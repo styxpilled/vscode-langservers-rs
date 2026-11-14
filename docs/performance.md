@@ -114,8 +114,8 @@ without that, page faults of the growth are 20%.
 
 Costs that profiles found and that the port avoids:
 
-- `isVoidElement` with ICU collation for each tag (a third of the parse). Names
-  of `[a-z0-9-]` compare as bytes.
+- `isVoidElement` with ICU collation for each tag (a third of the parse). The
+  search compares bytes.
 - A lowercase `String` of each tag and attribute name in the scanner and the
   parser, and a copy of each pending attribute name.
 - In the formatter: a `String` for each output item, a `Vec` of items for each

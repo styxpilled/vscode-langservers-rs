@@ -1,14 +1,11 @@
 //! Port of `pathCompletion.ts`.
 
 use css_languageservice::services::links::{DocumentContext, FileSystemProvider, FileType};
-use lsp_types::{
-    Command, CompletionItem, CompletionItemKind, CompletionTextEdit, Position, Range, TextEdit,
-};
+use lsp_types::{Command, CompletionItem, CompletionItemKind, CompletionTextEdit, Range, TextEdit};
 use text_document::TextDocument;
 
 use super::completion::{CompletionList, CompletionParticipant, HtmlAttributeValueContext};
 use crate::language_facts::HtmlDataManager;
-use crate::utils::utf16_len;
 
 /// `PathCompletionParticipant`.
 #[derive(Default)]
@@ -25,22 +22,23 @@ impl CompletionParticipant for PathCompletionParticipant {
 }
 
 impl PathCompletionParticipant {
-    /// `computeCompletions`. `None` where upstream throws: `Range.create`
-    /// rejects a negative character.
+    /// `computeCompletions`.
     pub fn compute_completions(
         &self,
         document: &TextDocument,
         document_context: &dyn DocumentContext,
         file_system: &dyn FileSystemProvider,
-    ) -> Option<CompletionList> {
+    ) -> CompletionList {
         let mut result = CompletionList::default();
         for c in &self.attribute_completions {
-            let full_value = strip_quotes(document.text_in(c.range));
+            let (start, end) = value_offsets(document, c.range);
+            let full_value = &document.text()[start..end];
             if is_completable_path(full_value) {
                 if full_value == "." || full_value == ".." {
                     result.is_incomplete = true;
                 } else {
-                    let replace_range = path_to_replace_range(&c.value, full_value, c.range)?;
+                    let replace_range =
+                        path_to_replace_range(document, &c.value, full_value, start, end);
                     result.items.extend(provide_path_suggestions(
                         &c.value,
                         replace_range,
@@ -52,7 +50,7 @@ impl PathCompletionParticipant {
                 }
             }
         }
-        Some(result)
+        result
     }
 }
 
@@ -143,16 +141,17 @@ fn extension_filter(context: &HtmlAttributeValueContext) -> Option<&'static [&'s
     }
 }
 
-/// `stripQuotes`: `slice(1, -1)` after a leading quote.
-fn strip_quotes(full_value: &str) -> &str {
-    if full_value.starts_with(['\'', '"']) {
-        let inner = &full_value[1..];
-        match inner.char_indices().next_back() {
-            Some((i, _)) => &inner[..i],
-            None => "",
-        }
-    } else {
-        full_value
+/// `stripQuotes`: the value of an attribute without its quotes, as byte offsets.
+fn value_offsets(document: &TextDocument, range: Range) -> (usize, usize) {
+    let (start, end) = (
+        document.offset_at(range.start),
+        document.offset_at(range.end),
+    );
+    let value = &document.text()[start..end];
+    match value.chars().next() {
+        Some(q @ ('\'' | '"')) if value.len() > 1 && value.ends_with(q) => (start + 1, end - 1),
+        Some('\'' | '"') => (start + 1, end),
+        _ => (start, end),
     }
 }
 
@@ -160,33 +159,22 @@ fn is_completable_path(value: &str) -> bool {
     !(value.starts_with("http") || value.starts_with("//"))
 }
 
-fn shift_position(pos: Position, offset: i64) -> Option<Position> {
-    let character = u32::try_from(i64::from(pos.character) + offset).ok()?;
-    Some(Position::new(pos.line, character))
-}
-
-/// `pathToReplaceRange`.
+/// `pathToReplaceRange`: the path segment at the cursor, up to a space.
 fn path_to_replace_range(
+    document: &TextDocument,
     value_before_cursor: &str,
     full_value: &str,
-    range: Range,
-) -> Option<Range> {
-    match value_before_cursor.rfind('/') {
-        None => Some(Range::new(
-            shift_position(range.start, 1)?,
-            shift_position(range.end, -1)?,
-        )),
-        Some(last_slash) => {
-            // The cursor can be in the middle of the value: <script src="./s|rc/test.js">.
-            let after_last_slash = full_value.get(last_slash + 1..).unwrap_or("");
-            let start = shift_position(range.end, -1 - utf16_len(after_last_slash) as i64)?;
-            let end = match after_last_slash.find(' ') {
-                Some(ws) => shift_position(start, utf16_len(&after_last_slash[..ws]) as i64)?,
-                None => shift_position(range.end, -1)?,
-            };
-            Some(Range::new(start, end))
-        }
-    }
+    start: usize,
+    end: usize,
+) -> Range {
+    let Some(last_slash) = value_before_cursor.rfind('/') else {
+        return document.range(start, end);
+    };
+    // The cursor can be in the middle of the value: <script src="./s|rc/test.js">.
+    let after_last_slash = full_value.get(last_slash + 1..).unwrap_or("");
+    let start = end - after_last_slash.len();
+    let end = after_last_slash.find(' ').map_or(end, |ws| start + ws);
+    document.range(start, end)
 }
 
 fn completion_item(name: &str, is_dir: bool, replace_range: Range) -> CompletionItem {

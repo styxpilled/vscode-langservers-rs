@@ -135,8 +135,7 @@ fn node_to_name(doc: &HtmlDocument, id: NodeId) -> String {
     let node = &doc[id];
     let mut name = node.tag.clone();
     let push = |name: &mut Option<String>, s: &str| {
-        name.get_or_insert_with(|| "undefined".to_owned())
-            .push_str(s);
+        name.get_or_insert_default().push_str(s);
     };
     if node.attributes.is_some() {
         if let Some(Some(id)) = node.attribute("id")
@@ -195,7 +194,7 @@ pub fn do_rename(
     let tag = node.tag.as_deref()?;
     let len = tag.len();
     let in_end_tag = node
-        .end_tag_start_truthy()
+        .end_tag_start
         .is_some_and(|e| e + 2 <= offset && offset <= e + 2 + len);
     if !(in_end_tag || node.start < offset && offset <= node.start + 1 + len) {
         return None;
@@ -204,7 +203,7 @@ pub fn do_rename(
         document.range(node.start + 1, node.start + 1 + len),
         new_name.to_owned(),
     )];
-    if let Some(e) = node.end_tag_start_truthy() {
+    if let Some(e) = node.end_tag_start {
         edits.push(TextEdit::new(
             document.range(e + 2, e + 2 + len),
             new_name.to_owned(),
@@ -225,7 +224,7 @@ pub fn find_linked_editing_ranges(
     let offset = document.offset_at(position);
     let node = &html_document[html_document.find_node_at(offset)];
     let len = node.tag.as_ref().map_or(0, String::len);
-    let e = node.end_tag_start_truthy()?;
+    let e = node.end_tag_start?;
     let in_start = node.start < offset && offset <= node.start + 1 + len;
     let in_end = e + 2 <= offset && offset <= e + 2 + len;
     (in_start || in_end).then(|| {
@@ -245,7 +244,7 @@ pub fn find_matching_tag_position(
     let offset = document.offset_at(position);
     let node = &html_document[html_document.find_node_at(offset)];
     let len = node.tag.as_ref()?.len();
-    let e = node.end_tag_start_truthy()?;
+    let e = node.end_tag_start?;
     if node.start < offset && offset <= node.start + 1 + len {
         return Some(document.position_at(offset - 1 - node.start + e + 2));
     }

@@ -86,7 +86,7 @@ impl LanguageService {
             })
         };
 
-        if let Some(end_tag_start) = node.end_tag_start_truthy()
+        if let Some(end_tag_start) = node.end_tag_start
             && offset >= end_tag_start
         {
             return tag_hover(node_tag, tag_name_range(TokenType::EndTag, end_tag_start)?);
@@ -119,7 +119,7 @@ impl LanguageService {
             let current = filter_entity(text, offset);
             for (entity, value) in ENTITIES {
                 if current.len() == entity.len() + 1 && current[1..] == **entity {
-                    let code = format!("{:X}", value.encode_utf16().next().unwrap_or(0));
+                    let code = format!("{:X}", value.chars().next().map_or(0, u32::from));
                     let hex = format!("U+{code:0>4}");
                     let contents = format!(
                         "Character entity representing '{value}', unicode equivalent '{hex}'"

@@ -158,8 +158,9 @@ arguments also writes the sweep; without them, only the fixture.
   system and the participant contexts), hover, quote and tag completion,
   highlights, rename, matching tag, linked editing and selection ranges; each
   7th offset also completion and hover without markdown. The full results of
-  folding, symbols and links. Upstream throws in path completion for 13 offsets;
-  there the port must answer `None`.
+  folding, symbols and links. Path completion in a value that is not quoted on
+  one line is skipped (`experimental.md`; 137 results, 13 of them where upstream
+  throws).
 - Robustness (`robustness` in `tests/sweep.rs`, same variable, 90 s in release):
   each feature at each offset of each prefix of two non-ASCII variants of each
   sweep text, no panics.
@@ -174,6 +175,7 @@ arguments also writes the sweep; without them, only the fixture.
   the expected files of that build (`expected-nojs`) come from the Node
   reference without the JavaScript mode
   (`node scripts/html/record-fixture-format.cjs upstream/vscode <dir>`).
+- Server over stdio (`tests/stdio.rs`): the binary with settings requests.
 - Server robustness (`src/robustness.rs`): each mode feature at each position of
   each prefix of non-ASCII texts with embedded CSS, no panics. 60 s in release
   with the JavaScript mode:

@@ -18,14 +18,14 @@ tag auto insertion of Zed's fork (`zed.md`). The JavaScript mode uses tsrs
   they use the new void elements. Upstream keeps them in the cache until it
   expires.
 - Push diagnostics: as in the CSS server (`css-server.md`), each timer validates
-  the current text. A rejected settings request logs and publishes no
-  diagnostics.
+  the current text.
 - File system: as in the CSS server, schemes other than `file` fail in place of
   `fs/readDir` requests.
 - `resolveReference` returns no reference where `URI.parse` throws.
 - `html.format` settings are read field by field with the semantics of
-  js-beautify's `Options`: booleans by truthiness, numbers by `parseInt` (`NaN`
-  gives the js-beautify default), lists only from strings, `wrapAttributes` and
+  js-beautify's `Options`: booleans by truthiness, numbers as in
+  `experimental.md` (another value gives the js-beautify default), lists only
+  from strings, `wrapAttributes` and
   `indentScripts` must be a valid name (else the request answers `[]` and logs,
   as upstream throws). `unformattedContentDelimiter` that is not a string is not
   set. A negative `tabSize` is 4.
@@ -48,12 +48,7 @@ tag auto insertion of Zed's fork (`zed.md`). The JavaScript mode uses tsrs
   HTML mode (`doHover.length`), validation of a document with CSS, formatting.
   CSS hover always reads the global settings; HTML hover without scoped settings
   reads none.
-- `getLanguagesInDocument` stops at three embedded languages and then does not
-  add `html`.
-- Selection ranges in the HTML mode repeat the innermost range.
 - `didChangeConfiguration` with `settings: null` is accepted.
-- An `html.format.unformatted` that is truthy and not a string makes formatting
-  fail (`[]`, logged).
 
 ## JavaScript mode
 

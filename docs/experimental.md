@@ -128,3 +128,71 @@ The HTML server uses the same helpers for its formatter settings.
   replay difference. The `icu_collator` dependency is removed.
 - `difference` compares characters, not UTF-16 units: a character outside the
   BMP counts once.
+
+## HTML language facts
+
+- Void elements. Upstream `isVoidElement` does a binary search with
+  `localeCompare` (ICU) in the list that `sort()` ordered by UTF-16 units: for a
+  name outside `[a-z0-9-]` the two orders can differ and the search can fail.
+  The branch sorts by bytes and searches by bytes. The built-in void elements
+  are `[a-z]`: no sweep or replay difference. The `icu_collator` dependency is
+  removed.
+
+## HTML service
+
+`tests/experimental.rs` tests these changes.
+
+- Path completion. Upstream takes the replace range from the value range with
+  `shiftRange(range, 1, -1)` and shifts the end character by the length of the
+  name after the last `/`. The shift stays on one line, and it assumes two
+  quotes: a name on two lines gives a negative character and upstream throws
+  (no completion); an empty value gives a reversed range; an unclosed quote
+  loses the last character. The branch takes the value without its quotes as
+  byte offsets and makes the range from offsets. `do_complete2` always answers.
+  The feature sweep skips path completion in a value that is not quoted on one
+  line (137 results, 13 of them where upstream throws). `path_completion_ranges`.
+- Region markers. Upstream `/^\s*#(region\b)|(endregion\b)/` has no `^` for
+  `endregion`, so a comment with `endregion` anywhere ends a region. The branch
+  uses `/^\s*#(end)?region\b/`. `endregion_only_at_start`.
+- Entity hover. Upstream writes the first UTF-16 unit of the character
+  (`U+D835` for `&Afr;`). The branch writes the code point (`U+1D504`).
+  `entity_hover_code_point`.
+- Simplifications without an effect on results:
+  - The `type` value of a quoted attribute without closing quote kept all but
+    its last character. Without the closing quote the value goes to the end of
+    the text, so no script content follows. The branch keeps all of it.
+  - `startTagEnd` and `endTagStart` were JS conditions (0 is false). Only an
+    orphan end tag at offset 0 has `endTagStart` 0, and the service does not
+    make orphan nodes.
+  - Symbol names: a node without a tag has no attributes (the scanner skips to
+    `>`), so upstream `undefined#id` cannot occur. The branch does not write
+    `undefined`.
+
+## HTML server
+
+- Failed settings requests. As in the CSS server: upstream caches a rejected
+  `workspace/configuration` request (or a `null` result) until the next
+  `didChangeConfiguration`, and completion, hover, formatting and diagnostics
+  fail. The branch uses the global settings for that request and does not cache
+  the result. `tests/stdio.rs` (`scoped_settings`).
+- `html.format.unformatted` that is truthy and not a string. Upstream js-beautify
+  throws (`unformattedTags.match`), and formatting answers `[]`. The branch
+  ignores the value. `scoped_settings`.
+- Languages in a document. Upstream `getLanguagesInDocument` stops at three
+  embedded languages and then does not add `html`: a document with CSS,
+  JavaScript and TypeScript regions has no HTML mode for links, symbols,
+  colors, semantic tokens and diagnostics. The branch has no limit.
+  `embedded::tests::languages_in_document`.
+- Selection ranges. In the HTML mode, upstream adds the HTML ranges as parent of
+  the same HTML ranges, so the innermost range repeats. The branch returns the
+  HTML ranges once. `tests::selection_html`. Replay: 6 responses each in
+  `html/features.jsonl` and `html/push.jsonl`.
+
+## HTML formatter
+
+- Line lengths. Upstream counts the line lengths for wrapping and the attribute
+  alignment in UTF-16 units: a character outside the BMP counts twice. The
+  branch counts characters. `tests/formatter.rs` (`line_length_in_characters`).
+  The format sweep skips the texts with a character outside the BMP (68 of 15406
+  results; 19 of them differ). Effect on `html-perf.jsonl` (ASCII): formatting
+  60 to 66 ms against 60 to 61 ms, the same within noise.

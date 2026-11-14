@@ -47,7 +47,6 @@ Upstream: `vscode-html-languageservice`, `htmlFormatter.ts`,
 - The ignore directives of `<style>` content match
   `/\*\s*beautify(\s+\w+:\w+)+\s*\*/` (the CSS service:
   `/* beautify( \w+:\w+)+ */`).
-- Line lengths for wrapping and attribute alignment are in UTF-16 units.
 - Range formatting: the range extends to the enclosing
   `<!-- beautify ignore:start -->` and `<!-- beautify ignore:end -->` block. If
   the text before the range has a `<` with no `>` after it, the edit replaces

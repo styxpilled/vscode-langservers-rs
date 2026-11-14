@@ -467,22 +467,13 @@ impl<'a> Scanner<'a> {
                 let ch = self.peek();
                 if ch == b'\'' || ch == b'"' {
                     self.position += 1;
-                    if self.advance_until_char(ch) {
+                    let closed = self.advance_until_char(ch);
+                    let end = self.position;
+                    if closed {
                         self.position += 1;
                     }
                     if self.last_attribute_is_type() {
-                        // Upstream `substring(offset + 1, pos - 1)`: without a
-                        // closing quote, the last character is cut.
-                        let end = self.source[..self.position]
-                            .char_indices()
-                            .next_back()
-                            .map_or(0, |(i, _)| i);
-                        let start = offset + 1;
-                        self.last_type_value = Some(if start <= end {
-                            &self.source[start..end]
-                        } else {
-                            ""
-                        });
+                        self.last_type_value = Some(&self.source[offset + 1..end]);
                     }
                     self.state = ScannerState::WithinTag;
                     self.has_space_after_tag = false;

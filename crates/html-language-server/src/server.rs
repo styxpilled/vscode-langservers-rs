@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 use text_document::TextDocument;
 
 use crate::context::WorkspaceContext;
-use crate::modes::{Document, LanguageModes, Mode, check_unformatted};
+use crate::modes::{Document, LanguageModes, Mode};
 
 const VALIDATION_DELAY: Duration = Duration::from_millis(500);
 
@@ -93,9 +93,9 @@ struct AutoInsertParams {
     position: Position,
 }
 
-/// The settings of a document from `workspace/configuration`. `Ok(None)` is
-/// `undefined`, `Err` a rejected request.
-type Scoped = Result<Option<Value>, String>;
+/// The settings of a document from `workspace/configuration`. `None` selects the
+/// global settings.
+type Scoped = Option<Value>;
 
 enum DocumentSettings {
     Pending(RequestId),
@@ -455,7 +455,7 @@ impl Server {
     /// pending `workspace/configuration` request.
     fn scoped_settings(&mut self, document: &TextDocument) -> Result<Scoped, RequestId> {
         if !self.capabilities.scoped_settings {
-            return Ok(Ok(None));
+            return Ok(None);
         }
         match self.document_settings.get(document.uri()) {
             Some(DocumentSettings::Ready(scoped)) => Ok(scoped.clone()),
@@ -502,25 +502,28 @@ impl Server {
 
     fn on_configuration(&mut self, uri: Uri, response: Response) {
         // `then(s => ({ css: s[0], html: s[1], javascript: s[2], 'js/ts': s[3] }))`.
+        let pending = matches!(self.document_settings.get(&uri), Some(DocumentSettings::Pending(id)) if *id == response.id);
+        // A failed request is not cached: the next request asks again.
         let scoped = match response.response_result {
-            Err(error) => Err(error.message),
-            Ok(result) => match result {
-                Value::Null => Err("Cannot read properties of null (reading '0')".to_owned()),
-                Value::Array(items) => {
-                    let mut settings = serde_json::Map::new();
-                    for (key, item) in ["css", "html", "javascript", "js/ts"].iter().zip(items) {
-                        settings.insert((*key).to_owned(), item);
-                    }
-                    Ok(Some(Value::Object(settings)))
+            Ok(Value::Array(items)) => {
+                let mut settings = serde_json::Map::new();
+                for (key, item) in ["css", "html", "javascript", "js/ts"].iter().zip(items) {
+                    settings.insert((*key).to_owned(), item);
                 }
-                _ => Ok(Some(json!({}))),
-            },
+                let scoped = Some(Value::Object(settings));
+                if pending {
+                    self.document_settings
+                        .insert(uri, DocumentSettings::Ready(scoped.clone()));
+                }
+                scoped
+            }
+            Ok(_) | Err(_) => {
+                if pending {
+                    self.document_settings.remove(&uri);
+                }
+                None
+            }
         };
-        if matches!(self.document_settings.get(&uri), Some(DocumentSettings::Pending(id)) if *id == response.id)
-        {
-            self.document_settings
-                .insert(uri, DocumentSettings::Ready(scoped.clone()));
-        }
         let (ready, waiting) = std::mem::take(&mut self.waiting)
             .into_iter()
             .partition(|(id, _)| *id == response.id);
@@ -729,7 +732,7 @@ impl Server {
             return self.with_settings_or_default(request, None);
         };
         if !self.settings_needed(&request, &document) {
-            return self.with_settings(request, &document, Ok(None));
+            return self.with_settings(request, &document, None);
         }
         match self.scoped_settings(&document.text) {
             Ok(scoped) => self.with_settings(request, &document, scoped),
@@ -771,38 +774,34 @@ impl Server {
             };
             return self.send(Response::new_ok(request.id, missing));
         };
-        let result = scoped.and_then(|scoped| {
-            catch_unwind(AssertUnwindSafe(|| -> Result<Box<RawValue>, String> {
-                let params = request.params.clone();
-                let parse = |e: serde_json::Error| e.to_string();
-                match request.method.as_str() {
-                    "textDocument/completion" => {
-                        let p: PositionParams = serde_json::from_value(params).map_err(parse)?;
-                        self.completion(document, p.position, scoped.as_ref())
-                    }
-                    "textDocument/hover" => {
-                        let p: PositionParams = serde_json::from_value(params).map_err(parse)?;
-                        raw(&self.hover(document, p.position, scoped.as_ref())?)
-                    }
-                    "textDocument/formatting" | "textDocument/rangeFormatting" => {
-                        let p: FormattingParams = serde_json::from_value(params).map_err(parse)?;
-                        raw(&self.format(document, p.range, &p.options, scoped.as_ref())?)
-                    }
-                    _ => {
-                        let items =
-                            self.validate(document, scoped.as_ref())
-                                .unwrap_or_else(|message| {
-                                    self.log_error(&format!(
-                                        "Error while validating {uri}: {message}"
-                                    ));
-                                    Vec::new()
-                                });
-                        raw(&json!({ "kind": "full", "items": items }))
-                    }
+        let result = catch_unwind(AssertUnwindSafe(|| -> Result<Box<RawValue>, String> {
+            let params = request.params.clone();
+            let parse = |e: serde_json::Error| e.to_string();
+            match request.method.as_str() {
+                "textDocument/completion" => {
+                    let p: PositionParams = serde_json::from_value(params).map_err(parse)?;
+                    self.completion(document, p.position, scoped.as_ref())
                 }
-            }))
-            .unwrap_or_else(|payload| Err(panic_message(payload)))
-        });
+                "textDocument/hover" => {
+                    let p: PositionParams = serde_json::from_value(params).map_err(parse)?;
+                    raw(&self.hover(document, p.position, scoped.as_ref())?)
+                }
+                "textDocument/formatting" | "textDocument/rangeFormatting" => {
+                    let p: FormattingParams = serde_json::from_value(params).map_err(parse)?;
+                    raw(&self.format(document, p.range, &p.options, scoped.as_ref())?)
+                }
+                _ => {
+                    let items =
+                        self.validate(document, scoped.as_ref())
+                            .unwrap_or_else(|message| {
+                                self.log_error(&format!("Error while validating {uri}: {message}"));
+                                Vec::new()
+                            });
+                    raw(&json!({ "kind": "full", "items": items }))
+                }
+            }
+        }))
+        .unwrap_or_else(|payload| Err(panic_message(payload)));
         match result {
             Ok(result) => self.writer.response(request.id, &result),
             Err(message) => {
@@ -1074,7 +1073,7 @@ impl Server {
                 continue;
             };
             if !self.validation_needs_settings(&document) {
-                self.finish_validation(uri, Ok(None));
+                self.finish_validation(uri, None);
                 continue;
             }
             match self.scoped_settings(&document.text) {
@@ -1086,19 +1085,16 @@ impl Server {
 
     /// Validates the current text, so a change during the wait for the
     /// settings does not publish stale diagnostics. A closed document is not
-    /// validated. A rejected settings request publishes no diagnostics.
+    /// validated.
     fn finish_validation(&mut self, uri: Uri, scoped: Scoped) {
         let Some(document) = self.document(&uri) else {
             return;
         };
-        let diagnostics = match scoped {
-            Ok(scoped) => catch_unwind(AssertUnwindSafe(|| {
-                self.validate(&document, scoped.as_ref())
-            }))
-            .map_err(panic_message)
-            .and_then(|r| r),
-            Err(message) => Err(message),
-        };
+        let diagnostics = catch_unwind(AssertUnwindSafe(|| {
+            self.validate(&document, scoped.as_ref())
+        }))
+        .map_err(panic_message)
+        .and_then(|r| r);
         match diagnostics {
             Ok(diagnostics) => self.publish(uri, diagnostics),
             Err(message) => {
@@ -1224,7 +1220,6 @@ impl Server {
         scoped: Option<&Value>,
     ) -> Result<Vec<TextEdit>, String> {
         let settings = scoped.unwrap_or(&self.global);
-        check_unformatted(Some(settings))?;
         let text = &document.text;
         let full_range = Range::new(Position::new(0, 0), text.position_at(text.text().len()));
         let edits = self.modes.format(

@@ -57,8 +57,8 @@ fn applicable_ranges(
     let mut result = parent_tag_ranges(doc, id);
 
     // Self-closing or void elements.
-    if let Some(start_tag_end) = node.start_tag_end_truthy()
-        && node.end_tag_start_truthy().is_none()
+    if let Some(start_tag_end) = node.start_tag_end
+        && node.end_tag_start.is_none()
     {
         // Unmatched tag pairs like <div></div1>.
         if start_tag_end != node.end {
@@ -77,8 +77,7 @@ fn applicable_ranges(
         return attribute_ranges;
     }
 
-    let (Some(start_tag_end), Some(end_tag_start)) =
-        (node.start_tag_end_truthy(), node.end_tag_start_truthy())
+    let (Some(start_tag_end), Some(end_tag_start)) = (node.start_tag_end, node.end_tag_start)
     else {
         return result;
     };
@@ -109,7 +108,7 @@ fn parent_tag_ranges(doc: &HtmlDocument, mut id: usize) -> Vec<(usize, usize)> {
     while let Some(parent) = doc[id].parent {
         id = parent;
         let n = &doc[id];
-        match (n.start_tag_end_truthy(), n.end_tag_start_truthy()) {
+        match (n.start_tag_end, n.end_tag_start) {
             (Some(s), Some(e)) if s < e => {
                 result.push((s, e));
                 result.push((n.start, n.end));

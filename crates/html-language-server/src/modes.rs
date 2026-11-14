@@ -262,17 +262,16 @@ impl LanguageModes {
         let list = match mode {
             Mode::Html => {
                 let options = completion_configuration(get(settings, "html"), true);
-                self.html
-                    .do_complete2(
-                        &document.text,
-                        position,
-                        self.html_document(document),
-                        context,
-                        Some(&self.request_service),
-                        Some(&options),
-                        &mut [],
-                    )
-                    .map(|list| to_raw_value(&list).unwrap())
+                let list = self.html.do_complete2(
+                    &document.text,
+                    position,
+                    self.html_document(document),
+                    context,
+                    Some(&self.request_service),
+                    Some(&options),
+                    &mut [],
+                );
+                Some(to_raw_value(&list).unwrap())
             }
             Mode::Css => {
                 let (embedded, stylesheet) = document.css();
@@ -611,7 +610,7 @@ impl LanguageModes {
                     self.html_document(document),
                 );
                 let mut range = match self.mode_at_position(document, position) {
-                    Some(Mode::Html) => html_range.clone(),
+                    Some(Mode::Html) | None => return Ok(html_range),
                     Some(Mode::Css) => {
                         let (embedded, stylesheet) = document.css();
                         selection_range::get_selection_ranges(embedded, &[position], stylesheet)
@@ -622,7 +621,6 @@ impl LanguageModes {
                         let (mode, js) = self.script(script, document);
                         from_json(mode.selection_range(js, position)?)?
                     }
-                    None => return Ok(html_range),
                 };
                 let mut top = &mut range;
                 while top
@@ -825,8 +823,7 @@ fn enabled(mode: Mode, script_enabled: bool) -> bool {
     }
 }
 
-/// `settings.html.format.unformatted || ''` (`check_unformatted` rejects
-/// other values).
+/// `settings.html.format.unformatted` if it is a string.
 fn unformatted<'a>(settings: Settings<'a>) -> &'a str {
     get(get(get(settings, "html"), "format"), "unformatted")
         .and_then(Value::as_str)
@@ -907,18 +904,6 @@ fn encode_tokens(
 #[cfg(feature = "javascript")]
 fn from_json<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, String> {
     serde_json::from_value(value).map_err(|e| e.to_string())
-}
-
-/// `onFormat`: the formatter throws for an `unformatted` setting that is
-/// truthy and not a string (`unformattedTags.match`).
-pub fn check_unformatted(settings: Settings) -> Result<(), String> {
-    let unformatted = get(get(get(settings, "html"), "format"), "unformatted");
-    match unformatted {
-        Some(v) if truthy(Some(v)) && !v.is_string() => {
-            Err("unformattedTags.match is not a function".to_owned())
-        }
-        _ => Ok(()),
-    }
 }
 
 fn before_or_same(a: Position, b: Position) -> bool {

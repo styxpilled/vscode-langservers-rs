@@ -31,23 +31,11 @@ linked editing, matching tag, selection ranges. Fixture generator:
 ## Ported
 
 - `Scanner.scan` advances one character when a state does not advance.
-- `isVoidElement` is a binary search with `localeCompare` (ICU) in the list that
-  `sort()` ordered (UTF-16 order). Names of `[a-z0-9-]` (after lowercase)
-  compare as bytes: the root collation gives the same order (unit test).
-- The `type` value of a quoted attribute without closing quote loses its last
-  character (`substring(offset + 1, pos - 1)`).
-- Folding: `#region` must be at the start of the comment text, but `endregion`
-  can be anywhere (`/^\s*#(region\b)|(endregion\b)/`).
 - Folding: `rangeLimit` 0 means no limit.
-- Hover of an entity: the code is the first UTF-16 unit of the character.
 - Hover: the entity range starts after the `&`.
-- Symbols: a node without tag but with an `id` or `class` is named
-  `undefined#id`.
 - Links: `validateRef` uses
   `/\b(w[\w\d+.-]*:\/\/)?[^\s()<>]+(?:\([\w\d]+\)|([^[:punct:]\s]|\/?))/`; the
   last group can match nothing, so a link is valid if a word boundary comes
   before a character that is not white space or `()<>`. `#` alone is not valid.
 - Links: a `<base>` without a value (`href=""`) stops the search for a base, and
   an empty base resolves links against the document.
-- Path completion: a `Range.create` with a negative character throws upstream,
-  so the completion fails (`None`).

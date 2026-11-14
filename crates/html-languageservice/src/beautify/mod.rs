@@ -720,7 +720,7 @@ impl<'a> Beautifier<'a, '_> {
                 | WrapAttributes::AlignedMultiple
                 | WrapAttributes::PreserveAligned
         ) {
-            self.tags[pt].alignment_size = utf16_len(raw.text) as i64 + 1;
+            self.tags[pt].alignment_size = raw.text.chars().count() as i64 + 1;
         }
         let tag = &self.tags[pt];
         if !tag.tag_complete && !tag.is_unformatted {

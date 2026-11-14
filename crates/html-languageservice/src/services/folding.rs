@@ -17,24 +17,21 @@ fn range(start_line: u32, end_line: u32, kind: Option<FoldingRangeKind>) -> Fold
     }
 }
 
-/// `/^\s*#(region\b)|(endregion\b)/`: `Some(true)` for a region start,
-/// `Some(false)` for an end.
+/// `/^\s*#(end)?region\b/`: `Some(true)` for a region start, `Some(false)` for
+/// an end.
 fn region_marker(text: &str) -> Option<bool> {
-    let word_end = |s: &str| {
-        !s.bytes()
-            .next()
-            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
-    };
-    if let Some(rest) = text
+    let rest = text
         .trim_start_matches(is_js_whitespace)
-        .strip_prefix("#region")
-        && word_end(rest)
-    {
-        return Some(true);
-    }
-    text.match_indices("endregion")
-        .any(|(i, m)| word_end(&text[i + m.len()..]))
-        .then_some(false)
+        .strip_prefix('#')?;
+    let (start, rest) = match rest.strip_prefix("endregion") {
+        Some(rest) => (false, rest),
+        None => (true, rest.strip_prefix("region")?),
+    };
+    let word_continues = rest
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_');
+    (!word_continues).then_some(start)
 }
 
 impl LanguageService {

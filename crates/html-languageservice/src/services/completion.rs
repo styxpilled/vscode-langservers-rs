@@ -136,15 +136,9 @@ impl LanguageService {
         file_system: Option<&dyn FileSystemProvider>,
         settings: Option<&CompletionConfiguration>,
         participants: &mut [&mut dyn CompletionParticipant],
-    ) -> Option<CompletionList> {
+    ) -> CompletionList {
         let Some(file_system) = file_system else {
-            return Some(self.do_complete(
-                document,
-                position,
-                html_document,
-                settings,
-                participants,
-            ));
+            return self.do_complete(document, position, html_document, settings, participants);
         };
         let mut path = PathCompletionParticipant::default();
         let result = self.do_complete(
@@ -154,13 +148,13 @@ impl LanguageService {
             settings,
             &mut [&mut Chain(&mut path, participants)],
         );
-        let path_result = path.compute_completions(document, document_context, file_system)?;
+        let path_result = path.compute_completions(document, document_context, file_system);
         let mut items = path_result.items;
         items.extend(result.items);
-        Some(CompletionList {
+        CompletionList {
             is_incomplete: result.is_incomplete || path_result.is_incomplete,
             items,
-        })
+        }
     }
 
     /// `doComplete`.
@@ -227,7 +221,7 @@ impl LanguageService {
         let node = &html_document[html_document.find_node_before(offset)];
         if node.attributes.is_some()
             && node.start < offset
-            && node.end_tag_start_truthy().is_none_or(|e| e > offset)
+            && node.end_tag_start.is_none_or(|e| e > offset)
         {
             let mut scanner = Scanner::at(text, node.start);
             let mut token = scanner.scan();
@@ -266,7 +260,7 @@ impl LanguageService {
                 let node = &html_document[html_document.find_node_before(offset)];
                 let tag = node.tag.as_deref()?;
                 if node.start < offset
-                    && node.end_tag_start_truthy().is_none_or(|e| e > offset)
+                    && node.end_tag_start.is_none_or(|e| e > offset)
                     && !HtmlDataManager::is_void_element(tag, self.data_manager.void_elements())
                 {
                     let mut scanner = Scanner::at(text, node.start);
@@ -283,7 +277,7 @@ impl LanguageService {
                 let mut id = Some(html_document.find_node_before(offset));
                 while let Some(n) = id {
                     let node = &html_document[n];
-                    if !(node.closed && node.end_tag_start_truthy().is_none_or(|e| e <= offset)) {
+                    if !(node.closed && node.end_tag_start.is_none_or(|e| e <= offset)) {
                         break;
                     }
                     id = node.parent;
@@ -414,7 +408,7 @@ impl Completion<'_, '_> {
         while let Some(id) = curr {
             let node = &doc[id];
             if let Some(tag) = &node.tag
-                && (!node.closed || node.end_tag_start_truthy().is_some_and(|e| e > self.offset))
+                && (!node.closed || node.end_tag_start.is_some_and(|e| e > self.offset))
             {
                 let mut item = CompletionItem {
                     label: format!("/{tag}"),

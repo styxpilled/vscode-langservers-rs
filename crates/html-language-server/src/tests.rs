@@ -222,6 +222,14 @@ fn assert_selection(content: &str, expected: &[(usize, &str)]) {
 }
 
 #[test]
+fn selection_html() {
+    assert_selection(
+        "<div><p>|a</p></div>",
+        &[(8, "a"), (5, "<p>a</p>"), (0, "<div><p>a</p></div>")],
+    );
+}
+
+#[test]
 fn selection_embedded_css() {
     assert_selection(
         "<html><head><style>foo { display: |none; } </style></head></html>",

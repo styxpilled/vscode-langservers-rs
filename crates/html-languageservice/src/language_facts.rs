@@ -1,12 +1,9 @@
 //! Port of `dataProvider.ts` and `dataManager.ts`, with the data types of
 //! `htmlLanguageTypes.ts`.
 
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use icu_collator::options::CollatorOptions;
-use icu_collator::{Collator, CollatorBorrowed};
 use lsp_types::{MarkupContent, MarkupKind};
 use serde::Deserialize;
 use serde_json::Value;
@@ -377,12 +374,6 @@ pub fn generate_documentation(
     })
 }
 
-/// `String.prototype.localeCompare` (ICU collation).
-static COLLATOR: LazyLock<CollatorBorrowed<'static>> = LazyLock::new(|| {
-    Collator::try_new(Default::default(), CollatorOptions::default())
-        .expect("compiled collation data")
-});
-
 /// `HTMLDataManager`. Each data provider applies to all languages, so the
 /// void elements are computed once for each `set_data_providers`.
 #[derive(Debug)]
@@ -426,26 +417,21 @@ impl HtmlDataManager {
         &self.void_elements
     }
 
-    /// `isVoidElement`: a binary search with `localeCompare` in the list that
-    /// `sort()` ordered, as upstream.
+    /// `isVoidElement`: `e` in lowercase in the sorted list.
     pub fn is_void_element(e: &str, void_elements: &[String]) -> bool {
         if e.is_empty() {
             return false;
         }
-        if e.bytes()
-            .all(|b| is_simple_name_byte(b.to_ascii_lowercase()))
-        {
+        if e.is_ascii() {
             let key = || e.bytes().map(|b| b.to_ascii_lowercase());
-            return binary_search(void_elements, |t| {
-                if t.bytes().all(is_simple_name_byte) {
-                    t.bytes().cmp(key())
-                } else {
-                    COLLATOR.compare(t, &e.to_ascii_lowercase())
-                }
-            });
+            return void_elements
+                .binary_search_by(|t| t.bytes().cmp(key()))
+                .is_ok();
         }
         let key = e.to_lowercase();
-        binary_search(void_elements, |t| COLLATOR.compare(t, &key))
+        void_elements
+            .binary_search_by(|t| t.as_str().cmp(&key))
+            .is_ok()
     }
 
     /// `isPathAttribute`.
@@ -480,53 +466,13 @@ pub fn void_elements_of(providers: &[Arc<HtmlDataProvider>]) -> Vec<String> {
         .filter(|t| t.is_void == Some(true))
         .map(|t| t.name.clone())
         .collect();
-    tags.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
+    tags.sort();
     tags
-}
-
-/// The root collation orders strings of `[a-z0-9-]` as their bytes.
-fn is_simple_name_byte(b: u8) -> bool {
-    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'
-}
-
-/// `arrays.binarySearch`, true if found.
-fn binary_search(items: &[String], compare: impl Fn(&str) -> Ordering) -> bool {
-    let (mut low, mut high) = (0isize, items.len() as isize - 1);
-    while low <= high {
-        let mid = (low + high) / 2;
-        match compare(&items[mid as usize]) {
-            Ordering::Less => low = mid + 1,
-            Ordering::Greater => high = mid - 1,
-            Ordering::Equal => return true,
-        }
-    }
-    false
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{COLLATOR, is_simple_name_byte, missing_baseline_browsers};
-
-    #[test]
-    fn simple_names_collate_as_bytes() {
-        let alphabet = b"-09amz";
-        let mut names = vec![String::new()];
-        for _ in 0..3 {
-            let longer: Vec<String> = names
-                .iter()
-                .flat_map(|n| alphabet.iter().map(move |&c| format!("{n}{}", c as char)))
-                .collect();
-            names.extend(longer);
-        }
-        names.sort();
-        names.dedup();
-        assert!(names.iter().all(|n| n.bytes().all(is_simple_name_byte)));
-        for a in &names {
-            for b in &names {
-                assert_eq!(COLLATOR.compare(a, b), a.cmp(b), "{a:?} {b:?}");
-            }
-        }
-    }
+    use super::missing_baseline_browsers;
 
     #[test]
     fn missing_browser_lists() {

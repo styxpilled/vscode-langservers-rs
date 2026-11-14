@@ -1,9 +1,6 @@
-//! `Output` and `OutputLine` of js-beautify. Character counts are UTF-16
-//! lengths, as upstream.
+//! `Output` and `OutputLine` of js-beautify.
 
 use std::borrow::Cow;
-
-use css_languageservice::utils::utf16_len;
 
 /// The items of all lines are in `Output::items`: a line starts at `start`
 /// and ends at the start of the next line. Only the last two lines change.
@@ -104,8 +101,8 @@ impl<'a> Output<'a> {
     fn push(&mut self, item: Cow<'a, str>) {
         let line = self.lines.last_mut().unwrap();
         match item.rfind('\n') {
-            Some(i) => line.character_count = utf16_len(&item[i..]) as i64,
-            None => line.character_count += utf16_len(&item) as i64,
+            Some(i) => line.character_count = item[i..].chars().count() as i64,
+            None => line.character_count += item.chars().count() as i64,
         }
         self.items.push(item);
     }
@@ -121,7 +118,7 @@ impl<'a> Output<'a> {
         let base = if indent < 0 {
             0
         } else {
-            utf16_len(&self.base_string) as i64
+            self.base_string.chars().count() as i64
         };
         base + indent * self.indent_size + column
     }
@@ -186,7 +183,7 @@ impl<'a> Output<'a> {
         self.trim(true);
         if !self.just_added_newline() {
             let last = self.items.pop().unwrap();
-            self.current().character_count -= utf16_len(&last) as i64;
+            self.current().character_count -= last.chars().count() as i64;
             if !last.is_empty() {
                 self.push(match last {
                     Cow::Borrowed(s) => Cow::Borrowed(s.trim_end_matches('\n')),

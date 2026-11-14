@@ -181,16 +181,12 @@ impl DocumentRegions {
         result
     }
 
-    /// `getLanguagesInDocument`: at most three embedded languages, then `html`
-    /// unless three were found.
+    /// `getLanguagesInDocument`: the embedded languages, then `html`.
     pub fn languages_in_document(&self) -> Vec<&'static str> {
         let mut result = Vec::new();
         for id in self.regions.iter().filter_map(|r| r.language_id) {
             if !result.contains(&id) {
                 result.push(id);
-                if result.len() == 3 {
-                    return result;
-                }
             }
         }
         result.push("html");
@@ -407,6 +403,16 @@ mod tests {
             0,
             text.to_owned(),
         )
+    }
+
+    #[test]
+    fn languages_in_document() {
+        let text = "<p style='a'></p><script>b</script><script type='text/typescript'>c</script>";
+        let regions = DocumentRegions::new(&document(text));
+        assert_eq!(
+            regions.languages_in_document(),
+            ["css", "javascript", "typescript", "html"]
+        );
     }
 
     #[test]

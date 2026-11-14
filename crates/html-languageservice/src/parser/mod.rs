@@ -64,16 +64,6 @@ impl Node {
             (Some(_), None) => false,
         }
     }
-
-    /// `startTagEnd` as a JS condition (a number that is not 0).
-    pub fn start_tag_end_truthy(&self) -> Option<usize> {
-        self.start_tag_end.filter(|&n| n != 0)
-    }
-
-    /// `endTagStart` as a JS condition (a number that is not 0).
-    pub fn end_tag_start_truthy(&self) -> Option<usize> {
-        self.end_tag_start.filter(|&n| n != 0)
-    }
 }
 
 /// `HTMLDocument`.
