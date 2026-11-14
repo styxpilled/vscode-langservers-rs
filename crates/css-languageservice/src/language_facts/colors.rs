@@ -1,5 +1,4 @@
-//! Port of `colors.ts`. `pow` is the platform `pow`; `cbrt`, `atan2`, `sin` and
-//! `cos` are from `libm` (fdlibm). These are the closest to Node 24 (V8 13.6).
+//! Port of `colors.ts`.
 
 use foldhash::HashMap;
 use std::sync::LazyLock;
@@ -59,7 +58,7 @@ pub struct Lab {
     pub l: f64,
     pub a: f64,
     pub b: f64,
-    pub alpha: Option<f64>,
+    pub alpha: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -67,7 +66,7 @@ pub struct Lch {
     pub l: f64,
     pub c: f64,
     pub h: f64,
-    pub alpha: Option<f64>,
+    pub alpha: f64,
 }
 
 /// An entry of `colorFunctions`.
@@ -82,28 +81,10 @@ pub struct ColorFunction {
 static COLOR_MAP: LazyLock<HashMap<&str, &str>> =
     LazyLock::new(|| COLORS.iter().copied().collect());
 
-/// `Math.round`: halves round up.
-pub(crate) fn js_round(x: f64) -> f64 {
-    let floor = x.floor();
-    let r = if x - floor >= 0.5 { floor + 1.0 } else { floor };
-    if r == 0.0 && x < 0.0 { -0.0 } else { r }
-}
-
-/// `Number(x.toFixed(digits))`. `toFixed` rounds a tie away from zero; Rust
-/// formatting rounds it to even. 30 more digits are enough to see a tie: a
-/// double that is not on a tie is much farther from it.
-fn js_to_fixed(x: f64, digits: usize) -> f64 {
-    if !x.is_finite() || x.abs() >= 1e21 {
-        return x;
-    }
-    let s = format!("{:.*}", digits + 30, x.abs());
-    let cut = s.find('.').unwrap() + 1 + digits;
-    let mut n: u128 = s[..cut].replace('.', "").parse().unwrap();
-    if s.as_bytes()[cut] >= b'5' {
-        n += 1;
-    }
-    let v: f64 = format!("{n}e-{digits}").parse().unwrap();
-    if x < 0.0 { -v } else { v }
+/// `v` rounded to `digits` decimal places.
+fn round_to(v: f64, digits: i32) -> f64 {
+    let p = 10f64.powi(digits);
+    (v * p).round() / p
 }
 
 /// The length of the match of `[-+]?[0-9]*\.?[0-9]+` at the start of `s`.
@@ -195,7 +176,7 @@ fn named_color(name: &str) -> Option<&'static str> {
 /// `isColorValue`: a hex color, a color function or a color name.
 pub fn is_color_value(ast: &Ast, node: NodeId) -> bool {
     match ast.node_type(node) {
-        NodeType::HexColorValue => true,
+        NodeType::HexColorValue => color_from_hex(ast.get_text(node)).is_some(),
         NodeType::Function => is_color_constructor(ast, node),
         NodeType::Identifier => {
             if ast
@@ -339,7 +320,7 @@ pub fn hsl_from_color(rgba: Color) -> Hsla {
             h = (r - g) / chroma + 4.0;
         }
         h *= 60.0;
-        h = js_round(h);
+        h = h.round();
     }
     Hsla { h, s, l, a }
 }
@@ -392,7 +373,7 @@ pub fn xyz_from_lab(lab: Lab) -> Xyz {
         x: f(x) * 95.047,
         y: f(y) * 100.0,
         z: f(z) * 108.883,
-        alpha: lab.alpha.unwrap_or(1.0),
+        alpha: lab.alpha,
     }
 }
 
@@ -410,7 +391,7 @@ pub fn xyz_from_oklab(lab: Lab) -> Xyz {
         x: x * 100.0,
         y: y * 100.0,
         z: z * 100.0,
-        alpha: lab.alpha.unwrap_or(1.0),
+        alpha: lab.alpha,
     }
 }
 
@@ -429,9 +410,9 @@ pub fn xyz_to_rgb(xyz: Xyz) -> Color {
         }
     };
     Color {
-        red: js_round(compand(r) * 255.0),
-        green: js_round(compand(g) * 255.0),
-        blue: js_round(compand(b) * 255.0),
+        red: (compand(r) * 255.0).round(),
+        green: (compand(g) * 255.0).round(),
+        blue: (compand(b) * 255.0).round(),
         alpha: xyz.alpha,
     }
 }
@@ -456,11 +437,6 @@ pub fn RGBtoXYZ(rgba: Color) -> Xyz {
     }
 }
 
-/// `Math.round((v + Number.EPSILON) * 100) / 100`.
-fn round2(v: f64) -> f64 {
-    js_round((v + f64::EPSILON) * 100.0) / 100.0
-}
-
 #[allow(non_snake_case)]
 pub fn XYZtoLAB(xyz: Xyz, round: bool) -> Lab {
     let f = |v: f64| {
@@ -476,12 +452,12 @@ pub fn XYZtoLAB(xyz: Xyz, round: bool) -> Lab {
     let l = (116.0 * y) - 16.0;
     let a = 500.0 * (x - y);
     let b = 200.0 * (y - z);
-    let r = |v| if round { round2(v) } else { v };
+    let r = |v| if round { round_to(v, 2) } else { v };
     Lab {
         l: r(l),
         a: r(a),
         b: r(b),
-        alpha: Some(xyz.alpha),
+        alpha: xyz.alpha,
     }
 }
 
@@ -493,18 +469,18 @@ pub fn XYZtoOKLAB(xyz: Xyz, round: bool) -> Lab {
     let l = 0.818_933_010_1 * x + 0.361_866_742_4 * y - 0.128_859_713_7 * z;
     let m = 0.032_984_543_6 * x + 0.929_311_871_5 * y + 0.036_145_638_7 * z;
     let s = 0.048_200_301_8 * x + 0.264_366_269_1 * y + 0.633_851_707 * z;
-    let l_ = libm::cbrt(l);
-    let m_ = libm::cbrt(m);
-    let s_ = libm::cbrt(s);
+    let l_ = l.cbrt();
+    let m_ = m.cbrt();
+    let s_ = s.cbrt();
     let big_l = 0.210_454_255_3 * l_ + 0.793_617_785 * m_ - 0.004_072_046_8 * s_;
     let a = 1.977_998_495_1 * l_ - 2.428_592_205 * m_ + 0.450_593_709_9 * s_;
     let b = 0.025_904_037_1 * l_ + 0.782_771_766_2 * m_ - 0.808_675_766 * s_;
-    let r = |v| if round { js_to_fixed(v, 5) } else { v };
+    let r = |v| if round { round_to(v, 5) } else { v };
     Lab {
         l: r(big_l),
         a: r(a),
         b: r(b),
-        alpha: Some(xyz.alpha),
+        alpha: xyz.alpha,
     }
 }
 
@@ -522,7 +498,7 @@ pub fn oklab_from_color(rgba: Color, round: bool) -> Lab {
 
 fn lab_to_lch(lab: Lab) -> Lch {
     let c = (lab.a.powf(2.0) + lab.b.powf(2.0)).sqrt();
-    let mut h = libm::atan2(lab.b, lab.a) * RADIANS_TO_DEGREES_FACTOR;
+    let mut h = lab.b.atan2(lab.a) * RADIANS_TO_DEGREES_FACTOR;
     while h < 0.0 {
         h += 360.0;
     }
@@ -537,9 +513,9 @@ fn lab_to_lch(lab: Lab) -> Lch {
 pub fn lch_from_color(rgba: Color) -> Lch {
     let lch = lab_to_lch(lab_from_color(rgba, false));
     Lch {
-        l: round2(lch.l),
-        c: round2(lch.c),
-        h: round2(lch.h),
+        l: round_to(lch.l, 2),
+        c: round_to(lch.c, 2),
+        h: round_to(lch.h, 2),
         alpha: lch.alpha,
     }
 }
@@ -547,9 +523,9 @@ pub fn lch_from_color(rgba: Color) -> Lch {
 pub fn oklch_from_color(rgba: Color) -> Lch {
     let lch = lab_to_lch(oklab_from_color(rgba, false));
     Lch {
-        l: js_to_fixed(lch.l, 3),
-        c: js_to_fixed(lch.c, 5),
-        h: js_to_fixed(lch.h, 3),
+        l: round_to(lch.l, 3),
+        c: round_to(lch.c, 5),
+        h: round_to(lch.h, 3),
         alpha: lch.alpha,
     }
 }
@@ -561,36 +537,26 @@ fn lab_to_color(lab: Lab, xyz_converter: fn(Lab) -> Xyz) -> Color {
         red: clamp(rgb.red),
         green: clamp(rgb.green),
         blue: clamp(rgb.blue),
-        alpha: lab.alpha.unwrap_or(1.0),
+        alpha: lab.alpha,
     }
 }
 
 pub fn color_from_lab(l: f64, a: f64, b: f64, alpha: f64) -> Color {
-    let lab = Lab {
-        l,
-        a,
-        b,
-        alpha: Some(alpha),
-    };
+    let lab = Lab { l, a, b, alpha };
     lab_to_color(lab, xyz_from_lab)
 }
 
 pub fn color_from_oklab(l: f64, a: f64, b: f64, alpha: f64) -> Color {
-    let lab = Lab {
-        l,
-        a,
-        b,
-        alpha: Some(alpha),
-    };
+    let lab = Lab { l, a, b, alpha };
     lab_to_color(lab, xyz_from_oklab)
 }
 
 pub fn lab_from_lch(l: f64, c: f64, h: f64, alpha: f64) -> Lab {
     Lab {
         l,
-        a: c * libm::cos(h * DEGREES_TO_RADIANS_FACTOR),
-        b: c * libm::sin(h * DEGREES_TO_RADIANS_FACTOR),
-        alpha: Some(alpha),
+        a: c * (h * DEGREES_TO_RADIANS_FACTOR).cos(),
+        b: c * (h * DEGREES_TO_RADIANS_FACTOR).sin(),
+        alpha,
     }
 }
 

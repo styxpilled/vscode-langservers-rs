@@ -1,7 +1,7 @@
 //! Conversion of the `html.*` JSON settings with the JS semantics of the
 //! upstream server, `htmlFormatter.ts` and js-beautify's `Options`.
 
-use css_language_server::settings::{brace_style, get, parse_int, truthy};
+use css_language_server::settings::{brace_style, get, integer, truthy};
 use html_languageservice::HoverSettings;
 use html_languageservice::beautify::{IndentScripts, Templating, WrapAttributes};
 use html_languageservice::services::completion::CompletionConfiguration;
@@ -95,9 +95,9 @@ fn boolean(o: &Map<String, Value>, key: &str) -> Option<bool> {
     option(o, key).map(|v| truthy(Some(v)))
 }
 
-/// `_get_number`: `parseInt`, the default where it is `NaN`.
+/// `_get_number`: the default where the value is not a number.
 fn number(o: &Map<String, Value>, key: &str, nan: Option<i64>) -> Option<i64> {
-    option(o, key).and_then(|v| parse_int(v).or(nan))
+    option(o, key).and_then(|v| integer(v).or(nan))
 }
 
 fn string(o: &Map<String, Value>, key: &str) -> Option<String> {
@@ -153,10 +153,7 @@ fn css(o: &Map<String, Value>) -> Result<Option<EmbeddedCssFormatConfiguration>,
         newline_between_selectors: boolean(&c, "newlineBetweenSelectors"),
         newline_between_rules: boolean(&c, "newlineBetweenRules"),
         space_around_selector_separator: boolean(&c, "spaceAroundSelectorSeparator"),
-        brace_style: match c.get("braceStyle") {
-            Some(v) => brace_style(v)?,
-            None => None,
-        },
+        brace_style: c.get("braceStyle").and_then(brace_style),
         preserve_new_lines: boolean(&c, "preserveNewLines"),
         max_preserve_new_lines: number(&c, "maxPreserveNewLines", Some(32786)),
     }))
@@ -167,7 +164,7 @@ fn css(o: &Map<String, Value>) -> Result<Option<EmbeddedCssFormatConfiguration>,
 pub fn format_configuration(o: &Map<String, Value>) -> Result<HtmlFormatConfiguration, String> {
     // `tabSize || 4`. A negative size is 4 too (upstream builds broken indents).
     let tab_size = option(o, "tabSize")
-        .and_then(parse_int)
+        .and_then(integer)
         .filter(|&n| n > 0)
         .map(|n| n.min(u32::MAX as i64) as u32);
     Ok(HtmlFormatConfiguration {

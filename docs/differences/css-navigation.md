@@ -23,16 +23,9 @@ generator: `scripts/css/trace-navigation.mjs`.
   that child is still the name node (only for the selection range, and only if
   it is in the range).
 - An empty symbol name becomes `<undefined>`.
-- `toTwoDigitHex` adds a `0` only when the hex text does not have two digits: a
-  component above 1 gives three digits, a negative one gives `-1` and the like.
-- `getColorPresentations` writes the `lab`, `lch`, `oklab` and `oklch` alpha
-  with `${}`; the alpha is never `undefined` there.
 - Folding: a `#region` comment must have its text on one line
   (`\s*(.*?)\s*\*\/`); a region comment with a line break inside the text is a
   plain comment range. SCSS and Less also match `// #region`. The scanner comes
   from `document.languageId`, not from the parse.
 - Folding: `rangeLimit` 0 means no limit.
 - Selection ranges: a node with the same range as its parent is skipped.
-- `localeCompare` sorts the quick fixes with equal scores (ICU, as for JSON
-  sort). For the built-in property names (lowercase ASCII and `-`) this is the
-  byte order.

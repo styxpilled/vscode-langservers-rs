@@ -35,6 +35,8 @@ upstream.
 - `performance.md`: measurements, benchmarks, profiling, open ideas.
 - `zed.md`: what Zed sends and expects.
 - `differences/`: each difference from upstream, with its decision.
+- `experimental.md`: the changes of the `experimental` branch that do not
+  match the JS behavior.
 
 ## Roadmap
 

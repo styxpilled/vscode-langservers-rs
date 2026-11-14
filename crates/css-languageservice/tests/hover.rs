@@ -248,3 +248,34 @@ fn quirks_not_ported() {
         "<element o>"
     );
 }
+
+fn hover_at(input: &str, offset: usize) -> Option<Value> {
+    let data = CssDataManager::new(true, &[]);
+    let sheet = parse_stylesheet(Dialect::Css, input);
+    let doc = document("css", input);
+    do_hover(&doc, doc.position_at(offset), &sheet, &data, true, None)
+        .map(|h| serde_json::to_value(h).unwrap())
+}
+
+/// `docs/experimental.md`: the name of an unknown at-rule finds its entry.
+#[test]
+fn unknown_at_rule_by_name() {
+    let input = "@view-transition { navigation: auto; }";
+    assert!(hover_at("@counter-style x", 2).is_some());
+    let hover = hover_at(input, 2).unwrap();
+    assert!(
+        hover["contents"]["value"]
+            .as_str()
+            .unwrap()
+            .contains("view-transition")
+    );
+    assert_eq!(hover["range"]["end"]["character"], 16);
+    assert_eq!(hover_at(input, 20), None);
+}
+
+/// `docs/experimental.md`: an element named `…` is not a label.
+#[test]
+fn element_named_ellipsis() {
+    let hover = hover_at(r"\2026 {}", 0).unwrap();
+    assert_eq!(hover["contents"][0]["value"], "<\u{2026}>");
+}

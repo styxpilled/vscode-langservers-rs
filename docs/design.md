@@ -141,7 +141,7 @@ upstream: very deep nesting can overflow the stack (upstream throws
 - `services/`: `lint.rs`, `lint_rules.rs`, `lint_util.rs`, `validation.rs`,
   `selector_printing.rs`, `hover.rs`, `completion.rs` (SCSS and Less overrides
   match on the dialect; `CompletionParticipant`), `navigation.rs`,
-  `code_actions.rs` (ties sort with `icu_collator`, as `localeCompare`),
+  `code_actions.rs`,
   `folding.rs`, `selection_range.rs`, `links.rs` (`LinkResolver`,
   `FileSystemProvider`, `DocumentContext`), `path_completion.rs`,
   `formatter.rs`.

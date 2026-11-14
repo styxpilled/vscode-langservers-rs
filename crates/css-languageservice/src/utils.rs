@@ -73,59 +73,6 @@ pub fn limited_string(s: &str) -> String {
     format!("{}\u{2026}", &s[..end])
 }
 
-/// `Number.prototype.toString(16)` of V8 (`DoubleToRadixCString`) for a
-/// finite, positive number.
-pub fn js_to_radix16(value: f64) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut integer = value.floor();
-    let mut fraction = value - integer;
-    let next_up = f64::from_bits(value.to_bits() + 1);
-    let mut delta = (0.5 * (next_up - value)).max(f64::from_bits(1));
-    let mut digits: Vec<u8> = Vec::new();
-    if fraction >= delta {
-        loop {
-            fraction *= 16.0;
-            delta *= 16.0;
-            let digit = fraction as usize;
-            digits.push(DIGITS[digit]);
-            fraction -= digit as f64;
-            if (fraction > 0.5 || (fraction == 0.5 && digit & 1 == 1)) && fraction + delta > 1.0 {
-                // Round up, with carry over the digits.
-                loop {
-                    let Some(last) = digits.pop() else {
-                        integer += 1.0;
-                        break;
-                    };
-                    let d = DIGITS.iter().position(|&c| c == last).unwrap_or(0);
-                    if d + 1 < 16 {
-                        digits.push(DIGITS[d + 1]);
-                        break;
-                    }
-                }
-                break;
-            }
-            if fraction < delta {
-                break;
-            }
-        }
-    }
-    let mut out = Vec::new();
-    loop {
-        let remainder = integer % 16.0;
-        out.push(DIGITS[remainder as usize]);
-        integer = (integer - remainder) / 16.0;
-        if integer <= 0.0 {
-            break;
-        }
-    }
-    out.reverse();
-    if !digits.is_empty() {
-        out.push(b'.');
-        out.extend(digits);
-    }
-    String::from_utf8(out).unwrap_or_default()
-}
-
 /// Formats a number as JS `String(n)` does.
 pub fn js_number_to_string(n: f64) -> String {
     ryu_js::Buffer::new().format(n).to_owned()
@@ -133,7 +80,7 @@ pub fn js_number_to_string(n: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{js_number_to_string, js_to_radix16, parse_float};
+    use super::{js_number_to_string, parse_float};
 
     #[test]
     fn number_to_string_as_js() {
@@ -152,20 +99,6 @@ mod tests {
         ];
         for (v, s) in cases {
             assert_eq!(js_number_to_string(v), s, "{v}");
-        }
-    }
-
-    #[test]
-    fn radix16_as_js() {
-        let cases = [
-            (205.0, "cd"),
-            (255.0, "ff"),
-            (156.0, "9c"),
-            (204.5, "cc.8"),
-            (254.9, "fe.e66666666668"),
-        ];
-        for (v, s) in cases {
-            assert_eq!(js_to_radix16(v), s, "{v}");
         }
     }
 

@@ -2,6 +2,7 @@
 //! A method that a subclass overrides matches on the dialect.
 
 use foldhash::HashSet;
+use indexmap::IndexSet;
 
 use lsp_types::{
     ClientCapabilities, Command, CompletionItem, CompletionItemKind, CompletionItemTag,
@@ -15,7 +16,7 @@ use crate::data::{PropertyData, ValueData};
 use crate::language_facts::CssDataManager;
 use crate::language_facts::builtin_data as facts;
 use crate::language_facts::color_data::{COLOR_FUNCTIONS, COLOR_KEYWORDS, COLORS};
-use crate::language_facts::colors::{is_color_constructor, is_color_string};
+use crate::language_facts::colors::{is_color_string, is_color_value};
 use crate::language_facts::entry::{Entry, get_entry_description};
 use crate::parser::nodes::{Ast, Field, Kind, NodeId, NodeType, ReferenceType};
 use crate::parser::scanner::{Scanner, TokenType};
@@ -23,7 +24,7 @@ use crate::parser::symbol_scope::{SymbolId, Symbols};
 use crate::parser::{Dialect, Stylesheet};
 use crate::services::links::{DocumentContext, FileSystemProvider};
 use crate::services::path_completion::PathCompletionParticipant;
-use crate::utils::{js_to_radix16, limited_string, utf16_len};
+use crate::utils::{limited_string, utf16_len};
 
 /// `CompletionSettings`.
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -278,44 +279,6 @@ fn get_current_word(text: &str, offset: usize) -> &str {
         i -= 1;
     }
     &text[i..offset]
-}
-
-/// The `Set` class of upstream: an object with `Object.keys` order, so keys
-/// that are array indexes come first, in numeric order.
-#[derive(Default)]
-struct KeySet {
-    keys: Vec<String>,
-    seen: HashSet<String>,
-}
-
-impl KeySet {
-    fn add(&mut self, key: &str) {
-        if self.seen.insert(key.to_owned()) {
-            self.keys.push(key.to_owned());
-        }
-    }
-
-    fn remove(&mut self, key: &str) {
-        if self.seen.remove(key) {
-            self.keys.retain(|k| k != key);
-        }
-    }
-
-    fn entries(self) -> Vec<String> {
-        fn index(k: &str) -> Option<u32> {
-            let canonical = k == "0" || !k.starts_with('0');
-            let n: u32 = k
-                .parse()
-                .ok()
-                .filter(|_| canonical && k.bytes().all(|b| b.is_ascii_digit()))?;
-            (n != u32::MAX).then_some(n)
-        }
-        let (mut indexes, others): (Vec<String>, Vec<String>) =
-            self.keys.into_iter().partition(|k| index(k).is_some());
-        indexes.sort_by_key(|k| index(k));
-        indexes.extend(others);
-        indexes
-    }
 }
 
 impl State<'_, '_> {
@@ -607,7 +570,7 @@ impl State<'_, '_> {
                 text_edit: edit(range, format!("{}{suffix}", entry.name)),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 command: (trigger && needs_value).then(retrigger),
-                sort_text: Some(format!("{prefix}_{}", js_to_radix16(255.0 - relevance))),
+                sort_text: Some(format!("{prefix}_{:x}", (255.0 - relevance).round() as u8)),
                 ..item(&entry.name, CompletionItemKind::PROPERTY)
             };
             self.push(item);
@@ -672,7 +635,7 @@ impl State<'_, '_> {
                     _ => {}
                 }
             }
-            self.value_enum_proposals(entry.values.as_deref(), is_deprecated(entry), existing);
+            self.value_enum_proposals(entry.values.as_deref(), existing);
             self.css_wide_keyword_proposals(existing);
             self.unit_proposals(entry, existing);
         } else {
@@ -688,14 +651,8 @@ impl State<'_, '_> {
         self.term_proposals(entry, existing);
     }
 
-    /// `getValueEnumProposals`. Upstream tags each value with the status of
-    /// the property, not of the value.
-    fn value_enum_proposals(
-        &mut self,
-        values: Option<&[ValueData]>,
-        deprecated: bool,
-        existing: Option<NodeId>,
-    ) {
+    /// `getValueEnumProposals`.
+    fn value_enum_proposals(&mut self, values: Option<&[ValueData]>, existing: Option<NodeId>) {
         let range = self.completion_range(existing);
         for value in values.into_iter().flatten() {
             let mut insert = value.name.clone();
@@ -713,7 +670,7 @@ impl State<'_, '_> {
             self.push(CompletionItem {
                 documentation: get_entry_description(value, self.markdown, None)
                     .map(Documentation::MarkupContent),
-                tags: tags(deprecated),
+                tags: tags(is_deprecated(value)),
                 text_edit: edit(range, insert),
                 sort_text: Some(sort_text),
                 insert_text_format: format,
@@ -780,13 +737,13 @@ impl State<'_, '_> {
     /// `getVariableProposalsForCSSVarFunction`.
     fn variable_proposals_for_css_var_function(&mut self) {
         let ast = self.ast;
-        let mut referenced = KeySet::default();
+        let mut referenced = IndexSet::<_, foldhash::fast::RandomState>::default();
         ast.accept(self.root, &mut |n| {
             if ast.kind(n) == Kind::Identifier
                 && ast.node(n).is_custom_property
                 && (self.offset < ast.offset(n) || ast.end(n) < self.offset)
             {
-                referenced.add(ast.get_text(n));
+                referenced.insert(ast.get_text(n));
             }
             true
         });
@@ -806,12 +763,12 @@ impl State<'_, '_> {
                     ..item(&symbol.name, kind)
                 });
             }
-            referenced.remove(&symbol.name);
+            referenced.shift_remove(symbol.name.as_str());
         }
-        for name in referenced.entries() {
+        for name in referenced {
             if name.starts_with("--") {
                 self.push(CompletionItem {
-                    text_edit: edit(range, &name),
+                    text_edit: edit(range, name),
                     ..item(name, CompletionItemKind::VARIABLE)
                 });
             }
@@ -875,18 +832,18 @@ impl State<'_, '_> {
             });
         }
         let ast = self.ast;
-        let mut values = KeySet::default();
+        let mut values = IndexSet::<_, foldhash::fast::RandomState>::default();
         ast.accept(self.root, &mut |n| {
-            let color = ast.kind(n) == Kind::HexColorValue
-                || ast.kind(n) == Kind::Function && is_color_constructor(ast, n);
+            let color = matches!(ast.kind(n), Kind::HexColorValue | Kind::Function)
+                && is_color_value(ast, n);
             if color && (self.offset < ast.offset(n) || ast.end(n) < self.offset) {
-                values.add(ast.get_text(n));
+                values.insert(ast.get_text(n));
             }
             true
         });
-        for color in values.entries() {
+        for color in values {
             self.push(CompletionItem {
-                text_edit: edit(range, &color),
+                text_edit: edit(range, color),
                 ..item(color, CompletionItemKind::COLOR)
             });
         }
@@ -931,7 +888,7 @@ impl State<'_, '_> {
     fn collect_values(&self, declaration: NodeId) -> Vec<String> {
         let ast = self.ast;
         let name = ast.full_property_name(declaration);
-        let mut entries = KeySet::default();
+        let mut entries = IndexSet::<_, foldhash::fast::RandomState>::default();
         ast.accept(self.root, &mut |n| {
             if ast.kind(n).is_declaration()
                 && n != declaration
@@ -943,14 +900,14 @@ impl State<'_, '_> {
                         ast.kind(v),
                         Kind::Identifier | Kind::NumericValue | Kind::HexColorValue
                     ) {
-                        entries.add(ast.get_text(v));
+                        entries.insert(ast.get_text(v).to_owned());
                     }
                     true
                 });
             }
             true
         });
-        entries.entries()
+        entries.into_iter().collect()
     }
 
     // Structure
@@ -1322,11 +1279,7 @@ impl State<'_, '_> {
                         .and_then(|m| m.descriptors.as_ref())
                         .and_then(|d| d.iter().find(|d| d.name == name));
                     if let Some(d) = descriptor {
-                        return self.value_enum_proposals(
-                            d.values.as_deref(),
-                            is_deprecated(d),
-                            None,
-                        );
+                        return self.value_enum_proposals(d.values.as_deref(), None);
                     }
                 }
             } else if ast.kind(child) == Kind::MediaCondition {

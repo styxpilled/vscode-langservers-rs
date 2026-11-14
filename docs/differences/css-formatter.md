@@ -45,8 +45,6 @@ The test calls give the same result with and without the patches
   included. Inside a rule, the text gets a `{\n` prefix, and the first two
   UTF-16 units of the result are removed.
 - `lookBack` ignores ASCII case (`URL(`).
-- `foundNestedPseudoClass` starts one character after the character that follows
-  the colon: `h:(i) {` is a property, not a nested pseudo-class.
 - `get_code` drops an empty last token (an empty variable name, `$ `).
 - `max_preserve_newlines` default is 32786. One newline is always kept, also
   with `preserveNewLines: false`.

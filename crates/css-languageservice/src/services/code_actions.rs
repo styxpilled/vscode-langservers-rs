@@ -1,10 +1,7 @@
 //! Port of `cssCodeActions.ts`.
 
 use std::cmp::Ordering;
-use std::sync::LazyLock;
 
-use icu_collator::options::CollatorOptions;
-use icu_collator::{Collator, CollatorBorrowed};
 use lsp_types::{
     CodeAction, CodeActionKind, Command, Diagnostic, DocumentChanges, NumberOrString, OneOf,
     OptionalVersionedTextDocumentIdentifier, TextDocumentEdit, TextEdit, WorkspaceEdit,
@@ -15,12 +12,6 @@ use super::lint_rules::UNKNOWN_PROPERTY;
 use crate::language_facts::CssDataManager;
 use crate::parser::Stylesheet;
 use crate::parser::nodes::{Field, Kind};
-
-/// `String.prototype.localeCompare` (ICU collation).
-static COLLATOR: LazyLock<CollatorBorrowed<'static>> = LazyLock::new(|| {
-    Collator::try_new(Default::default(), CollatorOptions::default())
-        .expect("compiled collation data")
-});
 
 /// `doCodeActions`: the code actions as `_css.applyCodeAction` commands.
 pub fn do_code_actions(
@@ -102,19 +93,19 @@ fn get_fixes_for_unknown_property(
     data: &CssDataManager,
     result: &mut Vec<CodeAction>,
 ) {
-    let name: Vec<u16> = property_name.encode_utf16().collect();
+    let name: Vec<char> = property_name.chars().collect();
     let mut candidates: Vec<(&str, f64)> = data
         .get_properties()
         .iter()
         .filter_map(|p| {
-            let score = difference(&name, &p.name.encode_utf16().collect::<Vec<_>>(), 4);
+            let score = difference(&name, &p.name.chars().collect::<Vec<_>>(), 4);
             (score >= name.len() as f64 / 2.0).then_some((p.name.as_str(), score))
         })
         .collect();
     candidates.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(Ordering::Equal)
-            .then_with(|| COLLATOR.compare(a.0, b.0))
+            .then_with(|| a.0.cmp(b.0))
     });
 
     for (candidate, _) in candidates.into_iter().take(3) {
@@ -140,12 +131,12 @@ fn get_fixes_for_unknown_property(
 }
 
 /// `difference` of `utils/strings.ts`: the length of the longest common
-/// subsequence of the UTF-16 units, minus the square root of the length
+/// subsequence of the characters, minus the square root of the length
 /// difference. 0 if the lengths differ by more than `max_len_delta`.
 ///
 /// Upstream shares one row array for all rows of the LCS matrix, which can
 /// count a character more than once. Here each row has its own array.
-fn difference(first: &[u16], second: &[u16], max_len_delta: usize) -> f64 {
+fn difference(first: &[char], second: &[char], max_len_delta: usize) -> f64 {
     let length_difference = first.len().abs_diff(second.len());
     if length_difference > max_len_delta {
         return 0.0;

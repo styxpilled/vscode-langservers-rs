@@ -257,3 +257,27 @@ fn upstream_sweep() {
     eprintln!("{total} completions, {errors} upstream errors, {failures} failures");
     assert_eq!(failures, 0);
 }
+
+fn items_at_end(text: &str) -> Vec<Value> {
+    let data = CssDataManager::new(true, &[]);
+    let doc = document("css", text);
+    let position = doc.position_at(text.len());
+    let (result, _) = complete(Dialect::Css, &data, true, &doc, position, None);
+    result["items"].as_array().unwrap().clone()
+}
+
+/// `docs/experimental.md`: the status of the value, not of the property.
+#[test]
+fn deprecated_tag_of_values() {
+    let items = items_at_end("a { clip: ");
+    let auto = items.iter().find(|i| i["label"] == "auto").unwrap();
+    assert_eq!(auto["tags"], json!([]));
+}
+
+/// `docs/experimental.md`: source order, not `Object.keys` order.
+#[test]
+fn existing_values_in_source_order() {
+    let items = items_at_end("a { foo: 1px } b { foo: 1 } c { foo: ");
+    let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+    assert_eq!(labels[..2], ["1px", "1"]);
+}

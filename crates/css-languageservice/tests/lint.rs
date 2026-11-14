@@ -4,7 +4,7 @@
 use css_languageservice::LanguageSettings;
 use css_languageservice::data::CssDataProvider;
 use css_languageservice::language_facts::CssDataManager;
-use css_languageservice::parser::nodes::{Ast, Level, Marker};
+use css_languageservice::parser::nodes::{Ast, Kind, Level, Marker, NodeId};
 use css_languageservice::parser::{Dialect, Parser, parse_stylesheet};
 use css_languageservice::services::lint::lint_entries;
 use css_languageservice::services::lint_rules::{LintConfigurationSettings, LintSettings};
@@ -80,6 +80,37 @@ fn upstream_lint() {
     }
 }
 
+/// `docs/experimental.md`: upstream parses a hex color of another length as an
+/// error, so the declaration is not checked.
+fn has_other_hex_color(ast: &Ast, root: NodeId) -> bool {
+    let mut found = false;
+    ast.accept(root, &mut |n| {
+        found |= ast.kind(n) == Kind::HexColorValue && ![4, 5, 7, 9].contains(&ast.length(n));
+        !found
+    });
+    found
+}
+
+/// `docs/experimental.md`: upstream never reports `hexColorLength`.
+fn without_hex_color_length(entries: Value) -> Value {
+    let mut entries = entries.as_array().unwrap().clone();
+    entries.retain(|e| e[0] != "hexColorLength");
+    Value::Array(entries)
+}
+
+/// `docs/experimental.md`: upstream repeats a duplicate declaration for each
+/// other declaration of the same name.
+fn duplicates_once(entries: &Value) -> Value {
+    let mut out: Vec<Value> = Vec::new();
+    for e in entries.as_array().unwrap() {
+        if e[0] == "duplicateProperties" && out.last() == Some(e) {
+            continue;
+        }
+        out.push(e.clone());
+    }
+    Value::Array(out)
+}
+
 /// Set `CSS_LINT_SWEEP` to the sweep file of `trace-lint.mjs`.
 #[test]
 fn upstream_sweep() {
@@ -94,10 +125,14 @@ fn upstream_sweep() {
         serde_json::from_value(json!({ "validProperties": ["float", "color", "foo", "width"] }))
             .unwrap(),
     ];
-    let mut failures = 0;
+    let (mut failures, mut skipped) = (0, 0);
     for c in &cases {
         let input = c["input"].as_str().unwrap();
         let sheet = parse_stylesheet(dialect(c["dialect"].as_str().unwrap()), input);
+        if has_other_hex_color(&sheet.ast, sheet.root) {
+            skipped += 1;
+            continue;
+        }
         for (i, s) in settings.iter().enumerate() {
             let entries = lint_entries(
                 &sheet.ast,
@@ -106,8 +141,8 @@ fn upstream_sweep() {
                 &data,
                 ALL,
             );
-            let actual = encode(&sheet.ast, &entries);
-            let expected = &c[format!("e{i}")];
+            let actual = without_hex_color_length(encode(&sheet.ast, &entries));
+            let expected = &duplicates_once(&c[format!("e{i}")]);
             if &actual != expected {
                 failures += 1;
                 if failures <= 10 {
@@ -119,6 +154,7 @@ fn upstream_sweep() {
             }
         }
     }
+    eprintln!("{skipped} inputs with hex colors of other lengths skipped");
     assert_eq!(failures, 0, "{} cases", cases.len());
 }
 
@@ -150,4 +186,72 @@ fn upstream_validation() {
         let result = do_validation(&document, &sheet, settings.as_ref(), &data);
         assert_eq!(serde_json::to_value(&result).unwrap(), c["result"], "{c}");
     }
+}
+
+fn messages(d: Dialect, input: &str, lint: Value) -> Vec<String> {
+    let data = CssDataManager::new(true, &[]);
+    let settings: LanguageSettings = serde_json::from_value(json!({ "lint": lint })).unwrap();
+    let sheet = parse_stylesheet(d, input);
+    let doc = TextDocument::new(
+        "test://t/t.css".parse().unwrap(),
+        "css",
+        0,
+        input.to_owned(),
+    );
+    do_validation(&doc, &sheet, Some(&settings), &data)
+        .iter()
+        .map(|x| {
+            format!(
+                "{}-{} {}",
+                x.range.start.character, x.range.end.character, x.message
+            )
+        })
+        .collect()
+}
+
+/// `docs/experimental.md`: each duplicate declaration once.
+#[test]
+fn duplicate_properties_once() {
+    let lint = json!({ "duplicateProperties": "warning" });
+    let m = messages(
+        Dialect::Css,
+        "a { color: red; color: blue; color: green }",
+        lint,
+    );
+    assert_eq!(m.len(), 3, "{m:?}");
+}
+
+/// `docs/experimental.md`: hex colors of other lengths.
+#[test]
+fn hex_color_length() {
+    let message = "Hex colors must consist of three, four, six or eight hex numbers";
+    assert_eq!(
+        messages(Dialect::Css, "a { color: #12345 }", json!({})),
+        [format!("11-17 {message}")]
+    );
+    assert_eq!(
+        messages(Dialect::Less, "@c: #12345;", json!({})),
+        [format!("4-10 {message}")]
+    );
+    assert!(messages(Dialect::Css, "a { color: #1234 }", json!({})).is_empty());
+}
+
+/// `docs/experimental.md`: names are lowercase in all lookups.
+#[test]
+fn lowercase_names() {
+    let m = messages(
+        Dialect::Css,
+        "a { FOO: 0px }",
+        json!({ "zeroUnits": "warning", "validProperties": ["foo"] }),
+    );
+    assert!(m.is_empty(), "{m:?}");
+    let m = messages(
+        Dialect::Css,
+        "a { -WEBKIT-Transition: none }",
+        json!({ "vendorPrefix": "warning" }),
+    );
+    assert_eq!(
+        m,
+        ["4-22 Also define the standard property 'transition' for compatibility"]
+    );
 }

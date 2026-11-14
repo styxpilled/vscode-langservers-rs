@@ -282,3 +282,19 @@ fn quirks_not_ported() {
         .collect();
     assert_eq!(titles, ["Rename to 'flex'", "Rename to 'left'"]);
 }
+
+/// `docs/experimental.md`: hex components clamp to `00` and `ff`.
+#[test]
+fn hex_presentation_clamps() {
+    let color = Color {
+        red: 1.5,
+        green: -0.5,
+        blue: 0.5,
+        alpha: 1.0,
+    };
+    let labels: Vec<String> = get_color_presentations(color, Range::default())
+        .into_iter()
+        .map(|p| p.label)
+        .collect();
+    assert_eq!(labels[1], "#ff0080");
+}

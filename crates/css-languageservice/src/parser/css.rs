@@ -28,7 +28,7 @@ fn is_hex_color(text: &str) -> bool {
     let Some(hex) = text.strip_prefix('#') else {
         return false;
     };
-    matches!(hex.len(), 3 | 4 | 6 | 8) && hex.bytes().all(|b| b.is_ascii_hexdigit())
+    !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// `/^@(\-(webkit|ms|moz|o)\-)?keyframes$/i`.

@@ -33,13 +33,6 @@ Upstream: `vscode-css-languageservice`, `cssCompletion.ts`, `scssCompletion.ts`,
 
 ## Ported
 
-- `Set.getEntries` is `Object.keys`: keys that are array indexes (`5`, `10`)
-  come first, in numeric order. This changes the order of the existing values of
-  an unknown property.
-- `getValueEnumProposals` tags a value as deprecated by the status of the
-  property, not of the value.
-- Sort text of a property: `(255 - relevance).toString(16)`; a relevance with a
-  fraction from custom data gives a fraction in base 16 (`js_to_radix16`).
 - `getCompletionsForSelector` changes `currentWord` and the default range for
   `:` and `::`. The rest of the call uses the new values (also the participant
   context of `onCssProperty` for nested rule sets). The SCSS selector functions

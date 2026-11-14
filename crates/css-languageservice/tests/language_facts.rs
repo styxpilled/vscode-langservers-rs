@@ -90,7 +90,7 @@ fn lab_arg(v: &Value) -> Lab {
         l: num(&v["l"]),
         a: num(&v["a"]),
         b: num(&v["b"]),
-        alpha: v.get("alpha").filter(|a| !a.is_null()).map(num),
+        alpha: v.get("alpha").filter(|a| !a.is_null()).map_or(1.0, num),
     }
 }
 
@@ -109,16 +109,12 @@ fn color_val(c: Option<Color>) -> Value {
     })
 }
 
-fn opt(x: Option<f64>) -> Value {
-    x.map_or(Value::Null, enc)
-}
-
 fn lab_val(l: Lab) -> Value {
-    json!({ "l": enc(l.l), "a": enc(l.a), "b": enc(l.b), "alpha": opt(l.alpha) })
+    json!({ "l": enc(l.l), "a": enc(l.a), "b": enc(l.b), "alpha": enc(l.alpha) })
 }
 
 fn lch_val(l: Lch) -> Value {
-    json!({ "l": enc(l.l), "c": enc(l.c), "h": enc(l.h), "alpha": opt(l.alpha) })
+    json!({ "l": enc(l.l), "c": enc(l.c), "h": enc(l.h), "alpha": enc(l.alpha) })
 }
 
 fn xyz_val(x: Xyz) -> Value {
@@ -258,7 +254,14 @@ fn check_entries(entries: &[Value]) -> usize {
             }
         }
         let missing = get_missing_baseline_browsers(entry.browsers.as_deref());
-        if Value::Array(actual) != case["descriptions"] || missing != case["missing"] {
+        // `docs/experimental.md`: no "Baseline since undefined".
+        let expected: Value = serde_json::from_str(
+            &case["descriptions"]
+                .to_string()
+                .replace(" (Baseline since undefined)", ""),
+        )
+        .unwrap();
+        if Value::Array(actual) != expected || missing != case["missing"] {
             failures += 1;
             if failures <= 5 {
                 eprintln!("entry {}", case["entry"]);
@@ -416,7 +419,7 @@ fn quirks_not_ported() {
         l: 50.0,
         a: 0.0,
         b: 0.0,
-        alpha: Some(0.5),
+        alpha: 0.5,
     };
     assert_eq!(colors::xyz_from_lab(lab).alpha, 0.5);
 }

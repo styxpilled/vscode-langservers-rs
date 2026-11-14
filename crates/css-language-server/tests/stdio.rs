@@ -292,7 +292,8 @@ fn scoped_settings() {
     assert_eq!(client.response(id), Err(-32800));
     client.send(Response::new_ok(request.id, json!([{}])));
 
-    // A rejected settings request gives the error value.
+    // `docs/experimental.md`: a failed settings request gives the `configure`
+    // settings and is not cached.
     client.notify(
         "workspace/didChangeConfiguration",
         json!({ "settings": {} }),
@@ -301,7 +302,11 @@ fn scoped_settings() {
     let id = client.send_request("textDocument/completion", at(URI, 0, 5));
     let request = client.server_request("workspace/configuration");
     client.send(Response::new_err(request.id, -32603, "failed".into()));
-    assert_eq!(client.response(id), Ok(Value::Null));
+    assert!(client.response(id).unwrap()["items"].is_array());
+    let id = client.send_request("textDocument/completion", at(URI, 0, 5));
+    let request = client.server_request("workspace/configuration");
+    client.send(Response::new_ok(request.id, Value::Null));
+    assert!(client.response(id).unwrap()["items"].is_array());
     assert_eq!(client.exit(), 0);
 }
 
@@ -375,8 +380,14 @@ fn formatting() {
     let options = json!({ "tabSize": 2.7, "insertSpaces": 1, "braceStyle": "collapse,expand" });
     let edits = format(&mut client, options);
     assert_eq!(edits[0]["newText"], "a\n{\n  color: red\n}");
+    // `docs/experimental.md`: an unknown brace style is ignored.
     let edits = format(&mut client, json!({ "braceStyle": "sideways" }));
-    assert_eq!(edits, json!([]));
+    assert_eq!(
+        edits[0]["newText"],
+        "a {
+	color: red
+}"
+    );
     assert_eq!(client.exit(), 0);
 }
 

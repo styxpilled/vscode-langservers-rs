@@ -122,12 +122,22 @@ fn upstream_sweep() {
     }
 }
 
+/// `docs/experimental.md`: upstream parses a hex color of another length as an
+/// error.
+fn has_other_hex_color(tree: &Value) -> bool {
+    (tree["c"] == "HexColorValue" && ![4, 5, 7, 9].contains(&tree["l"].as_u64().unwrap()))
+        || tree["ch"]
+            .as_array()
+            .is_some_and(|ch| ch.iter().any(has_other_hex_color))
+}
+
 fn check(path: &str) {
     let only = std::env::var("CSS_PARSER_DIALECTS").unwrap_or_else(|_| "css,scss,less".into());
     let fixture = std::fs::read_to_string(path).unwrap();
     let cases: Vec<Value> = serde_json::from_str(&fixture).unwrap();
     let mut failures = 0;
     let mut checked = 0;
+    let mut skipped = 0;
     for case in &cases {
         let dialect_name = case["dialect"].as_str().unwrap();
         if !only.split(',').any(|d| d == dialect_name) {
@@ -146,6 +156,10 @@ fn check(path: &str) {
         };
         checked += 1;
         let tree = result.map_or(Value::Null, |id| dump(&parser.ast, id));
+        if has_other_hex_color(&tree) {
+            skipped += 1;
+            continue;
+        }
         let next = json!([
             token_name(&format!("{:?}", parser.token_kind())),
             utf16(input, parser.token_offset() as isize)
@@ -164,6 +178,7 @@ fn check(path: &str) {
             }
         }
     }
+    eprintln!("{skipped} parses with hex colors of other lengths skipped");
     assert!(checked > 0);
     assert_eq!(failures, 0, "{failures} of {checked} parses differ");
 }

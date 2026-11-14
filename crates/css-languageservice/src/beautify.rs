@@ -414,7 +414,7 @@ impl<'a> Beautifier<'a> {
 
     fn found_nested_pseudo_class(&self) -> bool {
         let mut open_paren = 0;
-        for c in self.input.text[self.input.pos..].chars().skip(1) {
+        for c in self.input.text[self.input.pos..].chars() {
             match c {
                 '{' => return true,
                 '(' => open_paren += 1,

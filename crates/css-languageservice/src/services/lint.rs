@@ -1,6 +1,6 @@
 //! Port of `lint.ts`.
 
-use foldhash::HashSet;
+use foldhash::{HashMap, HashSet};
 use indexmap::IndexMap;
 
 use serde_json::Value;
@@ -335,20 +335,21 @@ impl<'a> LintVisitor<'a> {
             ast.field(decl, Field::Value)
                 .is_some_and(|v| byte_at(ast, ast.offset(v)) != Some(b'-'))
         };
-        for (i, element) in property_table.iter().enumerate() {
-            let name = &element.full_property_name;
-            if name != "background"
-                && !self.valid_properties.contains(name)
-                && not_negative(element.node)
-            {
-                let elements = self.fetch(&property_table, name);
-                if elements.len() > 1 {
-                    for other in elements {
-                        if not_negative(other.node) && !std::ptr::eq(other, &property_table[i]) {
-                            self.add_entry(element.node, &rules::DUPLICATE_DECLARATIONS, None);
-                        }
-                    }
-                }
+        let candidates: Vec<&Element> = property_table
+            .iter()
+            .filter(|e| {
+                e.full_property_name != "background"
+                    && !self.valid_properties.contains(&e.full_property_name)
+                    && not_negative(e.node)
+            })
+            .collect();
+        let mut counts: HashMap<&str, usize> = HashMap::default();
+        for e in &candidates {
+            *counts.entry(&e.full_property_name).or_default() += 1;
+        }
+        for e in candidates {
+            if counts[e.full_property_name.as_str()] > 1 {
+                self.add_entry(e.node, &rules::DUPLICATE_DECLARATIONS, None);
             }
         }
 
@@ -383,8 +384,8 @@ impl<'a> LintVisitor<'a> {
                     if !self.data.is_known_property(name) && !self.valid_properties.contains(name) {
                         self.add_entry(property, &rules::UNKNOWN_VENDOR_SPECIFIC_PROPERTY, None);
                     }
-                    let non_prefixed = ast.non_prefixed_property_name(decl);
-                    properties_by_suffix.add(&non_prefixed, name, Some(property));
+                    let non_prefixed = rest.find('-').map_or(name, |end| &rest[end + 1..]);
+                    properties_by_suffix.add(non_prefixed, name, Some(property));
                 }
             } else {
                 let mut short = name;
@@ -516,7 +517,7 @@ impl<'a> LintVisitor<'a> {
         if parse_float(value) == 0.0
             && !self
                 .valid_properties
-                .contains(&ast.full_property_name(decl))
+                .contains(&ast.full_property_name(decl).to_lowercase())
         {
             self.add_entry(node, &rules::ZERO_WITH_UNIT, None);
         }
@@ -558,10 +559,7 @@ impl<'a> LintVisitor<'a> {
     }
 
     fn visit_hex_color_value(&mut self, node: NodeId) -> bool {
-        // Unreachable in practice: the parser makes this node only for valid
-        // lengths.
-        let length = utf16_len(self.ast.get_text(node));
-        if ![9, 7, 5, 4].contains(&length) {
+        if ![9, 7, 5, 4].contains(&self.ast.get_text(node).len()) {
             self.add_entry(node, &rules::HEX_COLOR_LENGTH, None);
         }
         false

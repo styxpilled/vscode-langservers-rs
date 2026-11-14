@@ -76,9 +76,9 @@ struct Document {
     stylesheet: OnceCell<Stylesheet>,
 }
 
-/// The settings of a document from `workspace/configuration`. `Ok(None)` is `undefined`,
-/// `Err` a rejected request.
-type Scoped = Result<Option<Value>, String>;
+/// The settings of a document from `workspace/configuration`. `None` selects the
+/// `configure` settings.
+type Scoped = Option<Value>;
 
 enum DocumentSettings {
     Pending(RequestId),
@@ -380,7 +380,7 @@ impl Server {
     /// `getDocumentSettings`. `Err` is the pending `workspace/configuration` request.
     fn scoped_settings(&mut self, document: &TextDocument) -> Result<Scoped, RequestId> {
         if !self.capabilities.scoped_settings {
-            return Ok(Ok(None));
+            return Ok(None);
         }
         match self.document_settings.get(document.uri()) {
             Some(DocumentSettings::Ready(scoped)) => Ok(scoped.clone()),
@@ -406,18 +406,24 @@ impl Server {
         let Some(Outgoing::Configuration(uri)) = self.outgoing.remove(&response.id) else {
             return;
         };
-        // `then(s => s[0])`.
+        let pending = matches!(self.document_settings.get(&uri), Some(DocumentSettings::Pending(id)) if *id == response.id);
+        // A failed request is not cached: the next request asks again.
         let scoped = match response.response_result {
-            Err(error) => Err(error.message),
-            Ok(Value::Array(mut items)) if !items.is_empty() => Ok(Some(items.swap_remove(0))),
-            Ok(Value::Null) => Err("Cannot read properties of null (reading '0')".to_owned()),
-            Ok(_) => Ok(None),
+            Ok(Value::Array(mut items)) => {
+                let scoped = (!items.is_empty()).then(|| items.swap_remove(0));
+                if pending {
+                    self.document_settings
+                        .insert(uri, DocumentSettings::Ready(scoped.clone()));
+                }
+                scoped
+            }
+            Ok(_) | Err(_) => {
+                if pending {
+                    self.document_settings.remove(&uri);
+                }
+                None
+            }
         };
-        if matches!(self.document_settings.get(&uri), Some(DocumentSettings::Pending(id)) if *id == response.id)
-        {
-            self.document_settings
-                .insert(uri, DocumentSettings::Ready(scoped.clone()));
-        }
         let (ready, waiting) = std::mem::take(&mut self.waiting)
             .into_iter()
             .partition(|(id, _)| *id == response.id);
@@ -568,13 +574,6 @@ impl Server {
         };
         let Some((document, scoped)) = context else {
             return self.send(Response::new_ok(request.id, error_value));
-        };
-        let scoped = match scoped {
-            Ok(scoped) => scoped,
-            Err(message) => {
-                self.log_error(&format!("Error while {action} for {uri}: {message}"));
-                return self.send(Response::new_ok(request.id, error_value));
-            }
         };
         let result = catch_unwind(AssertUnwindSafe(|| -> serde_json::Result<Value> {
             let params = request.params.clone();
@@ -778,12 +777,10 @@ impl Server {
         let Some(document) = self.document(&uri) else {
             return;
         };
-        let result = scoped.and_then(|scoped| {
-            catch_unwind(AssertUnwindSafe(|| {
-                self.validate(&document, scoped.as_ref())
-            }))
-            .map_err(panic_message)
-        });
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            self.validate(&document, scoped.as_ref())
+        }))
+        .map_err(panic_message);
         match result {
             Ok(diagnostics) => self.publish(uri, diagnostics),
             Err(message) => self.log_error(&format!(
@@ -1015,7 +1012,7 @@ impl Server {
         let text = &document.text;
         let full_range = text.full_range();
         self.dialect(text);
-        let options = format_configuration(&p.options)?;
+        let options = format_configuration(&p.options);
         let edits = format(text, Some(p.range.unwrap_or(full_range)), &options);
         if self
             .capabilities

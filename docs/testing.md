@@ -222,6 +222,8 @@ come from `target/replay`. The Node servers:
 
 ### Expected replay differences
 
+Also each difference of `experimental.md`.
+
 JSON:
 
 - `codeActionProvider` in the `initialize` result.

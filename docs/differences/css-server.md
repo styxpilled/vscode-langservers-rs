@@ -37,17 +37,14 @@ Zed differs only in the code actions (`zed.md`).
 ## Ported
 
 - `getDocumentSettings` caches the `workspace/configuration` promise for each
-  document until the next `didChangeConfiguration` or `didClose`. A rejected
-  request (or a `null` result: `s[0]` throws) stays rejected: completion and
-  hover answer `null`, pull diagnostics an empty report, push diagnostics log an
-  error. A request that waits for the settings uses the response even if the
-  cache was reset meanwhile.
+  document until the next `didChangeConfiguration` or `didClose`. A request
+  that waits for the settings uses the response even if the cache was reset
+  meanwhile.
 - `settings[0]` that is `undefined` (an empty result array) selects the
   `configure` settings of the language service; `null` selects no settings.
 - `didChangeConfiguration` with `settings: null` throws: logged, no change.
 - `braceStyle` follows `beautify-css.js`: a list (string split on runs of other
-  characters, or an array), the last item wins, only `expand` is not `collapse`,
-  and an unknown item throws (the request answers `[]` and logs). `tabSize` and
-  `maxPreserveNewLines` go through `parseInt`.
+  characters, or an array), the last item wins, only `expand` is not
+  `collapse`.
 - `foldingRange.rangeLimit` and `rangeFormatting.editLimit`: `0` and non-numbers
   are `Number.MAX_VALUE`.

@@ -104,17 +104,6 @@ impl Elements {
         }
     }
 
-    fn prepend(&mut self, id: ElementId, text: &str) {
-        if let Some(first) = self
-            .get_mut(id)
-            .attributes
-            .as_mut()
-            .and_then(|a| a.first_mut())
-        {
-            first.value = concat(Some(text), "", first.value.as_deref());
-        }
-    }
-
     pub fn find_root(&self, id: ElementId) -> ElementId {
         let mut curr = id;
         while let Some(parent) = self.get(curr).parent
@@ -145,27 +134,17 @@ impl Elements {
         });
     }
 
-    /// `clone`: the copy is always a plain `Element`, as upstream.
-    fn clone_element(&mut self, id: ElementId, clone_children: bool) -> ElementId {
-        let elem = self.create(ElementKind::Element);
-        if let Some(attributes) = self.get(id).attributes.clone() {
-            self.get_mut(elem).attributes = Some(Vec::new());
-            for a in attributes {
-                self.add_attr(elem, &a.name, a.value.as_deref());
-            }
-        }
-        if clone_children && let Some(children) = self.get(id).children.clone() {
-            self.get_mut(elem).children = Some(Vec::new());
-            for child in children {
-                let c = self.clone_element(child, true);
-                self.add_child(elem, c);
-            }
-        }
-        elem
-    }
-
+    /// `cloneWithParent`: copies the element and its ancestors, without children.
     fn clone_with_parent(&mut self, id: ElementId) -> ElementId {
-        let clone = self.clone_element(id, false);
+        let source = self.get(id);
+        let element = Element {
+            kind: source.kind,
+            parent: None,
+            children: None,
+            attributes: source.attributes.clone(),
+        };
+        self.elements.push(element);
+        let clone = ElementId(self.elements.len() - 1);
         if let Some(parent) = self.get(id).parent
             && self.get(parent).kind != ElementKind::Root
         {
@@ -222,7 +201,7 @@ fn print_elements(elements: &Elements, list: &[ElementId], indent: usize, out: &
 fn print_element(elements: &Elements, element: ElementId, indent: usize, out: &mut Vec<String>) {
     let indent = "  ".repeat(indent);
     let name = elements.find_attribute(element, "name").flatten();
-    if elements.get(element).kind == ElementKind::Label || name == Some("\u{2026}") {
+    if elements.get(element).kind == ElementKind::Label {
         out.push(indent + name.unwrap_or("undefined"));
         return;
     }
@@ -264,10 +243,6 @@ pub fn to_element(
                     continue;
                 }
                 result = elements.clone_with_parent(parent);
-                if !segments[0].is_empty() {
-                    let root = elements.find_root(result);
-                    elements.prepend(root, segments[0]);
-                }
                 for (i, segment) in segments.iter().enumerate().skip(1) {
                     if i > 1 {
                         let clone = elements.clone_with_parent(parent);

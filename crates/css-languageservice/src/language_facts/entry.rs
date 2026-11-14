@@ -95,16 +95,17 @@ fn entry_baseline_status(baseline: &BaselineStatus, browsers: Option<&[String]>)
         }
         return status;
     }
-    let year = baseline
-        .baseline_low_date
-        .as_deref()
-        .map_or("undefined", |d| d.split('-').next().unwrap_or(d));
     let level = if baseline.status == "low" {
         "Newly"
     } else {
         "Widely"
     };
-    format!("{level} available across major browsers (Baseline since {year})")
+    let mut status = format!("{level} available across major browsers");
+    if let Some(date) = &baseline.baseline_low_date {
+        let year = date.split('-').next().unwrap_or(date);
+        status += &format!(" (Baseline since {year})");
+    }
+    status
 }
 
 fn entry_baseline_image(baseline: &BaselineStatus) -> String {

@@ -106,9 +106,12 @@ pub fn do_hover(
         let entry_result = if kind.is_declaration() {
             let name = ast.full_property_name(node);
             entry_hover(data.get_property(&name).map(|e| e as &dyn Entry), node)
-        } else if kind == Kind::UnknownAtRule {
-            let entry = data.get_at_directive(ast.get_text(node));
-            entry_hover(entry.map(|e| e as &dyn Entry), node)
+        } else if kind == Kind::UnknownAtRule
+            && let Some(name) = ast.child(node, 0)
+            && offset <= ast.end(name)
+        {
+            let entry = data.get_at_directive(ast.get_text(name));
+            entry_hover(entry.map(|e| e as &dyn Entry), name)
         } else if ast.node_type(node) == NodeType::PseudoSelector {
             let name = ast.get_text(node);
             let entry = if name.starts_with("::") {

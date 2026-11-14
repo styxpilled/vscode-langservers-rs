@@ -10,13 +10,13 @@ use serde::Serialize;
 use text_document::TextDocument;
 
 use crate::language_facts::colors::{
-    Color, get_color_value, hsl_from_color, hwb_from_color, js_round, lab_from_color,
-    lch_from_color, oklab_from_color, oklch_from_color,
+    Color, get_color_value, hsl_from_color, hwb_from_color, lab_from_color, lch_from_color,
+    oklab_from_color, oklch_from_color,
 };
 use crate::parser::Stylesheet;
 use crate::parser::nodes::{Ast, Field, Kind, NodeId, NodeType};
 use crate::parser::symbol_scope::Symbols;
-use crate::utils::{js_number_to_string, js_to_radix16};
+use crate::utils::js_number_to_string;
 
 /// `ColorInformation` with `f64` components.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -400,7 +400,7 @@ pub fn find_document_colors(
 /// `getColorPresentations`.
 pub fn get_color_presentations(color: Color, range: Range) -> Vec<ColorPresentation> {
     let n = js_number_to_string;
-    let round = js_round;
+    let round = f64::round;
     let pct = |x: f64| n(round(x * 100.0));
     let (red256, green256, blue256) = (
         round(color.red * 255.0),
@@ -408,14 +408,7 @@ pub fn get_color_presentations(color: Color, range: Range) -> Vec<ColorPresentat
         round(color.blue * 255.0),
     );
     let (r, g, b) = (n(red256), n(green256), n(blue256));
-    let hex = |x: f64| {
-        let s = if x < 0.0 {
-            format!("-{}", js_to_radix16(-x))
-        } else {
-            js_to_radix16(x)
-        };
-        if s.len() != 2 { format!("0{s}") } else { s }
-    };
+    let hex = |x: f64| format!("{:02x}", x.clamp(0.0, 255.0) as u8);
 
     let mut labels = Vec::with_capacity(8);
     labels.push(if color.alpha == 1.0 {
@@ -446,34 +439,33 @@ pub fn get_color_presentations(color: Color, range: Range) -> Vec<ColorPresentat
         format!("hwb({h} {w}% {b}% / {})", n(hwb.a))
     });
 
-    let alpha = |a: Option<f64>| a.map_or("undefined".to_owned(), n);
     let lab = lab_from_color(color, true);
     let body = format!("{}% {} {}", n(lab.l), n(lab.a), n(lab.b));
-    labels.push(if lab.alpha == Some(1.0) {
+    labels.push(if lab.alpha == 1.0 {
         format!("lab({body})")
     } else {
-        format!("lab({body} / {})", alpha(lab.alpha))
+        format!("lab({body} / {})", n(lab.alpha))
     });
     let lch = lch_from_color(color);
     let body = format!("{}% {} {}", n(lch.l), n(lch.c), n(lch.h));
-    labels.push(if lch.alpha == Some(1.0) {
+    labels.push(if lch.alpha == 1.0 {
         format!("lch({body})")
     } else {
-        format!("lch({body} / {})", alpha(lch.alpha))
+        format!("lch({body} / {})", n(lch.alpha))
     });
     let oklab = oklab_from_color(color, true);
     let body = format!("{}% {} {}", n(oklab.l), n(oklab.a), n(oklab.b));
-    labels.push(if oklab.alpha == Some(1.0) {
+    labels.push(if oklab.alpha == 1.0 {
         format!("oklab({body})")
     } else {
-        format!("oklab({body} / {})", alpha(oklab.alpha))
+        format!("oklab({body} / {})", n(oklab.alpha))
     });
     let oklch = oklch_from_color(color);
     let body = format!("{}% {} {}", n(oklch.l), n(oklch.c), n(oklch.h));
-    labels.push(if oklch.alpha == Some(1.0) {
+    labels.push(if oklch.alpha == 1.0 {
         format!("oklch({body})")
     } else {
-        format!("oklch({body} / {})", alpha(oklch.alpha))
+        format!("oklch({body} / {})", n(oklch.alpha))
     });
 
     labels
