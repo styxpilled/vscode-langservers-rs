@@ -164,23 +164,30 @@ pub fn get_folding_ranges(
         .collect()
 }
 
-/// Port of the upstream pattern `/^\/\/\s*#(region\b)|(endregion\b)/`: `Some(true)` for a region
-/// start, `Some(false)` for a region end.
+/// `/^\/\/\s*#(end)?region\b/`: `Some(true)` for a region start, `Some(false)`
+/// for a region end.
 fn region_marker(comment: &str) -> Option<bool> {
-    if let Some(rest) = comment.strip_prefix("//")
-        && let Some(rest) = rest.trim_start().strip_prefix('#')
-        && rest.starts_with("region")
-        && !rest[6..].starts_with(is_word_char)
-    {
-        return Some(true);
-    }
-    // The second alternative has no `^`, so it matches anywhere in the comment.
-    comment
-        .match_indices("endregion")
-        .any(|(i, m)| !comment[i + m.len()..].starts_with(is_word_char))
-        .then_some(false)
+    let rest = comment.strip_prefix("//")?.trim_start().strip_prefix('#')?;
+    let (start, rest) = match rest.strip_prefix("endregion") {
+        Some(rest) => (false, rest),
+        None => (true, rest.strip_prefix("region")?),
+    };
+    (!rest.starts_with(is_word_char)).then_some(start)
 }
 
 fn is_word_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::region_marker;
+
+    #[test]
+    fn endregion_only_at_start() {
+        assert_eq!(region_marker("// #region a"), Some(true));
+        assert_eq!(region_marker("//  #endregion"), Some(false));
+        assert_eq!(region_marker("// not endregion"), None);
+        assert_eq!(region_marker("// #regions"), None);
+    }
 }

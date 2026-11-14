@@ -153,7 +153,8 @@ The HTML server uses the same helpers for its formatter settings.
   line (137 results, 13 of them where upstream throws). `path_completion_ranges`.
 - Region markers. Upstream `/^\s*#(region\b)|(endregion\b)/` has no `^` for
   `endregion`, so a comment with `endregion` anywhere ends a region. The branch
-  uses `/^\s*#(end)?region\b/`. `endregion_only_at_start`.
+  uses `/^\s*#(end)?region\b/`. The JSON folding has the same pattern after
+  `//` and the same change. `endregion_only_at_start`.
 - Entity hover. Upstream writes the first UTF-16 unit of the character
   (`U+D835` for `&Afr;`). The branch writes the code point (`U+1D504`).
   `entity_hover_code_point`.
