@@ -1,0 +1,33 @@
+[package]
+name = "html-language-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vscode-html-language-server"
+path = "src/main.rs"
+
+[features]
+default = ["javascript"]
+javascript = ["dep:tsrs_compiler", "dep:tsrs_core", "dep:tsrs_ls", "dep:tsrs_lsproto", "dep:tsrs_project", "dep:tsrs_vfs"]
+
+[dependencies]
+css-language-server = { path = "../css-language-server" }
+css-languageservice.workspace = true
+html-languageservice.workspace = true
+lsp-transport.workspace = true
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+lsp-server.workspace = true
+lsp-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+text-document.workspace = true
+vscode-uri.workspace = true
+tsrs_compiler = { workspace = true, optional = true }
+tsrs_core = { workspace = true, optional = true }
+tsrs_ls = { workspace = true, optional = true }
+tsrs_lsproto = { workspace = true, optional = true }
+tsrs_project = { workspace = true, optional = true }
+tsrs_vfs = { workspace = true, optional = true }

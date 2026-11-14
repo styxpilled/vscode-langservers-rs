@@ -1,0 +1,67 @@
+{
+  "schemas": [
+    {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "The name", "markdownDescription": "**Name**", "default": "x", "examples": ["a", "b\nc"] },
+        "version": { "type": "string", "pattern": "^\\d+$", "defaultSnippets": [{ "label": "v1", "body": "^1.0.${1:0}" }, { "bodyText": "\"${1:2}\"", "description": "two" }] },
+        "kind": { "enum": ["a", "b", 1, null, true, { "x": 1 }, [1]], "enumDescriptions": ["A", "B"], "markdownEnumDescriptions": ["*A*"], "enumSortTexts": ["1", "2"], "enumDetails": ["d1"] },
+        "flag": { "type": "boolean", "deprecationMessage": "no" },
+        "hidden": { "type": "string", "doNotSuggest": true },
+        "list": { "type": "array", "uniqueItems": true, "items": { "enum": ["x", "y", "z"] } },
+        "tuple": { "type": "array", "items": [{ "const": "first" }, { "type": "number", "default": 3 }] },
+        "nested": { "type": "object", "properties": { "deep": { "type": ["null", "object"], "properties": { "a": { "type": "integer" } } } }, "additionalProperties": { "type": "boolean" } },
+        "colors": { "type": "array", "items": { "type": "string", "format": "color-hex" } },
+        "one": { "oneOf": [{ "type": "string", "enum": ["s1"] }, { "type": "object", "properties": { "o": { "const": "c" } } }] },
+        "snip": { "defaultSnippets": [{ "body": { "a": "$1", "b": ["^${2:x}"], "2": 1 } }] },
+        "deepItems": { "type": "array", "items": { "type": "array", "items": { "default": { "q": 1 }, "defaultSnippets": [{ "bodyText": "{\n\t\"r\": $1\n}" }] } } },
+        "long": { "enum": ["a very long value that exceeds the label limit of sixty characters by a lot 1", "a very long value that exceeds the label limit of sixty characters by a lot 2", "short\nwith newline"] },
+        "refTest": { "$ref": "#/definitions/d" },
+        "ä€": { "type": "string", "enum": ["ö", "𝄞x", "$}\\"], "title": "Ü  t\tx", "markdownEnumDescriptions": ["`code`", "**b**"] },
+        "anyNum": { "anyOf": [{ "type": "number", "examples": [1.5, 1e21, -0] }, { "type": "null" }], "description": "  lead\n  spaces  " },
+        "obj": { "properties": { "p": {} } },
+        "arr": { "items": { "type": "string" } },
+        "only1": { "enum": ["single"] },
+        "constObj": { "const": { "k": [1, "two"] } },
+        "withDefault": { "type": "object", "default": {} },
+        "nul": { "type": "null" },
+        "multiType": { "type": ["string", "boolean"] },
+        "detail": { "type": "string", "completionDetail": "cd", "suggestSortText": "000" }
+      },
+      "patternProperties": { "^x-": { "type": "string", "default": "ext" } },
+      "propertyNames": { "enum": ["name", "version", "kind", "extra"], "enumDescriptions": ["N"], "examples": ["ex1"], "enumSortTexts": ["s"] },
+      "definitions": { "d": { "type": "number", "title": "D", "description": "a\n  b" } },
+      "if": { "properties": { "kind": { "const": "a" } } },
+      "then": { "properties": { "thenProp": { "type": "string" } } },
+      "else": { "properties": { "elseProp": { "type": "number" } } }
+    },
+    {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": ["object", "array"],
+      "properties": {
+        "ä": { "type": "array", "uniqueItems": true, "prefixItems": [{ "const": "ö" }], "items": { "minLength": 2 } },
+        "€": { "oneOf": [{ "properties": { "𝄞": { "const": null } } }, { "properties": { "𝄞": { "enum": ["x"] } } }] },
+        "a": { "pattern": "^\\p{L}+$", "format": "date-time" },
+        "b": { "$ref": "#/$defs/node" }
+      },
+      "patternProperties": { "^[€é]": { "deprecated": true, "type": "boolean" } },
+      "additionalProperties": { "$dynamicRef": "#node" },
+      "items": { "anyOf": [{ "type": "string", "format": "uri" }, { "multipleOf": 0.01 }] },
+      "$defs": { "node": { "$dynamicAnchor": "node", "type": "object", "properties": { "child": { "$ref": "#node" } } } }
+    }
+  ],
+  "samples": [
+    { "schema": 0, "text": "{ \"name\": \"x\", \"kind\": \"a\", \"list\": [\"x\", ], \"tuple\": [\"first\", ], \"nested\": { \"deep\": { }, \"other\": }, \"colors\": [\"#fff\"] }" },
+    { "schema": 0, "text": "{\n\t\"one\": ,\n\t\"snip\": ,\n\t\"deepItems\": [[ ]],\n\t\"long\": \n}" },
+    { "schema": 0, "text": "{ \"ä€\": \"𝄞x\", \"anyNum\": , \"x-foo\": , \"refTest\": 1, \"version\": \"\" }" },
+    { "schema": 0, "text": "{ \"obj\": , \"arr\": , \"only1\": , \"constObj\": , \"withDefault\": , \"nul\": , \"multiType\": , \"detail\": , \"kind\": 1 }" },
+    { "schema": 0, "text": "{ \"\" }" },
+    { "schema": 0, "text": "{ na" },
+    { "schema": 0, "text": "{ \"kind\": \"b\", // comment\n \"thenProp\": \"\", /* block */ \"elseProp\": 1 }" },
+    { "schema": 0, "text": "" },
+    { "schema": 0, "text": "[" },
+    { "schema": 1, "text": "{ \"ä\": [\"ö\", 1, true], // ü\n \"€\": { \"𝄞\": null } /* 😀\n */, \"é\": , \"b\": { \"child\": { } } }" },
+    { "schema": 1, "text": "[ \"\\é\", é, \"\\u00e9\", /* é" },
+    { "schema": 1, "text": "{\r\n\t\"a\" : \"é\r\n\"b\"\r\n// #region 😀\r\n,\"c\": [1,\r\n2]}" }
+  ]
+}

@@ -1,0 +1,2 @@
+# `mutable_key_type`: the Eq and Hash of `Uri` do not use its cache cell.
+ignore-interior-mutability = ["fluent_uri::Uri"]

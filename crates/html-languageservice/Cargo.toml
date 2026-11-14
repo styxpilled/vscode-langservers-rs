@@ -1,0 +1,14 @@
+[package]
+name = "html-languageservice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+css-languageservice.workspace = true
+icu_collator.workspace = true
+lsp-types.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+text-document.workspace = true
+vscode-uri.workspace = true

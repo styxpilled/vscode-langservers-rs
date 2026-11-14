@@ -1,0 +1,21 @@
+[package]
+name = "css-languageservice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+foldhash.workspace = true
+icu_collator.workspace = true
+indexmap.workspace = true
+libm = "0.2"
+regress.workspace = true
+ryu-js.workspace = true
+lsp-types.workspace = true
+text-document.workspace = true
+vscode-uri.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

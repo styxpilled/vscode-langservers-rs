@@ -1,0 +1,21 @@
+[package]
+name = "json-language-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vscode-json-language-server"
+path = "src/main.rs"
+
+[dependencies]
+json-languageservice.workspace = true
+lsp-transport.workspace = true
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+lsp-server.workspace = true
+lsp-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+vscode-uri.workspace = true

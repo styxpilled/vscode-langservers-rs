@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+jsonc = { path = "crates/jsonc" }
+json-languageservice = { path = "crates/json-languageservice" }
+css-languageservice = { path = "crates/css-languageservice" }
+html-languageservice = { path = "crates/html-languageservice" }
+lsp-transport = { path = "crates/lsp-transport" }
+text-document = { path = "crates/text-document" }
+vscode-uri = { path = "crates/vscode-uri" }
+anyhow = "1.0.104"
+lsp-server = "0.10.0"
+lsp-types = "0.97.0"
+icu_collator = "~2.3"
+indexmap = "2.14.2"
+foldhash = "0.2.0"
+regress = "0.12.0"
+ryu-js = "1.0.3"
+smallvec = { version = "1.16.5", features = ["union", "const_generics"] }
+serde = "1.0.228"
+ureq = "3.5.2"
+crossbeam-channel = "0.5.17"
+url = "2.5.8"
+tsrs_compiler = "=7.1.0-beta.tsrs1"
+tsrs_core = "=7.1.0-beta.tsrs1"
+tsrs_ls = "=7.1.0-beta.tsrs1"
+tsrs_lsproto = "=7.1.0-beta.tsrs1"
+tsrs_project = "=7.1.0-beta.tsrs1"
+tsrs_vfs = "=7.1.0-beta.tsrs1"
+serde_json = { version = "1.0.154", features = ["preserve_order", "float_roundtrip", "raw_value"] }

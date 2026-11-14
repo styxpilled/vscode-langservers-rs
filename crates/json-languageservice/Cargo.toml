@@ -1,0 +1,21 @@
+[package]
+name = "json-languageservice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+icu_collator.workspace = true
+foldhash.workspace = true
+indexmap.workspace = true
+jsonc.workspace = true
+lsp-types.workspace = true
+text-document.workspace = true
+vscode-uri.workspace = true
+regress.workspace = true
+ryu-js.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+url.workspace = true
