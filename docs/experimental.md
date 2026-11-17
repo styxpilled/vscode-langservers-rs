@@ -16,7 +16,7 @@ Upstream parsers and tree walks are recursive. Node throws `RangeError` at about
 `a{`, `(` or `<div>` (6 to 15 KB of text) stopped each server.
 
 - Server thread. Each server runs its loop on a thread with a 256 MiB stack
-  (`lsp_transport::run_server`). This is address space; the system commits pages
+  (`lsp_core::run_server`). This is address space; the system commits pages
   only on use.
 - Nesting limits, 1000 levels. Deeper parts are cut, so the walks after the
   parse also have a bounded depth:
@@ -55,9 +55,9 @@ Upstream parsers and tree walks are recursive. Node throws `RangeError` at about
 - Nested symbols (`documentSymbol` as `DocumentSymbol`, all three servers): a
   client that reads JSON with the default `serde_json` recursion limit (128
   levels) cannot read a response with symbols 62 levels deep, and loses the full
-  response. The symbols below `lsp_transport::MAX_SYMBOL_DEPTH` (50) become
+  response. The symbols below `lsp_core::MAX_SYMBOL_DEPTH` (50) become
   children of their ancestor at that depth, in document order. No symbol is
-  lost. `lsp-transport` `symbol_depth`; `tests/stdio.rs` of each server.
+  lost. `lsp-core` `symbol_depth`; `tests/stdio.rs` of each server.
 - Not limited: the JavaScript mode (tsrs, one more document). No overflow up to
   6000 levels, but its time grows as the cube of the depth (3000 levels: 1.9 s,
   6000: 14.5 s, 12000: more than 60 s).
@@ -71,7 +71,7 @@ Upstream servers limit results only when the client gives a limit. The VS Code
 client gives 5000 symbols (`json.maxItemsComputed`), 5000 folding ranges
 (`editor.foldingMaximumRegions`) and 500 colors (`editor.colorDecoratorsLimit`).
 Zed gives none. The branch uses these values when the client gives none
-(`lsp_transport::DEFAULT_RESULT_LIMIT`, `DEFAULT_COLOR_LIMIT`): folding ranges
+(`lsp_core::DEFAULT_RESULT_LIMIT`, `DEFAULT_COLOR_LIMIT`): folding ranges
 in all three servers; symbols and colors in the JSON server, as only its
 upstream has these settings. Zed shows no notice when a result is cut.
 `tests/stdio.rs` of each server (`default_limits`, `default_folding_limit`).
@@ -84,7 +84,7 @@ Upstream sends each completion item complete: `textEdit` with the range,
 `insertTextFormat`, `documentation` and the retrigger `command`. A CSS property
 list is about 400 KB, and 73% of it is documentation. When the client declares
 support (`completionList.itemDefaults`, `completionItem.resolveSupport`), the
-CSS and HTML servers send smaller lists (`lsp_transport::completion`):
+CSS and HTML servers send smaller lists (`lsp_core::completion`):
 
 - `itemDefaults.editRange`: the range of the service (CSS), or the most common
   item range (HTML). An item with this range has `textEditText` in place of
@@ -98,7 +98,7 @@ CSS and HTML servers send smaller lists (`lsp_transport::completion`):
   the commands of `executeCommandProvider`).
 - Empty `tags` are left out.
 
-Script items (JavaScript mode) do not change. `lsp-transport` tests,
+Script items (JavaScript mode) do not change. `lsp-core` tests,
 `tests/stdio.rs` (`compact_completion`) of both servers. Effect on the Zed
 sessions: CSS 96 completions 38.2 MB against 4.2 MB (average 398 KB against 44
 KB, largest 1157 KB against 119 KB), 317 ms against 101 ms in `lsp-replay`; HTML

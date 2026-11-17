@@ -1,12 +1,10 @@
 //! Port of `cssServer.ts`, `customData.ts`, `utils/runner.ts` and `utils/validation.ts`.
 
 use std::cell::{OnceCell, RefCell};
-use std::collections::{HashMap, VecDeque};
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, at, never, select};
+use crossbeam_channel::Receiver;
 use css_languageservice::data::CssDataProvider;
 use css_languageservice::language_facts::CssDataManager;
 use css_languageservice::language_facts::colors::Color;
@@ -23,9 +21,13 @@ use css_languageservice::services::navigation::{
 };
 use css_languageservice::services::selection_range::get_selection_ranges;
 use css_languageservice::services::validation::do_validation;
+use lsp_core::completion::{CompactList, CompletionSupport, ResolveStore};
+use lsp_core::server::{
+    Core, FullDiagnosticReport, Scoped, ScopedSettings, Service, capability, catch,
+    contains_markdown, limit, unwrap_positional,
+};
+use lsp_core::{DEFAULT_RESULT_LIMIT, Writer};
 use lsp_server::{ErrorCode, Message, Notification, Request, RequestId, Response};
-use lsp_transport::completion::{CompactList, CompletionSupport, ResolveStore};
-use lsp_transport::{DEFAULT_RESULT_LIMIT, Writer};
 use lsp_types::{
     CodeAction, CodeActionParams, ColorPresentation, CompletionParams, Diagnostic,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
@@ -45,8 +47,6 @@ use crate::settings::{
     validation_settings,
 };
 
-const VALIDATION_DELAY: Duration = Duration::from_millis(500);
-
 /// `ColorPresentationParams` with the `f64` `Color`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,25 +65,9 @@ struct FormattingParams {
     options: Value,
 }
 
-/// `lsp-types` has no type for this response without `relatedDocuments`.
-#[derive(Serialize)]
-struct FullDiagnosticReport {
-    kind: &'static str,
-    items: Vec<Diagnostic>,
-}
-
 struct Document {
     text: TextDocument,
     stylesheet: OnceCell<Stylesheet>,
-}
-
-/// The settings of a document from `workspace/configuration`. `None` selects the
-/// `configure` settings.
-type Scoped = Option<Value>;
-
-enum DocumentSettings {
-    Pending(RequestId),
-    Ready(Scoped),
 }
 
 /// An operation that waits for the settings of a document.
@@ -93,25 +77,20 @@ enum Job {
     Validate(Uri),
 }
 
-enum Outgoing {
-    Configuration(Uri),
-    Other,
-}
+/// A `workspace/configuration` request for a document.
+pub struct Outgoing(Uri);
 
 struct Capabilities {
     scoped_settings: bool,
     folding_range_limit: Option<usize>,
     formatter_edit_limit: Option<usize>,
-    pull_diagnostics: bool,
     hover_markdown: bool,
     completion_markdown: bool,
     completion: CompletionSupport,
 }
 
 pub struct Server {
-    writer: Writer,
-    receiver: Receiver<Message>,
-    inbox: VecDeque<Message>,
+    core: Core<Outgoing>,
     capabilities: Capabilities,
     workspace_folders: Vec<String>,
     request_service: RequestService,
@@ -121,43 +100,7 @@ pub struct Server {
     /// read their `configure` settings from it.
     configured: Value,
     documents: HashMap<Uri, Rc<Document>>,
-    document_settings: HashMap<Uri, DocumentSettings>,
-    waiting: Vec<(RequestId, Job)>,
-    pending_validations: HashMap<Uri, Instant>,
-    outgoing: HashMap<RequestId, Outgoing>,
-    next_id: i32,
-    shutdown: bool,
-}
-
-/// `getClientCapability`.
-fn capability<'a>(capabilities: &'a Value, path: &str) -> Option<&'a Value> {
-    path.split('.')
-        .try_fold(capabilities, |c, key| c.as_object()?.get(key))
-}
-
-fn contains_markdown(value: Option<&Value>) -> bool {
-    value
-        .and_then(Value::as_array)
-        .is_some_and(|a| a.iter().any(|f| f == "markdown"))
-}
-
-/// A number setting where `0` and non-numbers are `Number.MAX_VALUE`.
-fn limit(value: Option<&Value>) -> Option<usize> {
-    match value.and_then(Value::as_f64) {
-        Some(n) if n != 0.0 => {
-            let n = n.max(0.0).trunc();
-            (n < usize::MAX as f64).then_some(n as usize)
-        }
-        _ => None,
-    }
-}
-
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|s| s.to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "panic".to_owned())
+    settings: ScopedSettings<Job>,
 }
 
 /// `fetchDataProviders` for one path.
@@ -202,12 +145,14 @@ impl Server {
         ));
         let capabilities = Capabilities {
             scoped_settings: truthy(capability(caps, "workspace.configuration")),
-            folding_range_limit: limit(capability(caps, "textDocument.foldingRange.rangeLimit"))
-                .or(Some(DEFAULT_RESULT_LIMIT)),
+            folding_range_limit: limit(
+                capability(caps, "textDocument.foldingRange.rangeLimit"),
+                Some(DEFAULT_RESULT_LIMIT),
+            ),
             formatter_edit_limit: limit(
                 options.pointer("/customCapabilities/rangeFormatting/editLimit"),
+                None,
             ),
-            pull_diagnostics: capability(caps, "textDocument.diagnostic").is_some(),
             hover_markdown: contains_markdown(capability(caps, "textDocument.hover.contentFormat")),
             completion_markdown: contains_markdown(capability(
                 caps,
@@ -249,10 +194,9 @@ impl Server {
                 "triggerCharacters": ["/", "-", ":"]
             });
         }
+        let pull_diagnostics = capability(caps, "textDocument.diagnostic").is_some();
         let server = Server {
-            writer,
-            receiver,
-            inbox: VecDeque::new(),
+            core: Core::new(writer, receiver, pull_diagnostics),
             capabilities,
             workspace_folders,
             request_service: RequestService { handled_schemas },
@@ -260,95 +204,14 @@ impl Server {
             resolve: RefCell::default(),
             configured: Value::Null,
             documents: HashMap::new(),
-            document_settings: HashMap::new(),
-            waiting: Vec::new(),
-            pending_validations: HashMap::new(),
-            outgoing: HashMap::new(),
-            next_id: 0,
-            shutdown: false,
+            settings: ScopedSettings::default(),
         };
         (server, result)
     }
 
     /// Returns whether the client sent `shutdown` before `exit`.
     pub fn run(mut self) -> bool {
-        loop {
-            let message = match self.inbox.pop_front() {
-                Some(message) => message,
-                None => {
-                    let receiver = self.receiver.clone();
-                    let timer = match self.pending_validations.values().min() {
-                        Some(&deadline) => at(deadline),
-                        None => never(),
-                    };
-                    select! {
-                        recv(receiver) -> message => match message {
-                            Ok(message) => message,
-                            Err(_) => return self.shutdown,
-                        },
-                        recv(timer) -> _ => {
-                            self.run_due_validations();
-                            continue;
-                        }
-                    }
-                }
-            };
-            match message {
-                Message::Request(request) => self.on_request(request),
-                Message::Notification(notification) if notification.method == "exit" => {
-                    return self.shutdown;
-                }
-                Message::Notification(notification) => self.on_notification(notification),
-                Message::Response(response) => self.on_response(response),
-            }
-        }
-    }
-
-    fn send(&self, message: impl Into<Message>) {
-        self.writer.message(message.into());
-    }
-
-    fn notify(&self, method: &str, params: impl Serialize) {
-        self.writer.notification(method, &params);
-    }
-
-    fn send_request(&mut self, method: &str, params: impl Serialize, kind: Outgoing) -> RequestId {
-        self.next_id += 1;
-        let id = RequestId::from(self.next_id);
-        self.outgoing.insert(id.clone(), kind);
-        self.send(Request::new(id.clone(), method.to_owned(), params));
-        id
-    }
-
-    fn log(&self, kind: u8, message: &str) {
-        self.notify(
-            "window/logMessage",
-            json!({ "type": kind, "message": message }),
-        );
-    }
-
-    fn log_error(&self, message: &str) {
-        self.log(1, message);
-    }
-
-    fn respond_cancelled(&self, id: RequestId) {
-        self.send(Response::new_err(
-            id,
-            ErrorCode::RequestCanceled as i32,
-            "Request cancelled".to_owned(),
-        ));
-    }
-
-    /// Looks ahead in the received messages for a `$/cancelRequest` of `id`.
-    fn take_cancellation(&mut self, id: &RequestId) -> bool {
-        while let Ok(message) = self.receiver.try_recv() {
-            self.inbox.push_back(message);
-        }
-        let position = self.inbox.iter().position(|m| {
-            matches!(m, Message::Notification(n) if n.method == "$/cancelRequest"
-                && serde_json::from_value::<RequestId>(n.params["id"].clone()).ok().as_ref() == Some(id))
-        });
-        position.map(|i| self.inbox.remove(i)).is_some()
+        lsp_core::server::run(&mut self)
     }
 
     /// `getLanguageService`.
@@ -358,7 +221,10 @@ impl Server {
             "scss" => Dialect::Scss,
             "less" => Dialect::Less,
             id => {
-                self.log(4, &format!("Document type is {id}, using css instead."));
+                self.core.notify(
+                    "window/logMessage",
+                    json!({ "type": 4, "message": format!("Document type is {id}, using css instead.") }),
+                );
                 Dialect::Css
             }
         }
@@ -383,91 +249,35 @@ impl Server {
         self.documents.get(uri).cloned()
     }
 
-    /// `getDocumentSettings`. `Err` is the pending `workspace/configuration` request.
-    fn scoped_settings(&mut self, document: &TextDocument) -> Result<Scoped, RequestId> {
+    /// `getDocumentSettings`. `None`: `job` waits for the settings.
+    fn scoped_settings(
+        &mut self,
+        document: &TextDocument,
+        job: impl FnOnce() -> Job,
+    ) -> Option<Scoped> {
         if !self.capabilities.scoped_settings {
-            return Ok(None);
+            return Some(None);
         }
-        match self.document_settings.get(document.uri()) {
-            Some(DocumentSettings::Ready(scoped)) => Ok(scoped.clone()),
-            Some(DocumentSettings::Pending(id)) => Err(id.clone()),
-            None => {
-                let params = json!({
-                    "items": [{ "scopeUri": document.uri(), "section": document.language_id() }]
-                });
-                let uri = document.uri().clone();
-                let id = self.send_request(
-                    "workspace/configuration",
-                    params,
-                    Outgoing::Configuration(uri.clone()),
-                );
-                self.document_settings
-                    .insert(uri, DocumentSettings::Pending(id.clone()));
-                Err(id)
-            }
-        }
+        let uri = document.uri();
+        self.settings.get(
+            &mut self.core,
+            uri,
+            || vec![json!({ "scopeUri": uri, "section": document.language_id() })],
+            || Outgoing(uri.clone()),
+            job,
+        )
     }
 
-    fn on_response(&mut self, response: Response) {
-        let Some(Outgoing::Configuration(uri)) = self.outgoing.remove(&response.id) else {
-            return;
-        };
-        let pending = matches!(self.document_settings.get(&uri), Some(DocumentSettings::Pending(id)) if *id == response.id);
-        // A failed request is not cached: the next request asks again.
-        let scoped = match response.response_result {
-            Ok(Value::Array(mut items)) => {
-                let scoped = (!items.is_empty()).then(|| items.swap_remove(0));
-                if pending {
-                    self.document_settings
-                        .insert(uri, DocumentSettings::Ready(scoped.clone()));
-                }
-                scoped
-            }
-            Ok(_) | Err(_) => {
-                if pending {
-                    self.document_settings.remove(&uri);
-                }
-                None
-            }
-        };
-        let (ready, waiting) = std::mem::take(&mut self.waiting)
-            .into_iter()
-            .partition(|(id, _)| *id == response.id);
-        self.waiting = waiting;
-        for (_, job) in ready {
-            match job {
-                Job::Request(request, document) => {
-                    let document = self.document(document.text.uri()).unwrap_or(document);
-                    self.with_settings(request, &document, scoped.clone());
-                }
-                Job::Validate(uri) => self.finish_validation(uri, scoped.clone()),
-            }
-        }
-    }
-
-    fn on_request(&mut self, request: Request) {
-        if request.method == "shutdown" {
-            self.shutdown = true;
-            self.send(Response::new_ok(request.id, Value::Null));
-            return;
-        }
-        if self.take_cancellation(&request.id) {
-            self.respond_cancelled(request.id);
-            return;
-        }
-        self.dispatch(request);
-    }
-
-    fn dispatch(&mut self, request: Request) {
+    fn request(&mut self, request: Request) {
         let empty = || json!([]);
         match request.method.as_str() {
             "textDocument/completion" | "textDocument/hover" => self.needs_settings(request),
             "completionItem/resolve" => {
                 let mut item = request.params;
                 self.resolve.borrow().resolve(&mut item);
-                self.send(Response::new_ok(request.id, item));
+                self.core.send(Response::new_ok(request.id, item));
             }
-            "textDocument/diagnostic" if self.capabilities.pull_diagnostics => {
+            "textDocument/diagnostic" if self.core.pull_diagnostics() => {
                 self.needs_settings(request)
             }
             "textDocument/documentSymbol" => self.handle(
@@ -536,7 +346,7 @@ impl Server {
             "textDocument/formatting" => {
                 self.handle(request, empty(), "formatting", Self::formatting)
             }
-            _ => self.send(Response::new_err(
+            _ => self.core.send(Response::new_err(
                 request.id,
                 ErrorCode::MethodNotFound as i32,
                 format!("Unhandled method {}", request.method),
@@ -553,9 +363,9 @@ impl Server {
         let Some(document) = uri.and_then(|uri| self.document(&uri)) else {
             return self.with_settings_or_default(request, None);
         };
-        match self.scoped_settings(&document.text) {
-            Ok(scoped) => self.with_settings(request, &document, scoped),
-            Err(id) => self.waiting.push((id, Job::Request(request, document))),
+        let job = || Job::Request(request.clone(), document.clone());
+        if let Some(scoped) = self.scoped_settings(&document.text, job) {
+            self.with_settings(request, &document, scoped);
         }
     }
 
@@ -569,24 +379,18 @@ impl Server {
         request: Request,
         context: Option<(&Rc<Document>, Scoped)>,
     ) {
-        let uri = request
-            .params
-            .pointer("/textDocument/uri")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
         let (error_value, action) = match request.method.as_str() {
-            "textDocument/completion" => (Value::Null, "computing completions"),
-            "textDocument/hover" => (Value::Null, "computing hover"),
+            "textDocument/completion" => (Value::Null, "computing completions for"),
+            "textDocument/hover" => (Value::Null, "computing hover for"),
             _ => (
                 json!({ "kind": "full", "items": [] }),
-                "computing diagnostics",
+                "computing diagnostics for",
             ),
         };
         let Some((document, scoped)) = context else {
-            return self.send(Response::new_ok(request.id, error_value));
+            return self.core.send(Response::new_ok(request.id, error_value));
         };
-        let result = catch_unwind(AssertUnwindSafe(|| -> serde_json::Result<Value> {
+        let result = catch(|| -> serde_json::Result<Value> {
             let params = request.params.clone();
             Ok(match request.method.as_str() {
                 "textDocument/completion" => json!(self.completion(
@@ -599,29 +403,24 @@ impl Server {
                 }
                 _ => {
                     let _: DocumentDiagnosticParams = serde_json::from_value(params)?;
-                    json!(FullDiagnosticReport {
-                        kind: "full",
-                        items: self.validate(document, scoped.as_ref()),
-                    })
+                    json!(FullDiagnosticReport::new(
+                        self.validate_document(document, scoped.as_ref())
+                    ))
                 }
             })
-        }));
+        });
         match result {
-            Ok(Ok(result)) => self.writer.response(request.id, &result),
-            Ok(Err(e)) => self.send(Response::new_err(
+            Ok(Ok(result)) => self.core.respond(request.id, &result),
+            Ok(Err(e)) => self.core.send(Response::new_err(
                 request.id,
                 ErrorCode::InvalidParams as i32,
                 e.to_string(),
             )),
-            Err(payload) => {
-                let message = panic_message(payload);
-                self.log_error(&format!("Error while {action} for {uri}: {message}"));
-                self.send(Response::new_ok(request.id, error_value));
-            }
+            Err(message) => self.core.fail(request, error_value, action, &message),
         }
     }
 
-    /// `runSafeAsync`: a panic gives `error_value`.
+    /// `runSafeAsync`: an error or a panic gives `error_value`.
     fn handle<P: DeserializeOwned, R: Serialize>(
         &mut self,
         request: Request,
@@ -629,38 +428,10 @@ impl Server {
         action: &str,
         f: fn(&mut Self, P) -> Result<R, String>,
     ) {
-        let params: P = match serde_json::from_value(request.params.clone()) {
-            Ok(params) => params,
-            Err(e) => {
-                return self.send(Response::new_err(
-                    request.id,
-                    ErrorCode::InvalidParams as i32,
-                    e.to_string(),
-                ));
-            }
-        };
-        let message = match catch_unwind(AssertUnwindSafe(|| f(self, params))) {
-            Ok(Ok(result)) => return self.writer.response(request.id, &result),
-            Ok(Err(message)) => message,
-            Err(payload) => panic_message(payload),
-        };
-        let uri = request
-            .params
-            .pointer("/textDocument/uri")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        self.log_error(&format!("Error while {action} for {uri}: {message}"));
-        self.send(Response::new_ok(request.id, error_value));
+        lsp_core::server::handle(self, request, error_value, &format!("{action} for"), f);
     }
 
-    fn on_notification(&mut self, notification: Notification) {
-        let method = notification.method.clone();
-        if let Err(e) = self.try_on_notification(notification) {
-            self.log_error(&format!("Error while handling {method}: {e}"));
-        }
-    }
-
-    fn try_on_notification(&mut self, notification: Notification) -> anyhow::Result<()> {
+    fn notification(&mut self, notification: Notification) -> anyhow::Result<()> {
         let params = notification.params;
         match notification.method.as_str() {
             "textDocument/didOpen" => {
@@ -675,7 +446,7 @@ impl Server {
                         stylesheet: OnceCell::new(),
                     }),
                 );
-                self.trigger_validation(item.uri);
+                self.core.trigger_validation(item.uri);
             }
             "textDocument/didChange" => {
                 let p: DidChangeTextDocumentParams = serde_json::from_value(params)?;
@@ -695,17 +466,14 @@ impl Server {
                         stylesheet: OnceCell::new(),
                     }),
                 );
-                self.trigger_validation(uri);
+                self.core.trigger_validation(uri);
             }
             "textDocument/didClose" => {
                 let p: DidCloseTextDocumentParams = serde_json::from_value(params)?;
                 let uri = p.text_document.uri;
                 self.documents.remove(&uri);
-                self.document_settings.remove(&uri);
-                if !self.capabilities.pull_diagnostics {
-                    self.pending_validations.remove(&uri);
-                    self.publish(uri, Vec::new());
-                }
+                self.settings.remove(&uri);
+                self.core.close(uri);
             }
             "workspace/didChangeConfiguration" => {
                 let settings = params.get("settings").cloned().unwrap_or(Value::Null);
@@ -713,16 +481,11 @@ impl Server {
                     anyhow::bail!("Cannot read properties of {settings} (reading 'css')");
                 }
                 self.configured = settings;
-                self.document_settings.clear();
-                self.request_refresh();
+                self.settings.clear();
+                self.core.request_refresh(self.documents.keys());
             }
             "css/customDataChanged" => {
-                // `vscode-jsonrpc` sends an array parameter as `[array]`.
-                let params = match params {
-                    Value::Array(mut a) if a.len() == 1 && a[0].is_array() => a.remove(0),
-                    params => params,
-                };
-                let paths: Vec<String> = serde_json::from_value(params)?;
+                let paths: Vec<String> = serde_json::from_value(unwrap_positional(params, true))?;
                 let providers: Vec<CssDataProvider> = paths
                     .iter()
                     .map(|p| data_provider(&self.request_service, p))
@@ -731,55 +494,16 @@ impl Server {
             }
             "$/cancelRequest" => {
                 let id: RequestId = serde_json::from_value(params["id"].clone())?;
-                let before = self.waiting.len();
-                self.waiting
-                    .retain(|(_, job)| !matches!(job, Job::Request(r, _) if r.id == id));
-                if self.waiting.len() < before {
-                    self.respond_cancelled(id);
+                if self
+                    .settings
+                    .cancel(|job| matches!(job, Job::Request(r, _) if r.id == id))
+                {
+                    self.core.respond_cancelled(id);
                 }
             }
             _ => {}
         }
         Ok(())
-    }
-
-    fn request_refresh(&mut self) {
-        if self.capabilities.pull_diagnostics {
-            self.send_request("workspace/diagnostic/refresh", Value::Null, Outgoing::Other);
-        } else {
-            let uris: Vec<Uri> = self.documents.keys().cloned().collect();
-            for uri in uris {
-                self.trigger_validation(uri);
-            }
-        }
-    }
-
-    fn trigger_validation(&mut self, uri: Uri) {
-        if self.capabilities.pull_diagnostics {
-            return;
-        }
-        self.pending_validations
-            .insert(uri, Instant::now() + VALIDATION_DELAY);
-    }
-
-    fn run_due_validations(&mut self) {
-        let now = Instant::now();
-        let due: Vec<Uri> = self
-            .pending_validations
-            .iter()
-            .filter(|(_, deadline)| **deadline <= now)
-            .map(|(uri, _)| uri.clone())
-            .collect();
-        for uri in due {
-            self.pending_validations.remove(&uri);
-            let Some(document) = self.document(&uri) else {
-                continue;
-            };
-            match self.scoped_settings(&document.text) {
-                Ok(scoped) => self.finish_validation(uri, scoped),
-                Err(id) => self.waiting.push((id, Job::Validate(uri))),
-            }
-        }
     }
 
     /// Validates the current text, so a change during the wait for the settings does not
@@ -788,28 +512,17 @@ impl Server {
         let Some(document) = self.document(&uri) else {
             return;
         };
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            self.validate(&document, scoped.as_ref())
-        }))
-        .map_err(panic_message);
-        match result {
-            Ok(diagnostics) => self.publish(uri, diagnostics),
-            Err(message) => self.log_error(&format!(
+        match catch(|| self.validate_document(&document, scoped.as_ref())) {
+            Ok(diagnostics) => self.core.publish(uri, diagnostics),
+            Err(message) => self.core.log_error(&format!(
                 "Error while validating {}: {message}",
                 uri.as_str()
             )),
         }
     }
 
-    fn publish(&self, uri: Uri, diagnostics: Vec<Diagnostic>) {
-        self.notify(
-            "textDocument/publishDiagnostics",
-            json!({ "uri": uri, "diagnostics": diagnostics }),
-        );
-    }
-
     /// `validateTextDocument`.
-    fn validate(&self, document: &Document, scoped: Option<&Value>) -> Vec<Diagnostic> {
+    fn validate_document(&self, document: &Document, scoped: Option<&Value>) -> Vec<Diagnostic> {
         let settings = match scoped {
             None => self.configured(&document.text),
             scoped => scoped,
@@ -880,7 +593,7 @@ impl Server {
         };
         self.dialect(&document.text);
         let mut symbols = find_document_symbols(&document.text, self.stylesheet(&document));
-        lsp_transport::cap_symbol_depth(&mut symbols);
+        lsp_core::cap_symbol_depth(&mut symbols);
         Ok(symbols)
     }
 
@@ -1042,5 +755,50 @@ impl Server {
             }]);
         }
         Ok(edits)
+    }
+}
+
+impl Service for Server {
+    type Outgoing = Outgoing;
+    type Event = ();
+
+    fn core(&mut self) -> &mut Core<Outgoing> {
+        &mut self.core
+    }
+
+    fn dispatch(&mut self, request: Request) {
+        self.request(request);
+    }
+
+    fn on_notification(&mut self, notification: Notification) -> anyhow::Result<()> {
+        self.notification(notification)
+    }
+
+    fn on_response(&mut self, response: Response, Outgoing(uri): Outgoing) {
+        // A failed request is not cached: the next request asks again.
+        let scoped = match response.response_result {
+            Ok(Value::Array(mut items)) => Some((!items.is_empty()).then(|| items.swap_remove(0))),
+            Ok(_) | Err(_) => None,
+        };
+        for job in self.settings.resolve(uri, &response.id, scoped.as_ref()) {
+            let scoped = scoped.clone().flatten();
+            match job {
+                Job::Request(request, document) => {
+                    let document = self.document(document.text.uri()).unwrap_or(document);
+                    self.with_settings(request, &document, scoped);
+                }
+                Job::Validate(uri) => self.finish_validation(uri, scoped),
+            }
+        }
+    }
+
+    fn validate(&mut self, uri: Uri) {
+        let Some(document) = self.document(&uri) else {
+            return;
+        };
+        let job = || Job::Validate(uri.clone());
+        if let Some(scoped) = self.scoped_settings(&document.text, job) {
+            self.finish_validation(uri, scoped);
+        }
     }
 }

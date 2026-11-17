@@ -1,5 +1,5 @@
 [package]
-name = "lsp-transport"
+name = "lsp-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,3 +10,4 @@ lsp-server.workspace = true
 lsp-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+anyhow.workspace = true

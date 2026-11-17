@@ -77,7 +77,7 @@ that start them with `--stdio`.
 | [`html-language-server`](crates/html-language-server) | `microsoft/vscode` `extensions/html-language-features/server` |
 | [`text-document`](crates/text-document)               | `vscode-languageserver-textdocument`                          |
 | [`vscode-uri`](crates/vscode-uri)                     | `microsoft/vscode-uri` (parts)                                |
-| [`lsp-transport`](crates/lsp-transport)               | stdio transport of the servers                                |
+| [`lsp-core`](crates/lsp-core)                         | transport and main loop of the servers                        |
 | [`lsp-recorder`](crates/lsp-recorder)                 | session recorder and replay tool (tests)                      |
 
 ## Documentation

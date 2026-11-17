@@ -3,22 +3,24 @@
 //! (`zed-industries/vscode`, branch `html-tags-as-workspace-edits`).
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, at, never, select};
+use crossbeam_channel::Receiver;
 use css_language_server::fs::RequestService;
 use css_language_server::settings::{get, truthy};
 use css_languageservice::language_facts::colors::Color;
 use css_languageservice::services::links::DocumentLink;
 use css_languageservice::services::navigation::ColorInformation;
 use html_languageservice::{HtmlDataProvider, LanguageService};
+use lsp_core::completion::{CompletionSupport, ResolveStore};
+use lsp_core::server::{
+    Core, Scoped, ScopedSettings, Service, capability, catch, contains_markdown, limit,
+    unwrap_positional,
+};
+use lsp_core::{DEFAULT_RESULT_LIMIT, Writer};
 use lsp_server::{ErrorCode, Message, Notification, Request, RequestId, Response};
-use lsp_transport::completion::{CompletionSupport, ResolveStore};
-use lsp_transport::{DEFAULT_RESULT_LIMIT, Writer};
 use lsp_types::{
     ClientCapabilities, Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DocumentSymbolResponse, FoldingRange, Position, Range,
@@ -32,8 +34,6 @@ use text_document::TextDocument;
 
 use crate::context::WorkspaceContext;
 use crate::modes::{Completions, Document, LanguageModes, Mode};
-
-const VALIDATION_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -95,15 +95,6 @@ struct AutoInsertParams {
     position: Position,
 }
 
-/// The settings of a document from `workspace/configuration`. `None` selects the
-/// global settings.
-type Scoped = Option<Value>;
-
-enum DocumentSettings {
-    Pending(RequestId),
-    Ready(Scoped),
-}
-
 /// An operation that waits for the settings of a document.
 enum Job {
     /// The document at the time of the request. It is used if the document closes.
@@ -111,11 +102,10 @@ enum Job {
     Validate(Uri),
 }
 
-enum Outgoing {
+pub enum Outgoing {
     Configuration(Uri),
     /// `html/customDataContent` for the path at an index of a batch.
     CustomData(u32, usize),
-    Other,
 }
 
 struct Capabilities {
@@ -125,7 +115,6 @@ struct Capabilities {
     snippet_edit: bool,
     folding_range_limit: Option<usize>,
     formatter_edit_limit: Option<usize>,
-    pull_diagnostics: bool,
     hierarchical_document_symbols: bool,
     completion: CompletionSupport,
 }
@@ -137,9 +126,7 @@ struct CustomDataBatch {
 }
 
 pub struct Server {
-    writer: Writer,
-    receiver: Receiver<Message>,
-    inbox: VecDeque<Message>,
+    core: Core<Outgoing>,
     capabilities: Capabilities,
     workspace_folders: Vec<String>,
     modes: LanguageModes,
@@ -148,52 +135,16 @@ pub struct Server {
     /// `workspace/didChangeConfiguration`, `{}` before.
     global: Value,
     documents: HashMap<Uri, Rc<Document>>,
-    document_settings: HashMap<Uri, DocumentSettings>,
-    waiting: Vec<(RequestId, Job)>,
-    pending_validations: HashMap<Uri, Instant>,
-    outgoing: HashMap<RequestId, Outgoing>,
+    settings: ScopedSettings<Job>,
     custom_data: HashMap<u32, CustomDataBatch>,
     next_batch: u32,
     /// The ids of the dynamic formatter registrations.
     formatter_registrations: Option<[String; 2]>,
-    next_id: i32,
-    shutdown: bool,
-}
-
-/// `getClientCapability`.
-fn capability<'a>(capabilities: &'a Value, path: &str) -> Option<&'a Value> {
-    path.split('.')
-        .try_fold(capabilities, |c, key| c.as_object()?.get(key))
-}
-
-fn contains_markdown(value: Option<&Value>) -> bool {
-    value
-        .and_then(Value::as_array)
-        .is_some_and(|a| a.iter().any(|f| f == "markdown"))
-}
-
-/// A number setting where `0` and non-numbers are `Number.MAX_VALUE`.
-fn limit(value: Option<&Value>) -> Option<usize> {
-    match value.and_then(Value::as_f64) {
-        Some(n) if n != 0.0 => {
-            let n = n.max(0.0).trunc();
-            (n < usize::MAX as f64).then_some(n as usize)
-        }
-        _ => None,
-    }
 }
 
 /// A result serialized once, without a `Value` tree.
 fn raw(value: &impl Serialize) -> Result<Box<RawValue>, String> {
     to_raw_value(value).map_err(|e| e.to_string())
-}
-
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|s| s.to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "panic".to_owned())
 }
 
 /// `parseHTMLData`.
@@ -214,14 +165,6 @@ fn parse_html_data(id: &str, source: Option<&str>) -> Arc<HtmlDataProvider> {
         _ => json!({}),
     };
     Arc::new(HtmlDataProvider::new(id, &data))
-}
-
-/// `vscode-jsonrpc` sends an array parameter as `[array]`.
-fn unwrap_array_param(params: Value) -> Value {
-    match params {
-        Value::Array(mut a) if a.len() == 1 && a[0].is_array() => a.remove(0),
-        params => params,
-    }
 }
 
 impl Server {
@@ -296,12 +239,14 @@ impl Server {
                 caps,
                 "workspace.workspaceEdit.snippetEditSupport",
             )),
-            folding_range_limit: limit(capability(caps, "textDocument.foldingRange.rangeLimit"))
-                .or(Some(DEFAULT_RESULT_LIMIT)),
+            folding_range_limit: limit(
+                capability(caps, "textDocument.foldingRange.rangeLimit"),
+                Some(DEFAULT_RESULT_LIMIT),
+            ),
             formatter_edit_limit: limit(
                 options.pointer("/customCapabilities/rangeFormatting/editLimit"),
+                None,
             ),
-            pull_diagnostics: capability(caps, "textDocument.diagnostic").is_some(),
             completion: CompletionSupport::from_capabilities(caps),
             hierarchical_document_symbols: capability(
                 caps,
@@ -347,25 +292,19 @@ impl Server {
                 "triggerCharacters": [".", ":", "<", "\"", "=", "/"]
             });
         }
+        let pull_diagnostics = capability(caps, "textDocument.diagnostic").is_some();
         let mut server = Server {
-            writer,
-            receiver,
-            inbox: VecDeque::new(),
+            core: Core::new(writer, receiver, pull_diagnostics),
             capabilities,
             workspace_folders,
             modes,
             resolve: RefCell::default(),
             global: json!({}),
             documents: HashMap::new(),
-            document_settings: HashMap::new(),
-            waiting: Vec::new(),
-            pending_validations: HashMap::new(),
-            outgoing: HashMap::new(),
+            settings: ScopedSettings::default(),
             custom_data: HashMap::new(),
             next_batch: 0,
             formatter_registrations: None,
-            next_id: 0,
-            shutdown: false,
         };
         let data_paths = match options.get("dataPaths") {
             Some(Value::Array(paths)) => paths.clone(),
@@ -377,79 +316,7 @@ impl Server {
 
     /// Returns whether the client sent `shutdown` before `exit`.
     pub fn run(mut self) -> bool {
-        loop {
-            let message = match self.inbox.pop_front() {
-                Some(message) => message,
-                None => {
-                    let receiver = self.receiver.clone();
-                    let timer = match self.pending_validations.values().min() {
-                        Some(&deadline) => at(deadline),
-                        None => never(),
-                    };
-                    select! {
-                        recv(receiver) -> message => match message {
-                            Ok(message) => message,
-                            Err(_) => return self.shutdown,
-                        },
-                        recv(timer) -> _ => {
-                            self.run_due_validations();
-                            continue;
-                        }
-                    }
-                }
-            };
-            match message {
-                Message::Request(request) => self.on_request(request),
-                Message::Notification(notification) if notification.method == "exit" => {
-                    return self.shutdown;
-                }
-                Message::Notification(notification) => self.on_notification(notification),
-                Message::Response(response) => self.on_response(response),
-            }
-        }
-    }
-
-    fn send(&self, message: impl Into<Message>) {
-        self.writer.message(message.into());
-    }
-
-    fn notify(&self, method: &str, params: impl Serialize) {
-        self.writer.notification(method, &params);
-    }
-
-    fn send_request(&mut self, method: &str, params: impl Serialize, kind: Outgoing) -> RequestId {
-        self.next_id += 1;
-        let id = RequestId::from(self.next_id);
-        self.outgoing.insert(id.clone(), kind);
-        self.send(Request::new(id.clone(), method.to_owned(), params));
-        id
-    }
-
-    fn log_error(&self, message: &str) {
-        self.notify(
-            "window/logMessage",
-            json!({ "type": 1, "message": message }),
-        );
-    }
-
-    fn respond_cancelled(&self, id: RequestId) {
-        self.send(Response::new_err(
-            id,
-            ErrorCode::RequestCanceled as i32,
-            "Request cancelled".to_owned(),
-        ));
-    }
-
-    /// Looks ahead in the received messages for a `$/cancelRequest` of `id`.
-    fn take_cancellation(&mut self, id: &RequestId) -> bool {
-        while let Ok(message) = self.receiver.try_recv() {
-            self.inbox.push_back(message);
-        }
-        let position = self.inbox.iter().position(|m| {
-            matches!(m, Message::Notification(n) if n.method == "$/cancelRequest"
-                && serde_json::from_value::<RequestId>(n.params["id"].clone()).ok().as_ref() == Some(id))
-        });
-        position.map(|i| self.inbox.remove(i)).is_some()
+        lsp_core::server::run(&mut self)
     }
 
     fn document(&self, uri: &Uri) -> Option<Rc<Document>> {
@@ -463,58 +330,34 @@ impl Server {
         }
     }
 
-    /// `getDocumentSettings` when the request needs settings. `Err` is the
-    /// pending `workspace/configuration` request.
-    fn scoped_settings(&mut self, document: &TextDocument) -> Result<Scoped, RequestId> {
+    /// `getDocumentSettings` when the request needs settings. `None`: `job` waits for the
+    /// settings.
+    fn scoped_settings(
+        &mut self,
+        document: &TextDocument,
+        job: impl FnOnce() -> Job,
+    ) -> Option<Scoped> {
         if !self.capabilities.scoped_settings {
-            return Ok(None);
+            return Some(None);
         }
-        match self.document_settings.get(document.uri()) {
-            Some(DocumentSettings::Ready(scoped)) => Ok(scoped.clone()),
-            Some(DocumentSettings::Pending(id)) => Err(id.clone()),
-            None => {
-                let uri = document.uri().clone();
-                let items: Vec<Value> = ["css", "html", "javascript", "js/ts"]
-                    .iter()
-                    .map(|section| json!({ "scopeUri": uri, "section": section }))
-                    .collect();
-                let id = self.send_request(
-                    "workspace/configuration",
-                    json!({ "items": items }),
-                    Outgoing::Configuration(uri.clone()),
-                );
-                self.document_settings
-                    .insert(uri, DocumentSettings::Pending(id.clone()));
-                Err(id)
-            }
-        }
-    }
-
-    fn on_response(&mut self, response: Response) {
-        match self.outgoing.remove(&response.id) {
-            Some(Outgoing::Configuration(uri)) => self.on_configuration(uri, response),
-            Some(Outgoing::CustomData(batch, index)) => {
-                let content = response
-                    .response_result
-                    .as_ref()
-                    .ok()
-                    .and_then(Value::as_str);
-                let Some(b) = self.custom_data.get_mut(&batch) else {
-                    return;
-                };
-                b.providers[index] = Some(parse_html_data(&b.paths[index], content));
-                if b.providers.iter().all(Option::is_some) {
-                    let b = self.custom_data.remove(&batch).unwrap();
-                    self.set_data_providers(b.providers.into_iter().flatten().collect());
-                }
-            }
-            _ => {}
-        }
+        let uri = document.uri();
+        let items = || {
+            ["css", "html", "javascript", "js/ts"]
+                .iter()
+                .map(|section| json!({ "scopeUri": uri, "section": section }))
+                .collect()
+        };
+        self.settings.get(
+            &mut self.core,
+            uri,
+            items,
+            || Outgoing::Configuration(uri.clone()),
+            job,
+        )
     }
 
     fn on_configuration(&mut self, uri: Uri, response: Response) {
         // `then(s => ({ css: s[0], html: s[1], javascript: s[2], 'js/ts': s[3] }))`.
-        let pending = matches!(self.document_settings.get(&uri), Some(DocumentSettings::Pending(id)) if *id == response.id);
         // A failed request is not cached: the next request asks again.
         let scoped = match response.response_result {
             Ok(Value::Array(items)) => {
@@ -522,32 +365,35 @@ impl Server {
                 for (key, item) in ["css", "html", "javascript", "js/ts"].iter().zip(items) {
                     settings.insert((*key).to_owned(), item);
                 }
-                let scoped = Some(Value::Object(settings));
-                if pending {
-                    self.document_settings
-                        .insert(uri, DocumentSettings::Ready(scoped.clone()));
-                }
-                scoped
+                Some(Some(Value::Object(settings)))
             }
-            Ok(_) | Err(_) => {
-                if pending {
-                    self.document_settings.remove(&uri);
-                }
-                None
-            }
+            Ok(_) | Err(_) => None,
         };
-        let (ready, waiting) = std::mem::take(&mut self.waiting)
-            .into_iter()
-            .partition(|(id, _)| *id == response.id);
-        self.waiting = waiting;
-        for (_, job) in ready {
+        for job in self.settings.resolve(uri, &response.id, scoped.as_ref()) {
+            let scoped = scoped.clone().flatten();
             match job {
                 Job::Request(request, document) => {
                     let document = self.document(document.text.uri()).unwrap_or(document);
-                    self.with_settings(request, &document, scoped.clone());
+                    self.with_settings(request, &document, scoped);
                 }
-                Job::Validate(uri) => self.finish_validation(uri, scoped.clone()),
+                Job::Validate(uri) => self.finish_validation(uri, scoped),
             }
+        }
+    }
+
+    fn on_custom_data(&mut self, batch: u32, index: usize, response: Response) {
+        let content = response
+            .response_result
+            .as_ref()
+            .ok()
+            .and_then(Value::as_str);
+        let Some(b) = self.custom_data.get_mut(&batch) else {
+            return;
+        };
+        b.providers[index] = Some(parse_html_data(&b.paths[index], content));
+        if b.providers.iter().all(Option::is_some) {
+            let b = self.custom_data.remove(&batch).unwrap();
+            self.set_data_providers(b.providers.into_iter().flatten().collect());
         }
     }
 
@@ -575,7 +421,7 @@ impl Server {
         );
         for (i, path) in paths.iter().enumerate() {
             // `vscode-jsonrpc` sends a single string parameter as `[param]`.
-            self.send_request(
+            self.core.send_tracked(
                 "html/customDataContent",
                 json!([path]),
                 Outgoing::CustomData(batch, i),
@@ -595,34 +441,21 @@ impl Server {
         }
     }
 
-    fn on_request(&mut self, request: Request) {
-        if request.method == "shutdown" {
-            self.shutdown = true;
-            self.send(Response::new_ok(request.id, Value::Null));
-            return;
-        }
-        if self.take_cancellation(&request.id) {
-            self.respond_cancelled(request.id);
-            return;
-        }
-        self.dispatch(request);
-    }
-
-    fn dispatch(&mut self, request: Request) {
+    fn request(&mut self, request: Request) {
         let empty = || json!([]);
         match request.method.as_str() {
             "textDocument/completion"
             | "textDocument/hover"
             | "textDocument/formatting"
             | "textDocument/rangeFormatting" => self.needs_settings(request),
-            "textDocument/diagnostic" if self.capabilities.pull_diagnostics => {
+            "textDocument/diagnostic" if self.core.pull_diagnostics() => {
                 self.needs_settings(request)
             }
             "completionItem/resolve" => self.resolve(request),
             "workspace/textDocumentContent" => {
                 let uri = request.params.get("uri").and_then(Value::as_str);
                 let text = uri.and_then(|u| self.modes.text_document_content(u));
-                self.send(Response::new_ok(
+                self.core.send(Response::new_ok(
                     request.id,
                     json!({ "text": text.unwrap_or("") }),
                 ));
@@ -705,11 +538,11 @@ impl Server {
                 "computing semantic tokens for",
                 Self::semantic_tokens,
             ),
-            "html/semanticTokenLegend" => self.send(Response::new_ok(
+            "html/semanticTokenLegend" => self.core.send(Response::new_ok(
                 request.id,
                 self.modes.semantic_token_legend(),
             )),
-            _ => self.send(Response::new_err(
+            _ => self.core.send(Response::new_err(
                 request.id,
                 ErrorCode::MethodNotFound as i32,
                 format!("Unhandled method {}", request.method),
@@ -746,9 +579,9 @@ impl Server {
         if !self.settings_needed(&request, &document) {
             return self.with_settings(request, &document, None);
         }
-        match self.scoped_settings(&document.text) {
-            Ok(scoped) => self.with_settings(request, &document, scoped),
-            Err(id) => self.waiting.push((id, Job::Request(request, document))),
+        let job = || Job::Request(request.clone(), document.clone());
+        if let Some(scoped) = self.scoped_settings(&document.text, job) {
+            self.with_settings(request, &document, scoped);
         }
     }
 
@@ -784,9 +617,9 @@ impl Server {
                 "textDocument/completion" | "textDocument/hover" => Value::Null,
                 _ => error_value,
             };
-            return self.send(Response::new_ok(request.id, missing));
+            return self.core.send(Response::new_ok(request.id, missing));
         };
-        let result = catch_unwind(AssertUnwindSafe(|| -> Result<Box<RawValue>, String> {
+        let result = catch(|| -> Result<Box<RawValue>, String> {
             let params = request.params.clone();
             let parse = |e: serde_json::Error| e.to_string();
             match request.method.as_str() {
@@ -803,23 +636,21 @@ impl Server {
                     raw(&self.format(document, p.range, &p.options, scoped.as_ref())?)
                 }
                 _ => {
-                    let items =
-                        self.validate(document, scoped.as_ref())
-                            .unwrap_or_else(|message| {
-                                self.log_error(&format!("Error while validating {uri}: {message}"));
-                                Vec::new()
-                            });
+                    let items = self
+                        .validate_document(document, scoped.as_ref())
+                        .unwrap_or_else(|message| {
+                            self.core
+                                .log_error(&format!("Error while validating {uri}: {message}"));
+                            Vec::new()
+                        });
                     raw(&json!({ "kind": "full", "items": items }))
                 }
             }
-        }))
-        .unwrap_or_else(|payload| Err(panic_message(payload)));
+        })
+        .and_then(|r| r);
         match result {
-            Ok(result) => self.writer.response(request.id, &result),
-            Err(message) => {
-                self.log_error(&format!("Error while {action} {uri}: {message}"));
-                self.send(Response::new_ok(request.id, error_value));
-            }
+            Ok(result) => self.core.respond(request.id, &result),
+            Err(message) => self.core.fail(request, error_value, action, &message),
         }
     }
 
@@ -831,47 +662,18 @@ impl Server {
         action: &str,
         f: fn(&mut Self, P) -> Result<R, String>,
     ) {
-        let params: P = match serde_json::from_value(request.params.clone()) {
-            Ok(params) => params,
-            Err(e) => {
-                return self.send(Response::new_err(
-                    request.id,
-                    ErrorCode::InvalidParams as i32,
-                    e.to_string(),
-                ));
-            }
-        };
-        let message = match catch_unwind(AssertUnwindSafe(|| f(self, params))) {
-            Ok(Ok(result)) => return self.writer.response(request.id, &result),
-            Ok(Err(message)) => message,
-            Err(payload) => panic_message(payload),
-        };
-        let uri = request
-            .params
-            .pointer("/textDocument/uri")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        self.log_error(&format!("Error while {action} {uri}: {message}"));
-        self.send(Response::new_ok(request.id, error_value));
+        lsp_core::server::handle(self, request, error_value, action, f);
     }
 
-    fn on_notification(&mut self, notification: Notification) {
-        let method = notification.method.clone();
-        if let Err(e) = self.try_on_notification(notification) {
-            self.log_error(&format!("Error while handling {method}: {e}"));
-        }
-    }
-
-    fn try_on_notification(&mut self, notification: Notification) -> anyhow::Result<()> {
+    fn notification(&mut self, notification: Notification) -> anyhow::Result<()> {
         let params = notification.params;
         match notification.method.as_str() {
             "initialized" => {
                 if self.capabilities.workspace_folders {
                     let id = self.registration_id();
-                    self.send_request(
+                    self.core.send_request(
                         "client/registerCapability",
                         json!({ "registrations": [{ "id": id, "method": "workspace/didChangeWorkspaceFolders", "registerOptions": {} }] }),
-                        Outgoing::Other,
                     );
                 }
             }
@@ -882,7 +684,7 @@ impl Server {
                     TextDocument::new(item.uri.clone(), item.language_id, item.version, item.text);
                 self.documents
                     .insert(item.uri.clone(), Rc::new(Document::new(text)));
-                self.trigger_validation(item.uri);
+                self.core.trigger_validation(item.uri);
             }
             "textDocument/didChange" => {
                 let p: DidChangeTextDocumentParams = serde_json::from_value(params)?;
@@ -898,7 +700,7 @@ impl Server {
                 let text = text.update(p.content_changes, p.text_document.version);
                 self.documents
                     .insert(uri.clone(), Rc::new(Document::new(text)));
-                self.trigger_validation(uri.clone());
+                self.core.trigger_validation(uri.clone());
                 if self.capabilities.snippet_edit
                     && let Some(change) = single
                     && let Some(range) = change.range
@@ -910,16 +712,13 @@ impl Server {
                 let p: DidCloseTextDocumentParams = serde_json::from_value(params)?;
                 let uri = p.text_document.uri;
                 self.documents.remove(&uri);
-                self.document_settings.remove(&uri);
-                if !self.capabilities.pull_diagnostics {
-                    self.pending_validations.remove(&uri);
-                    self.publish(uri, Vec::new());
-                }
+                self.settings.remove(&uri);
+                self.core.close(uri);
             }
             "workspace/didChangeConfiguration" => {
                 self.global = params.get("settings").cloned().unwrap_or(Value::Null);
-                self.document_settings.clear();
-                self.request_refresh();
+                self.settings.clear();
+                self.core.request_refresh(self.documents.keys());
                 self.update_formatter_registrations();
             }
             "workspace/didChangeWorkspaceFolders" if self.capabilities.workspace_folders => {
@@ -936,10 +735,10 @@ impl Server {
                 self.workspace_folders
                     .retain(|f| !removed.contains(f) && !added.contains(f));
                 self.workspace_folders.extend(added);
-                self.request_refresh();
+                self.core.request_refresh(self.documents.keys());
             }
             "html/customDataChanged" => {
-                let paths = match unwrap_array_param(params) {
+                let paths = match unwrap_positional(params, true) {
                     Value::Array(paths) => paths,
                     params => anyhow::bail!("dataPaths.map is not a function: {params}"),
                 };
@@ -947,11 +746,11 @@ impl Server {
             }
             "$/cancelRequest" => {
                 let id: RequestId = serde_json::from_value(params["id"].clone())?;
-                let before = self.waiting.len();
-                self.waiting
-                    .retain(|(_, job)| !matches!(job, Job::Request(r, _) if r.id == id));
-                if self.waiting.len() < before {
-                    self.respond_cancelled(id);
+                if self
+                    .settings
+                    .cancel(|job| matches!(job, Job::Request(r, _) if r.id == id))
+                {
+                    self.core.respond_cancelled(id);
                 }
             }
             _ => {}
@@ -960,8 +759,7 @@ impl Server {
     }
 
     fn registration_id(&mut self) -> String {
-        self.next_id += 1;
-        format!("html-server-registration-{}", self.next_id)
+        format!("html-server-registration-{}", self.core.next_id())
     }
 
     /// The dynamic formatter registration of `onDidChangeConfiguration`.
@@ -978,10 +776,9 @@ impl Server {
                 .iter()
                 .zip(["textDocument/rangeFormatting", "textDocument/formatting"])
             {
-                self.send_request(
+                self.core.send_request(
                     "client/registerCapability",
                     json!({ "registrations": [{ "id": id, "method": method, "registerOptions": { "documentSelector": selector } }] }),
-                    Outgoing::Other,
                 );
             }
             self.formatter_registrations = Some(ids);
@@ -990,10 +787,9 @@ impl Server {
                 .iter()
                 .zip(["textDocument/rangeFormatting", "textDocument/formatting"])
             {
-                self.send_request(
+                self.core.send_request(
                     "client/unregisterCapability",
                     json!({ "unregisterations": [{ "id": id, "method": method }] }),
-                    Outgoing::Other,
                 );
             }
         }
@@ -1025,15 +821,13 @@ impl Server {
             _ => return,
         };
         let global = Some(&self.global);
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            self.modes.auto_insert(&document, position, kind, global)
-        }));
-        let snippet = match result {
+        let snippet = match catch(|| self.modes.auto_insert(&document, position, kind, global)) {
             Ok(Some(snippet)) => snippet,
             Ok(None) => return,
-            Err(payload) => {
-                let message = panic_message(payload);
-                return self.log_error(&format!("Error while handling notification: {message}"));
+            Err(message) => {
+                return self
+                    .core
+                    .log_error(&format!("Error while handling notification: {message}"));
             }
         };
         let edit = json!({
@@ -1045,54 +839,8 @@ impl Server {
                 }]
             }]
         });
-        self.send_request(
-            "workspace/applyEdit",
-            json!({ "edit": edit }),
-            Outgoing::Other,
-        );
-    }
-
-    fn request_refresh(&mut self) {
-        if self.capabilities.pull_diagnostics {
-            self.send_request("workspace/diagnostic/refresh", Value::Null, Outgoing::Other);
-        } else {
-            let uris: Vec<Uri> = self.documents.keys().cloned().collect();
-            for uri in uris {
-                self.trigger_validation(uri);
-            }
-        }
-    }
-
-    fn trigger_validation(&mut self, uri: Uri) {
-        if self.capabilities.pull_diagnostics {
-            return;
-        }
-        self.pending_validations
-            .insert(uri, Instant::now() + VALIDATION_DELAY);
-    }
-
-    fn run_due_validations(&mut self) {
-        let now = Instant::now();
-        let due: Vec<Uri> = self
-            .pending_validations
-            .iter()
-            .filter(|(_, deadline)| **deadline <= now)
-            .map(|(uri, _)| uri.clone())
-            .collect();
-        for uri in due {
-            self.pending_validations.remove(&uri);
-            let Some(document) = self.document(&uri) else {
-                continue;
-            };
-            if !self.validation_needs_settings(&document) {
-                self.finish_validation(uri, None);
-                continue;
-            }
-            match self.scoped_settings(&document.text) {
-                Ok(scoped) => self.finish_validation(uri, scoped),
-                Err(id) => self.waiting.push((id, Job::Validate(uri))),
-            }
-        }
+        self.core
+            .send_request("workspace/applyEdit", json!({ "edit": edit }));
     }
 
     /// Validates the current text, so a change during the wait for the
@@ -1102,28 +850,16 @@ impl Server {
         let Some(document) = self.document(&uri) else {
             return;
         };
-        let diagnostics = catch_unwind(AssertUnwindSafe(|| {
-            self.validate(&document, scoped.as_ref())
-        }))
-        .map_err(panic_message)
-        .and_then(|r| r);
-        match diagnostics {
-            Ok(diagnostics) => self.publish(uri, diagnostics),
+        match catch(|| self.validate_document(&document, scoped.as_ref())).and_then(|r| r) {
+            Ok(diagnostics) => self.core.publish(uri, diagnostics),
             Err(message) => {
-                self.log_error(&format!(
+                self.core.log_error(&format!(
                     "Error while validating {}: {message}",
                     uri.as_str()
                 ));
-                self.publish(uri, Vec::new());
+                self.core.publish(uri, Vec::new());
             }
         }
-    }
-
-    fn publish(&self, uri: Uri, diagnostics: Vec<Diagnostic>) {
-        self.notify(
-            "textDocument/publishDiagnostics",
-            json!({ "uri": uri, "diagnostics": diagnostics }),
-        );
     }
 
     /// Whether `validateTextDocument` reads the document settings.
@@ -1137,7 +873,7 @@ impl Server {
     }
 
     /// `validateTextDocument`. `Err` where it catches an error.
-    fn validate(
+    fn validate_document(
         &self,
         document: &Document,
         scoped: Option<&Value>,
@@ -1214,7 +950,7 @@ impl Server {
         let mut item = request.params;
         if item.get("data").is_some_and(Value::is_array) {
             self.resolve.borrow().resolve(&mut item);
-            return self.send(Response::new_ok(request.id, item));
+            return self.core.send(Response::new_ok(request.id, item));
         }
         let data = item.get("data").filter(|d| {
             d.get("languageId").is_some_and(Value::is_string)
@@ -1225,19 +961,16 @@ impl Server {
             .and_then(|d| d["uri"].as_str()?.parse::<Uri>().ok())
             .and_then(|uri| self.document(&uri));
         let Some(document) = document else {
-            return self.send(Response::new_ok(request.id, item));
+            return self.core.send(Response::new_ok(request.id, item));
         };
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            self.modes.resolve(&document, item.clone())
-        }))
-        .unwrap_or_else(|payload| Err(panic_message(payload)));
+        let result = catch(|| self.modes.resolve(&document, item.clone())).and_then(|r| r);
         match result {
-            Ok(resolved) => self.send(Response::new_ok(request.id, resolved)),
+            Ok(resolved) => self.core.send(Response::new_ok(request.id, resolved)),
             Err(message) => {
-                self.log_error(&format!(
+                self.core.log_error(&format!(
                     "Error while resolving completion proposal: {message}"
                 ));
-                self.send(Response::new_ok(request.id, item));
+                self.core.send(Response::new_ok(request.id, item));
             }
         }
     }
@@ -1344,7 +1077,7 @@ impl Server {
             for mode in modes {
                 symbols.extend(self.modes.document_symbols_nested(mode, &document)?);
             }
-            lsp_transport::cap_symbol_depth(&mut symbols);
+            lsp_core::cap_symbol_depth(&mut symbols);
             return Ok(DocumentSymbolResponse::Nested(symbols));
         }
         let mut symbols = Vec::new();
@@ -1470,4 +1203,41 @@ fn validation_enabled(language_id: &str, settings: &Value) -> bool {
         };
     }
     true
+}
+
+impl Service for Server {
+    type Outgoing = Outgoing;
+    type Event = ();
+
+    fn core(&mut self) -> &mut Core<Outgoing> {
+        &mut self.core
+    }
+
+    fn dispatch(&mut self, request: Request) {
+        self.request(request);
+    }
+
+    fn on_notification(&mut self, notification: Notification) -> anyhow::Result<()> {
+        self.notification(notification)
+    }
+
+    fn on_response(&mut self, response: Response, kind: Outgoing) {
+        match kind {
+            Outgoing::Configuration(uri) => self.on_configuration(uri, response),
+            Outgoing::CustomData(batch, index) => self.on_custom_data(batch, index, response),
+        }
+    }
+
+    fn validate(&mut self, uri: Uri) {
+        let Some(document) = self.document(&uri) else {
+            return;
+        };
+        if !self.validation_needs_settings(&document) {
+            return self.finish_validation(uri, None);
+        }
+        let job = || Job::Validate(uri.clone());
+        if let Some(scoped) = self.scoped_settings(&document.text, job) {
+            self.finish_validation(uri, scoped);
+        }
+    }
 }

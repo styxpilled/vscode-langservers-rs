@@ -37,7 +37,7 @@ root.
   the release servers and sends each request except formatting. It prints the
   time of each case or the first request without an answer. To test the
   parser limits and not the stack size, build with a small
-  `SERVER_STACK_SIZE` (`lsp-transport`; all cases pass with 4 MiB).
+  `SERVER_STACK_SIZE` (`lsp-core`; all cases pass with 4 MiB).
 - Session replay: sessions recorded in Zed (or generated) go to the Node and the
   Rust server, and the results are compared.
 

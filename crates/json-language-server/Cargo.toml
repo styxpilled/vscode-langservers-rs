@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 json-languageservice.workspace = true
-lsp-transport.workspace = true
+lsp-core.workspace = true
 anyhow.workspace = true
 crossbeam-channel.workspace = true
 lsp-server.workspace = true

@@ -202,7 +202,7 @@ Profile before each change; guesses were often wrong.
   `--process` limits it to the processes that match.
 - A server under `lsp-replay`: record the replay, then use
   `--process html-language`. The server waits most of the time; the stack regex
-  `'Server::(on_|handle|dispatch)|lsp_transport'` keeps the busy samples. A
+  `'Server::(on_|handle|dispatch)|lsp_core'` keeps the busy samples. A
   sample is 0.25 ms at `-r 4000`.
 
 ## Open ideas

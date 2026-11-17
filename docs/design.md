@@ -28,11 +28,22 @@
   `to_string_unencoded`), `Utils` (`join_path`, `dirname`, `basename`,
   `resolve_path`), `posix` (bundled `path.posix`), `resolve_relative_path`,
   `decode_uri_component`.
-- `crates/lsp-transport`: stdio threads for the servers, and `run_server`, which
-  runs the server loop on a thread with a 256 MiB stack (`experimental.md`,
-  "Deep nesting"). Responses and notifications are serialized directly from the
-  `lsp-types` values (a `serde_json::Value` takes about 8 times the memory of
-  its JSON text).
+- `crates/lsp-core`: the parts of the servers that do not depend on the
+  language.
+  - Stdio threads, and `run_server`, which runs the server loop on a thread
+    with a 256 MiB stack (`experimental.md`, "Deep nesting"). Responses and
+    notifications are serialized directly from the `lsp-types` values (a
+    `serde_json::Value` takes about 8 times the memory of its JSON text).
+  - `server.rs`: `Core` (requests to the client, push diagnostic timers with
+    500 ms delay, `publishDiagnostics`, refresh) and `run`, the main loop of a
+    `Service`: `shutdown` and `exit`, a lookahead for the `$/cancelRequest` of
+    each request, timers, events from worker threads, and work while no
+    message waits. `handle` is `runSafe` (an error or a panic gives the error
+    value and a log message). `ScopedSettings` is `getDocumentSettings`: the
+    `workspace/configuration` result of each document, and the jobs that wait
+    for it.
+  - `completion.rs`: small completion lists (`experimental.md`).
+  - Result limits and the symbol depth cap.
 - `crates/lsp-recorder`: `lsp-recorder` and `lsp-replay` (see `testing.md`).
 
 ## JSON
@@ -84,9 +95,10 @@ upstream. On `experimental` it reads at most `MAX_DEPTH` levels
 ### `crates/json-language-server`
 
 - `server.rs`: `jsonServer.ts` and `utils/validation.ts`: all requests and
-  notifications, client capability checks, settings, push diagnostics (500 ms
-  delay) or pull diagnostics, result limits, dynamic formatter registration,
-  `runSafe` (a panic gives the error value and a log message).
+  notifications, client capability checks, settings, push or pull diagnostics,
+  result limits, dynamic formatter registration. A `Service` of `lsp-core`;
+  schema fetches are its worker events, and the schema prefetch is its idle
+  work.
 - `schema_request.rs`: schema content through `file:` (read inline), HTTP
   (`ureq` on a worker thread, with the `request-light` messages and a disk
   cache, `experimental.md`) and
@@ -157,11 +169,12 @@ upstream. On `experimental` it reads at most `MAX_DEPTH` levels
 ### `crates/css-language-server`
 
 - `server.rs`: `cssServer.ts`, `customData.ts`, `runner.ts`, `validation.ts`.
-  Same main loop as the JSON server. One `CssDataManager` for the three
+  A `Service` of `lsp-core`. One `CssDataManager` for the three
   dialects. The `didChangeConfiguration` settings are kept as JSON. Parsed style
   sheets are cached for each open document.
-- Scoped settings: completion, hover and validation wait for the
-  `workspace/configuration` response of their document. `$/cancelRequest`
+- Scoped settings (`ScopedSettings` of `lsp-core`): completion, hover and
+  validation wait for the `workspace/configuration` response of their
+  document. `$/cancelRequest`
   answers a waiting request with `RequestCancelled`.
 - `settings.rs`: JSON settings to the service types, with the JS semantics of
   upstream (`parseInt`, truthiness, `braceStyle` lists).
@@ -206,7 +219,7 @@ upstream. On `experimental` it reads at most `MAX_DEPTH` levels
 ### `crates/html-language-server`
 
 - `server.rs`: `htmlServer.ts` and the tag auto insertion of Zed's fork. Same
-  main loop and scoped settings as the CSS server; the configuration request has
+  `lsp-core` parts as the CSS server; the configuration request has
   four sections. `html/customDataContent` requests go to the client in batches.
 - `modes.rs`: the modes (`Mode`: HTML, CSS, `Script`), `formatting.ts`,
   `htmlFolding.ts`, `selectionRanges.ts`, `semanticTokens.ts`. `Document` caches

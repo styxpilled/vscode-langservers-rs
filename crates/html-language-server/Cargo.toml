@@ -16,7 +16,7 @@ javascript = ["dep:tsrs_compiler", "dep:tsrs_core", "dep:tsrs_ls", "dep:tsrs_lsp
 css-language-server = { path = "../css-language-server" }
 css-languageservice.workspace = true
 html-languageservice.workspace = true
-lsp-transport.workspace = true
+lsp-core.workspace = true
 anyhow.workspace = true
 crossbeam-channel.workspace = true
 lsp-server.workspace = true

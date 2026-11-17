@@ -2,11 +2,10 @@
 
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crossbeam_channel::{Receiver, Sender, at, never, select};
+use crossbeam_channel::Receiver;
 use json_languageservice::{
     Color, ColorInformation, DocumentLanguageSettings, FormattingOptions, JsonDocument,
     LanguageService, LanguageServiceParams, LanguageSettings, SchemaConfiguration,
@@ -33,7 +32,10 @@ use crate::schema_request::{
     Cached, FetchResult, HttpResult, HttpSettings, SchemaStore, Source, cache_dir, fetch_http,
     http_agent, write_cache,
 };
-use lsp_transport::{DEFAULT_COLOR_LIMIT, DEFAULT_RESULT_LIMIT, Writer};
+use lsp_core::server::{
+    Core, FullDiagnosticReport, Service, capability, catch, limit, unwrap_positional,
+};
+use lsp_core::{DEFAULT_COLOR_LIMIT, DEFAULT_RESULT_LIMIT, Writer};
 
 /// `ColorPresentationParams` with the `f64` `Color`: Zed sends `f32` values as
 /// text, and Node reads them as doubles.
@@ -45,7 +47,6 @@ struct ColorPresentationParams {
     range: Range,
 }
 
-const VALIDATION_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_FORMATTER_EDIT_LIMIT: usize = 10000;
 const SORT_CODE_ACTION_KIND: &str = "source.sort.json";
 
@@ -90,7 +91,6 @@ struct Capabilities {
     hierarchical_document_symbols: bool,
     folding_range_limit: Option<usize>,
     formatter_edit_limit: Option<usize>,
-    pull_diagnostics: bool,
 }
 
 enum Job {
@@ -105,27 +105,17 @@ struct Deferred {
     job: Job,
 }
 
-/// `lsp-types` has no type for this response without `relatedDocuments`.
-#[derive(Serialize)]
-struct FullDiagnosticReport {
-    kind: &'static str,
-    items: Vec<Diagnostic>,
-}
+/// `vscode/content` for a URI.
+pub struct Outgoing(String);
 
-enum Outgoing {
-    Content(String),
-    Other,
-}
+/// Schema content from a worker thread. The bool is true for a schema that changed after the
+/// server used its cached copy.
+pub struct Fetched(String, FetchResult, bool);
 
 pub struct Server {
-    writer: Writer,
-    receiver: Receiver<Message>,
-    inbox: VecDeque<Message>,
+    core: Core<Outgoing, Fetched>,
     ls: LanguageService,
     store: SchemaStore,
-    /// The bool is true for a schema that changed after the server used its cached copy.
-    fetched_tx: Sender<(String, FetchResult, bool)>,
-    fetched_rx: Receiver<(String, FetchResult, bool)>,
     cache_dir: Option<PathBuf>,
     http: HttpSettings,
     agent: ureq::Agent,
@@ -134,21 +124,11 @@ pub struct Server {
     settings: Settings,
     last_settings: Option<Value>,
     formatter_registered: bool,
-    pending_validations: HashMap<Uri, Instant>,
     deferred: Vec<Deferred>,
     /// Documents whose schema is loaded and compiled when no message waits. With the flag,
     /// a refresh follows.
     prefetch: VecDeque<(Uri, bool)>,
     refresh_after_prefetch: bool,
-    outgoing: HashMap<RequestId, Outgoing>,
-    next_id: i32,
-    shutdown: bool,
-}
-
-/// `getClientCapability`.
-fn capability<'a>(capabilities: &'a Value, path: &str) -> Option<&'a Value> {
-    path.split('.')
-        .try_fold(capabilities, |c, key| c.as_object()?.get(key))
 }
 
 fn truthy(value: Option<&Value>) -> bool {
@@ -161,17 +141,6 @@ fn truthy(value: Option<&Value>) -> bool {
     }
 }
 
-/// `sanitizeLimitSetting(value || default)`.
-fn limit(value: Option<&Value>, default: Option<usize>) -> Option<usize> {
-    match value.and_then(Value::as_f64) {
-        Some(n) if n != 0.0 && !n.is_nan() => {
-            let n = n.max(0.0).trunc();
-            (n < usize::MAX as f64).then_some(n as usize)
-        }
-        _ => default,
-    }
-}
-
 fn severity(value: Option<&Value>) -> Option<SeverityLevel> {
     match value?.as_str()? {
         "error" => Some(SeverityLevel::Error),
@@ -179,23 +148,6 @@ fn severity(value: Option<&Value>) -> Option<SeverityLevel> {
         "ignore" => Some(SeverityLevel::Ignore),
         _ => None,
     }
-}
-
-/// A `vscode-jsonrpc` client sends a single parameter that is not an object as `[param]`.
-/// With `only_arrays`, only `[[...]]` is unwrapped.
-fn unwrap_positional(params: Value, only_arrays: bool) -> Value {
-    match params {
-        Value::Array(mut a) if a.len() == 1 && (!only_arrays || a[0].is_array()) => a.remove(0),
-        params => params,
-    }
-}
-
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|s| s.to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "panic".to_owned())
 }
 
 fn schema_configuration(value: &Value) -> Option<SchemaConfiguration> {
@@ -318,7 +270,6 @@ impl Server {
                 options.pointer("/customCapabilities/rangeFormatting/editLimit"),
                 Some(DEFAULT_FORMATTER_EDIT_LIMIT),
             ),
-            pull_diagnostics: capability(caps, "textDocument.diagnostic").is_some(),
         };
         let provide_formatter = provide_formatter == Some(&Value::Bool(true));
         let mut result = json!({
@@ -351,17 +302,13 @@ impl Server {
             });
         }
 
-        let (fetched_tx, fetched_rx) = crossbeam_channel::unbounded();
+        let pull_diagnostics = capability(caps, "textDocument.diagnostic").is_some();
         let http = HttpSettings::default();
         let folding = capabilities.folding_range_limit;
         let server = Server {
-            writer,
-            receiver,
-            inbox: VecDeque::new(),
+            core: Core::new(writer, receiver, pull_diagnostics),
             ls,
             store,
-            fetched_tx,
-            fetched_rx,
             cache_dir,
             agent: http_agent(&http),
             http,
@@ -378,109 +325,16 @@ impl Server {
             },
             last_settings: None,
             formatter_registered: false,
-            pending_validations: HashMap::new(),
             deferred: Vec::new(),
             prefetch: VecDeque::new(),
             refresh_after_prefetch: false,
-            outgoing: HashMap::new(),
-            next_id: 0,
-            shutdown: false,
         };
         (server, result)
     }
 
     /// Returns whether the client sent `shutdown` before `exit`.
     pub fn run(mut self) -> bool {
-        loop {
-            let message = match self.inbox.pop_front() {
-                Some(message) => message,
-                None => {
-                    if !self.prefetch.is_empty()
-                        && self.receiver.is_empty()
-                        && self.fetched_rx.is_empty()
-                    {
-                        self.prefetch_next();
-                        continue;
-                    }
-                    let receiver = self.receiver.clone();
-                    let fetched = self.fetched_rx.clone();
-                    let timer = match self.pending_validations.values().min() {
-                        Some(&deadline) => at(deadline),
-                        None => never(),
-                    };
-                    select! {
-                        recv(receiver) -> message => match message {
-                            Ok(message) => message,
-                            Err(_) => return self.shutdown,
-                        },
-                        recv(fetched) -> result => {
-                            if let Ok((uri, result, changed)) = result {
-                                if changed {
-                                    self.on_changed(uri, result);
-                                } else {
-                                    self.on_fetched(uri, result);
-                                }
-                            }
-                            continue;
-                        }
-                        recv(timer) -> _ => {
-                            self.run_due_validations();
-                            continue;
-                        }
-                    }
-                }
-            };
-            match message {
-                Message::Request(request) => self.on_request(request),
-                Message::Notification(notification) if notification.method == "exit" => {
-                    return self.shutdown;
-                }
-                Message::Notification(notification) => self.on_notification(notification),
-                Message::Response(response) => self.on_response(response),
-            }
-        }
-    }
-
-    fn send(&self, message: impl Into<Message>) {
-        self.writer.message(message.into());
-    }
-
-    fn notify(&self, method: &str, params: impl Serialize) {
-        self.writer.notification(method, &params);
-    }
-
-    fn send_request(&mut self, method: &str, params: impl Serialize, kind: Outgoing) {
-        self.next_id += 1;
-        let id = RequestId::from(self.next_id);
-        self.outgoing.insert(id.clone(), kind);
-        self.send(Request::new(id, method.to_owned(), params));
-    }
-
-    fn log_error(&self, message: &str) {
-        self.notify(
-            "window/logMessage",
-            json!({ "type": 1, "message": message }),
-        );
-    }
-
-    fn respond_cancelled(&self, id: RequestId) {
-        self.send(Response::new_err(
-            id,
-            ErrorCode::RequestCanceled as i32,
-            "Request cancelled".to_owned(),
-        ));
-    }
-
-    /// Looks ahead in the received messages for a `$/cancelRequest` of `id`.
-    fn take_cancellation(&mut self, id: &RequestId) -> bool {
-        while let Ok(message) = self.receiver.try_recv() {
-            self.inbox.push_back(message);
-        }
-        let position = self.inbox.iter().position(|m| {
-            matches!(m, Message::Notification(n) if n.method == "$/cancelRequest"
-                && serde_json::from_value::<RequestId>(n.params["id"].clone()).ok().as_ref() == Some(id))
-        });
-        position.map(|i| self.inbox.remove(i)).is_some()
+        lsp_core::server::run(&mut self)
     }
 
     /// Runs `f` and starts the schema fetches that it needs. Returns the URIs of the schemas
@@ -490,12 +344,12 @@ impl Server {
         f: impl FnOnce(&mut Self) -> T,
     ) -> Result<Result<T, HashSet<String>>, String> {
         self.store.begin();
-        let result = catch_unwind(AssertUnwindSafe(|| f(self)));
+        let result = catch(|| f(self));
         let (missing, to_start) = self.store.end();
         for (uri, source) in to_start {
             self.start_fetch(uri, source);
         }
-        let result = result.map_err(panic_message)?;
+        let result = result?;
         if missing.is_empty() {
             return Ok(Ok(result));
         }
@@ -511,7 +365,7 @@ impl Server {
             Source::Http(cached) => {
                 let agent = self.agent.clone();
                 let proxy = self.http.proxy.as_deref().is_some_and(|p| !p.is_empty());
-                let tx = self.fetched_tx.clone();
+                let tx = self.core.event_sender();
                 let cache = self.cache_dir.clone();
                 std::thread::spawn(move || {
                     let etag = cached.as_ref().map(|c| c.etag.as_str());
@@ -537,12 +391,13 @@ impl Server {
                         HttpResult::Fetched(result) => result,
                         HttpResult::NotModified => unreachable!(),
                     };
-                    let _ = tx.send((uri, result, cached.is_some()));
+                    let _ = tx.send(Fetched(uri, result, cached.is_some()));
                 });
             }
             Source::Client => {
                 // `vscode-jsonrpc` sends a single parameter that is not an object as an array.
-                self.send_request("vscode/content", [&uri], Outgoing::Content(uri.clone()));
+                self.core
+                    .send_tracked("vscode/content", [&uri], Outgoing(uri.clone()));
             }
         }
     }
@@ -607,7 +462,7 @@ impl Server {
             Ok(Err(waiting)) => self.defer_prefetch(uri, refresh, waiting),
             Err(message) => {
                 self.refresh_after_prefetch |= refresh;
-                self.log_error(&format!(
+                self.core.log_error(&format!(
                     "Error while loading the schema for {}: {message}",
                     uri.as_str()
                 ));
@@ -618,34 +473,7 @@ impl Server {
         }
     }
 
-    fn on_response(&mut self, response: Response) {
-        let Some(Outgoing::Content(uri)) = self.outgoing.remove(&response.id) else {
-            return;
-        };
-        let result = match response.response_result {
-            Err(error) => Err(SchemaRequestError {
-                message: error.message,
-                code: Some(error.code.into()),
-            }),
-            Ok(result) => Ok(result.as_str().unwrap_or_default().to_owned()),
-        };
-        self.on_fetched(uri, result);
-    }
-
-    fn on_request(&mut self, request: Request) {
-        if request.method == "shutdown" {
-            self.shutdown = true;
-            self.send(Response::new_ok(request.id, Value::Null));
-            return;
-        }
-        if self.take_cancellation(&request.id) {
-            self.respond_cancelled(request.id);
-            return;
-        }
-        self.dispatch(request);
-    }
-
-    fn dispatch(&mut self, mut request: Request) {
+    fn request(&mut self, mut request: Request) {
         if matches!(
             request.method.as_str(),
             "json/validate" | "json/languageStatus"
@@ -708,7 +536,7 @@ impl Server {
             "textDocument/documentLink" => {
                 self.handle(request, empty(), "computing links", Self::document_links)
             }
-            "textDocument/diagnostic" if self.capabilities.pull_diagnostics => self.handle(
+            "textDocument/diagnostic" if self.core.pull_diagnostics() => self.handle(
                 request,
                 json!({ "kind": "full", "items": [] }),
                 "computing diagnostics",
@@ -728,7 +556,7 @@ impl Server {
                 Self::language_status,
             ),
             "json/sort" => self.handle(request, empty(), "sorting", Self::sort),
-            _ => self.send(Response::new_err(
+            _ => self.core.send(Response::new_err(
                 request.id,
                 ErrorCode::MethodNotFound as i32,
                 format!("Unhandled method {}", request.method),
@@ -744,18 +572,11 @@ impl Server {
         action: &str,
         f: fn(&mut Self, P) -> R,
     ) {
-        let params: P = match serde_json::from_value(request.params.clone()) {
-            Ok(params) => params,
-            Err(e) => {
-                return self.send(Response::new_err(
-                    request.id,
-                    ErrorCode::InvalidParams as i32,
-                    e.to_string(),
-                ));
-            }
+        let Some(params) = self.core.params(&request) else {
+            return;
         };
         match self.with_schemas(|s| f(s, params)) {
-            Ok(Ok(result)) => self.writer.response(request.id, &result),
+            Ok(Ok(result)) => self.core.respond(request.id, &result),
             Ok(Err(waiting)) if request.method == "textDocument/diagnostic" => {
                 self.diagnostics_without_schema(request, waiting)
             }
@@ -764,13 +585,8 @@ impl Server {
                 job: Job::Request(request),
             }),
             Err(message) => {
-                let uri = request
-                    .params
-                    .pointer("/textDocument/uri")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                self.log_error(&format!("Error while {action} for {uri}: {message}"));
-                self.send(Response::new_ok(request.id, error_value));
+                self.core
+                    .fail(request, error_value, &format!("{action} for"), &message)
             }
         }
     }
@@ -787,11 +603,8 @@ impl Server {
             Some(d) => validate_syntax(&self.ls, &self.settings, &d.text, d.json()),
             None => Vec::new(),
         };
-        let report = FullDiagnosticReport {
-            kind: "full",
-            items,
-        };
-        self.writer.response(request.id, &report);
+        self.core
+            .respond(request.id, &FullDiagnosticReport::new(items));
         if let Some(uri) = uri {
             self.defer_prefetch(uri, true, waiting);
         }
@@ -817,14 +630,7 @@ impl Server {
         }
     }
 
-    fn on_notification(&mut self, notification: Notification) {
-        let method = notification.method.clone();
-        if let Err(e) = self.try_on_notification(notification) {
-            self.log_error(&format!("Error while handling {method}: {e}"));
-        }
-    }
-
-    fn try_on_notification(&mut self, notification: Notification) -> anyhow::Result<()> {
+    fn notification(&mut self, notification: Notification) -> anyhow::Result<()> {
         let params = match notification.method.as_str() {
             "json/schemaContent" => unwrap_positional(notification.params, false),
             "json/schemaAssociations" => unwrap_positional(notification.params, true),
@@ -838,7 +644,7 @@ impl Server {
                     TextDocument::new(item.uri.clone(), item.language_id, item.version, item.text);
                 self.documents.insert(item.uri.clone(), Document::new(text));
                 self.queue_prefetch(item.uri.clone(), false);
-                self.trigger_validation(item.uri);
+                self.core.trigger_validation(item.uri);
             }
             "textDocument/didChange" => {
                 let p: DidChangeTextDocumentParams = serde_json::from_value(params)?;
@@ -850,7 +656,7 @@ impl Server {
                     .text
                     .update(p.content_changes, p.text_document.version);
                 self.documents.insert(uri.clone(), Document::new(text));
-                self.trigger_validation(uri);
+                self.core.trigger_validation(uri);
             }
             "textDocument/didClose" => {
                 let p: DidCloseTextDocumentParams = serde_json::from_value(params)?;
@@ -860,10 +666,7 @@ impl Server {
                     |d| !matches!(&d.job, Job::Validate(u) | Job::Prefetch(u, _) if *u == uri),
                 );
                 self.prefetch.retain(|(u, _)| *u != uri);
-                if !self.capabilities.pull_diagnostics {
-                    self.pending_validations.remove(&uri);
-                    self.publish(uri, Vec::new());
-                }
+                self.core.close(uri);
             }
             "workspace/didChangeConfiguration" => self.on_configuration(&params["settings"]),
             "json/schemaAssociations" => {
@@ -894,7 +697,7 @@ impl Server {
                 self.deferred
                     .retain(|d| !matches!(&d.job, Job::Request(r) if r.id == id));
                 if self.deferred.len() < before {
-                    self.respond_cancelled(id);
+                    self.core.respond_cancelled(id);
                 }
             }
             _ => {}
@@ -968,10 +771,9 @@ impl Server {
                             json!({ "id": id, "method": method, "registerOptions": { "documentSelector": selector } })
                         })
                         .collect();
-                    self.send_request(
+                    self.core.send_request(
                         "client/registerCapability",
                         json!({ "registrations": registrations }),
-                        Outgoing::Other,
                     );
                 }
             } else if self.formatter_registered {
@@ -981,10 +783,9 @@ impl Server {
                     .map(|(id, method)| json!({ "id": id, "method": method }))
                     .collect();
                 // The misspelling is from the LSP specification.
-                self.send_request(
+                self.core.send_request(
                     "client/unregisterCapability",
                     json!({ "unregisterations": unregistrations }),
-                    Outgoing::Other,
                 );
             }
         }
@@ -1059,35 +860,7 @@ impl Server {
     }
 
     fn request_refresh(&mut self) {
-        if self.capabilities.pull_diagnostics {
-            self.send_request("workspace/diagnostic/refresh", Value::Null, Outgoing::Other);
-        } else {
-            let uris: Vec<Uri> = self.documents.keys().cloned().collect();
-            for uri in uris {
-                self.trigger_validation(uri);
-            }
-        }
-    }
-
-    fn trigger_validation(&mut self, uri: Uri) {
-        if !self.capabilities.pull_diagnostics {
-            self.pending_validations
-                .insert(uri, Instant::now() + VALIDATION_DELAY);
-        }
-    }
-
-    fn run_due_validations(&mut self) {
-        let now = Instant::now();
-        let due: Vec<Uri> = self
-            .pending_validations
-            .iter()
-            .filter(|(_, deadline)| **deadline <= now)
-            .map(|(uri, _)| uri.clone())
-            .collect();
-        for uri in due {
-            self.pending_validations.remove(&uri);
-            self.validate_and_publish(uri);
-        }
+        self.core.request_refresh(self.documents.keys());
     }
 
     fn validate_and_publish(&mut self, uri: Uri) {
@@ -1101,24 +874,17 @@ impl Server {
             ))
         });
         match result {
-            Ok(Ok(Some(diagnostics))) => self.publish(uri, diagnostics),
+            Ok(Ok(Some(diagnostics))) => self.core.publish(uri, diagnostics),
             Ok(Ok(None)) => {}
             Ok(Err(waiting)) => self.deferred.push(Deferred {
                 waiting,
                 job: Job::Validate(uri),
             }),
-            Err(message) => self.log_error(&format!(
+            Err(message) => self.core.log_error(&format!(
                 "Error while validating {}: {message}",
                 uri.as_str()
             )),
         }
-    }
-
-    fn publish(&self, uri: Uri, diagnostics: Vec<Diagnostic>) {
-        self.notify(
-            "textDocument/publishDiagnostics",
-            json!({ "uri": uri, "diagnostics": diagnostics }),
-        );
     }
 
     fn completion(&mut self, p: CompletionParams) -> Option<CompletionList> {
@@ -1144,7 +910,7 @@ impl Server {
         let limit = self.settings.result_limit;
         if self.capabilities.hierarchical_document_symbols {
             let mut symbols = find_document_symbols2(&document.text, document.json(), limit);
-            lsp_transport::cap_symbol_depth(&mut symbols);
+            lsp_core::cap_symbol_depth(&mut symbols);
             DocumentSymbolResponse::Nested(symbols)
         } else {
             DocumentSymbolResponse::Flat(find_document_symbols(
@@ -1263,10 +1029,7 @@ impl Server {
             ),
             None => Vec::new(),
         };
-        FullDiagnosticReport {
-            kind: "full",
-            items,
-        }
+        FullDiagnosticReport::new(items)
     }
 
     fn force_validate(&mut self, uri: Uri) -> Vec<Diagnostic> {
@@ -1328,5 +1091,53 @@ impl Server {
             keep_lines: options["keepLines"] == true,
         };
         json_languageservice::sort(&document.text, &options)
+    }
+}
+
+impl Service for Server {
+    type Outgoing = Outgoing;
+    type Event = Fetched;
+
+    fn core(&mut self) -> &mut Core<Outgoing, Fetched> {
+        &mut self.core
+    }
+
+    fn dispatch(&mut self, request: Request) {
+        self.request(request);
+    }
+
+    fn on_notification(&mut self, notification: Notification) -> anyhow::Result<()> {
+        self.notification(notification)
+    }
+
+    fn on_response(&mut self, response: Response, Outgoing(uri): Outgoing) {
+        let result = match response.response_result {
+            Err(error) => Err(SchemaRequestError {
+                message: error.message,
+                code: Some(error.code.into()),
+            }),
+            Ok(result) => Ok(result.as_str().unwrap_or_default().to_owned()),
+        };
+        self.on_fetched(uri, result);
+    }
+
+    fn validate(&mut self, uri: Uri) {
+        self.validate_and_publish(uri);
+    }
+
+    fn on_event(&mut self, Fetched(uri, result, changed): Fetched) {
+        if changed {
+            self.on_changed(uri, result);
+        } else {
+            self.on_fetched(uri, result);
+        }
+    }
+
+    fn idle(&mut self) -> bool {
+        if self.prefetch.is_empty() {
+            return false;
+        }
+        self.prefetch_next();
+        true
     }
 }

@@ -12,7 +12,7 @@ jsonc = { path = "crates/jsonc" }
 json-languageservice = { path = "crates/json-languageservice" }
 css-languageservice = { path = "crates/css-languageservice" }
 html-languageservice = { path = "crates/html-languageservice" }
-lsp-transport = { path = "crates/lsp-transport" }
+lsp-core = { path = "crates/lsp-core" }
 text-document = { path = "crates/text-document" }
 vscode-uri = { path = "crates/vscode-uri" }
 anyhow = "1.0.104"

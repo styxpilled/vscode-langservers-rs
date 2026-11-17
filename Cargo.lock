@@ -119,8 +119,8 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "css-languageservice",
+ "lsp-core",
  "lsp-server",
- "lsp-transport",
  "lsp-types",
  "serde",
  "serde_json",
@@ -249,8 +249,8 @@ dependencies = [
  "css-language-server",
  "css-languageservice",
  "html-languageservice",
+ "lsp-core",
  "lsp-server",
- "lsp-transport",
  "lsp-types",
  "serde",
  "serde_json",
@@ -470,8 +470,8 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "json-languageservice",
+ "lsp-core",
  "lsp-server",
- "lsp-transport",
  "lsp-types",
  "serde",
  "serde_json",
@@ -529,6 +529,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
+name = "lsp-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossbeam-channel",
+ "lsp-server",
+ "lsp-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lsp-recorder"
 version = "0.1.0"
 dependencies = [
@@ -547,17 +559,6 @@ dependencies = [
  "log",
  "serde",
  "serde_derive",
- "serde_json",
-]
-
-[[package]]
-name = "lsp-transport"
-version = "0.1.0"
-dependencies = [
- "crossbeam-channel",
- "lsp-server",
- "lsp-types",
- "serde",
  "serde_json",
 ]
 

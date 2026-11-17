@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 pub mod completion;
+pub mod server;
 
 #[derive(Clone)]
 pub struct Writer(Sender<Vec<u8>>);
