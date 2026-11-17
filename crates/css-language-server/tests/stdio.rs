@@ -205,6 +205,13 @@ fn push_diagnostics() {
     let diagnostics = client.diagnostics(URI);
     assert_eq!(severities(&diagnostics), [("zeroUnits".into(), 1)]);
 
+    // `docs/experimental.md`: `null` settings are no settings.
+    client.notify(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": null }),
+    );
+    assert_eq!(client.diagnostics(URI), Vec::<Value>::new());
+
     client.notify("textDocument/didClose", text_document(URI));
     assert_eq!(client.diagnostics(URI), Vec::<Value>::new());
     assert_eq!(client.exit(), 0);

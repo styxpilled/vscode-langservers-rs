@@ -231,17 +231,15 @@ mod tests {
             markdown: true,
         };
         let fs = file_system();
-        let list = completion
-            .do_complete2(
-                &document,
-                document.position_at(offset),
-                &stylesheet,
-                &context,
-                Some(&fs),
-                None,
-                &mut [],
-            )
-            .unwrap();
+        let list = completion.do_complete2(
+            &document,
+            document.position_at(offset),
+            &stylesheet,
+            &context,
+            Some(&fs),
+            None,
+            &mut [],
+        );
         if let Some(count) = count {
             assert_eq!(list.items.len(), count);
         }

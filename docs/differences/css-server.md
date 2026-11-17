@@ -42,7 +42,6 @@ Zed differs only in the code actions (`zed.md`).
   meanwhile.
 - `settings[0]` that is `undefined` (an empty result array) selects the
   `configure` settings of the language service; `null` selects no settings.
-- `didChangeConfiguration` with `settings: null` throws: logged, no change.
 - `braceStyle` follows `beautify-css.js`: a list (string split on runs of other
   characters, or an array), the last item wins, only `expand` is not
   `collapse`.

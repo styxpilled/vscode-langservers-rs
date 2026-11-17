@@ -18,12 +18,6 @@ Upstream: `vscode-css-languageservice`, the file system parts of
 
 ## Changed
 
-- Upstream is async; a throw rejects the promise. `find_document_links2` returns
-  no links and `do_complete2` an empty list there (the server answers with `[]`
-  and `null`). Throws: an invalid URI in `vscode-uri` (for example a join that
-  gives a path without `/` after an authority), `null` as `package.json`, an
-  `exports` or root entry that is not a string, a negative character in a path
-  completion range.
 - `FileSystemProvider`: `readDirectory` and `getContent` are optional upstream;
   Rust requires the three functions (the server has them). `None` is a throw.
 

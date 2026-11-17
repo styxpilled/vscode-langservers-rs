@@ -285,7 +285,7 @@ impl LanguageModes {
         }
     }
 
-    /// `doComplete`. `Err` where upstream rejects.
+    /// `doComplete`. `Err` where the JavaScript mode fails.
     pub fn complete(
         &self,
         mode: Mode,
@@ -306,11 +306,11 @@ impl LanguageModes {
                     Some(&options),
                     &mut [],
                 );
-                Some(Completions::List {
+                Completions::List {
                     is_incomplete: list.is_incomplete,
                     items: list.items,
                     edit_range: None,
-                })
+                }
             }
             Mode::Css => {
                 let (embedded, stylesheet) = document.css();
@@ -319,21 +319,20 @@ impl LanguageModes {
                     data: &self.css_data,
                     markdown: self.css_completion_markdown,
                 };
-                completion
-                    .do_complete2(
-                        embedded,
-                        position,
-                        stylesheet,
-                        context,
-                        Some(&self.request_service),
-                        completion_settings(get(get(settings, "css"), "completion")).as_ref(),
-                        &mut [],
-                    )
-                    .map(|list| Completions::List {
-                        is_incomplete: list.is_incomplete,
-                        items: list.items,
-                        edit_range: list.item_defaults.map(|d| d.edit_range),
-                    })
+                let list = completion.do_complete2(
+                    embedded,
+                    position,
+                    stylesheet,
+                    context,
+                    Some(&self.request_service),
+                    completion_settings(get(get(settings, "css"), "completion")).as_ref(),
+                    &mut [],
+                );
+                Completions::List {
+                    is_incomplete: list.is_incomplete,
+                    items: list.items,
+                    edit_range: list.item_defaults.map(|d| d.edit_range),
+                }
             }
             #[cfg(feature = "javascript")]
             Mode::Script(script) => {
@@ -343,7 +342,7 @@ impl LanguageModes {
                     .map(Completions::Raw);
             }
         };
-        list.ok_or_else(|| "Range.create rejects a negative character".to_owned())
+        Ok(list)
     }
 
     /// `doHover`. The HTML mode reads `settings`; the CSS mode always reads
@@ -800,7 +799,7 @@ impl LanguageModes {
         format_range.start = start;
 
         let html_settings = get(settings, "html");
-        let config = format_configuration(&format_settings(html_settings, options))?;
+        let config = format_configuration(&format_settings(html_settings, options));
         let mut html_edits = formatter::format(text, Some(format_range), &config);
         let mut formatted = text.apply_edits(&html_edits);
         if truthy(options.get("insertFinalNewline"))

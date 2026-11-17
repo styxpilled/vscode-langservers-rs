@@ -82,24 +82,14 @@ impl LinkResolver<'_> {
         resolved
     }
 
-    /// `findDocumentLinks2`. Empty where upstream rejects (the server then
-    /// answers with an empty list).
+    /// `findDocumentLinks2`. A link whose resolution throws upstream is left
+    /// out; upstream rejects and gives no links.
     pub fn find_document_links2(
         &self,
         document: &TextDocument,
         stylesheet: &Stylesheet,
         context: &dyn DocumentContext,
     ) -> Vec<DocumentLink> {
-        self.try_find_document_links2(document, stylesheet, context)
-            .unwrap_or_default()
-    }
-
-    fn try_find_document_links2(
-        &self,
-        document: &TextDocument,
-        stylesheet: &Stylesheet,
-        context: &dyn DocumentContext,
-    ) -> Result<Vec<DocumentLink>, Thrown> {
         let mut resolved = Vec::new();
         for (mut link, is_raw_link) in self.find_unresolved_links(document, stylesheet) {
             if link.target.is_empty() || link.target.starts_with("data:") {
@@ -110,12 +100,14 @@ impl LinkResolver<'_> {
                 continue;
             }
             let uri = document.uri().as_str();
-            if let Some(target) = self.resolve_reference(&link.target, uri, context, is_raw_link)? {
+            if let Ok(Some(target)) =
+                self.resolve_reference(&link.target, uri, context, is_raw_link)
+            {
                 link.target = target;
                 resolved.push(link);
             }
         }
-        Ok(resolved)
+        resolved
     }
 
     fn is_raw_string_document_link_node(&self, ty: NodeType) -> bool {
@@ -350,21 +342,16 @@ impl LinkResolver<'_> {
         let Some(content) = content.filter(|c| !c.is_empty()) else {
             return Ok(None);
         };
-        let Ok(package_json) = serde_json::from_str::<Value>(&content) else {
+        // Upstream throws for `null` content and for an entry that is not a string.
+        let Ok(package_json @ Value::Object(_)) = serde_json::from_str::<Value>(&content) else {
             return Ok(None);
         };
-        if package_json.is_null() {
-            return Err(Thrown);
-        }
         let entry_path = |entry: Option<&Value>| -> Result<Option<String>, Thrown> {
-            match entry.filter(|e| truthy(e)) {
-                None => Ok(None),
+            match entry {
                 Some(Value::String(entry)) if entry.ends_with(".scss") => {
                     Ok(Some(join_path(&module_path, &[entry])?))
                 }
-                Some(Value::String(_)) => Ok(None),
-                // `entry.endsWith` is not a function.
-                Some(_) => Err(Thrown),
+                _ => Ok(None),
             }
         };
         let subpath = bare_target.get(module_name.len() + 1..).unwrap_or("");
@@ -408,26 +395,19 @@ impl LinkResolver<'_> {
                     continue;
                 };
                 let captured = m.group(1).map_or("", |r| &lookup_subpath[r]);
-                match first_truthy(subpath_object, &["sass", "styles", "default"])
-                    .filter(|e| truthy(e))
+                if let Some(Value::String(entry)) =
+                    first_truthy(subpath_object, &["sass", "styles", "default"])
+                    && entry.ends_with(".scss")
                 {
-                    None => {}
-                    Some(Value::String(entry)) if entry.ends_with(".scss") => {
-                        // The right side of a subpath pattern is a pattern too.
-                        let expanded = entry.replacen('*', captured, 1);
-                        return Ok(Some(join_path(&module_path, &[&expanded])?));
-                    }
-                    Some(Value::String(_)) => {}
-                    Some(_) => return Err(Thrown),
+                    // The right side of a subpath pattern is a pattern too.
+                    let expanded = entry.replacen('*', captured, 1);
+                    return Ok(Some(join_path(&module_path, &[&expanded])?));
                 }
             }
         } else if subpath.is_empty() {
             // `sass` and `style` at the root of `package.json`.
-            match first_truthy(&package_json, &["sass", "style"]) {
-                None => {}
-                Some(Value::String(entry)) => return Ok(Some(join_path(&module_path, &[entry])?)),
-                // `posix.join` throws for a value that is not a string.
-                Some(_) => return Err(Thrown),
+            if let Some(Value::String(entry)) = first_truthy(&package_json, &["sass", "style"]) {
+                return Ok(Some(join_path(&module_path, &[entry])?));
             }
         }
         Ok(None)

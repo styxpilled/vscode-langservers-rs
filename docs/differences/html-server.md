@@ -25,9 +25,7 @@ tag auto insertion of Zed's fork (`zed.md`). The JavaScript mode uses tsrs
 - `html.format` settings are read field by field with the semantics of
   js-beautify's `Options`: booleans by truthiness, numbers as in
   `experimental.md` (another value gives the js-beautify default), lists only
-  from strings, `wrapAttributes` and
-  `indentScripts` must be a valid name (else the request answers `[]` and logs,
-  as upstream throws). `unformattedContentDelimiter` that is not a string is not
+  from strings. `unformattedContentDelimiter` that is not a string is not
   set. A negative `tabSize` is 4.
 - A `css` settings section that is `null` (Zed's `html` extension answers `null`
   for each section) or a `css.lint` that is `null` gives the default lint.

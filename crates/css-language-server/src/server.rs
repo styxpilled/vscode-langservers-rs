@@ -497,11 +497,8 @@ impl Server {
                 self.core.close(uri);
             }
             "workspace/didChangeConfiguration" => {
-                let settings = params.get("settings").cloned().unwrap_or(Value::Null);
-                if settings.is_null() {
-                    anyhow::bail!("Cannot read properties of {settings} (reading 'css')");
-                }
-                self.configured = settings;
+                // Upstream throws for `null` settings and keeps the last ones.
+                self.configured = params.get("settings").cloned().unwrap_or(Value::Null);
                 self.settings.clear();
                 self.core.request_refresh(self.documents.keys());
             }
@@ -565,7 +562,7 @@ impl Server {
         p: CompletionParams,
         document: &Document,
         scoped: Option<&Value>,
-    ) -> Option<CompactList> {
+    ) -> CompactList {
         let settings = get(scoped, "completion")
             .or_else(|| get(self.configured(&document.text), "completion"));
         let stylesheet = self.stylesheet(document);
@@ -586,13 +583,13 @@ impl Server {
             Some(&self.request_service),
             completion_settings(settings).as_ref(),
             &mut [],
-        )?;
-        Some(self.resolve.borrow_mut().compact(
+        );
+        self.resolve.borrow_mut().compact(
             self.capabilities.completion,
             list.is_incomplete,
             list.items,
             list.item_defaults.map(|d| d.edit_range),
-        ))
+        )
     }
 
     fn hover(&self, p: HoverParams, document: &Document, scoped: Option<&Value>) -> Option<Hover> {

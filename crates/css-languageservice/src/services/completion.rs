@@ -120,7 +120,7 @@ pub struct Completion<'a> {
 
 impl Completion<'_> {
     /// `doComplete2`: `doComplete` with path completion. The file system
-    /// must provide `readDirectory`. `None` where upstream rejects.
+    /// must provide `readDirectory`.
     #[allow(clippy::too_many_arguments)]
     pub fn do_complete2(
         &self,
@@ -131,9 +131,9 @@ impl Completion<'_> {
         file_system: Option<&dyn FileSystemProvider>,
         settings: Option<&CompletionSettings>,
         participants: &mut [&mut dyn CompletionParticipant],
-    ) -> Option<CompletionList> {
+    ) -> CompletionList {
         let Some(file_system) = file_system else {
-            return Some(self.do_complete(document, position, stylesheet, settings, participants));
+            return self.do_complete(document, position, stylesheet, settings, participants);
         };
         let mut path = PathCompletionParticipant::default();
         let result = {
@@ -145,13 +145,13 @@ impl Completion<'_> {
             );
             self.do_complete(document, position, stylesheet, settings, &mut all)
         };
-        let mut path_result = path.compute_completions(document, context, file_system)?;
+        let mut path_result = path.compute_completions(document, context, file_system);
         path_result.items.extend(result.items);
-        Some(CompletionList {
+        CompletionList {
             is_incomplete: result.is_incomplete || path_result.is_incomplete,
             item_defaults: result.item_defaults,
             items: path_result.items,
-        })
+        }
     }
 
     /// `doComplete`.

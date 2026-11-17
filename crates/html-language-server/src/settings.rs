@@ -3,7 +3,7 @@
 
 use css_language_server::settings::{brace_style, get, integer, truthy};
 use html_languageservice::HoverSettings;
-use html_languageservice::beautify::{IndentScripts, Templating, WrapAttributes};
+use html_languageservice::beautify::Templating;
 use html_languageservice::services::completion::CompletionConfiguration;
 use html_languageservice::services::formatter::{
     EmbeddedCssFormatConfiguration, HtmlFormatConfiguration, TemplatingSetting,
@@ -104,70 +104,52 @@ fn string(o: &Map<String, Value>, key: &str) -> Option<String> {
     option(o, key).and_then(Value::as_str).map(str::to_owned)
 }
 
-/// `_get_selection`: a name, or a list with one name. Other types give the
-/// default. `Err` where js-beautify throws.
-fn selection<T: for<'de> Deserialize<'de>>(
-    o: &Map<String, Value>,
-    key: &str,
-    js_key: &str,
-) -> Result<Option<T>, String> {
-    let name = match option(o, key) {
-        Some(Value::String(s)) => Value::from(s.as_str()),
-        Some(Value::Array(a)) if a.len() == 1 => a[0].clone(),
-        Some(Value::Array(_)) | Some(Value::Object(_)) => {
-            return Err(format!(
-                "Invalid Option Value: The option '{js_key}' can only be one of the following values"
-            ));
-        }
-        _ => return Ok(None),
+/// `_get_selection`: a name, or a list with one name. Other values give the
+/// default (js-beautify throws for a list or an unknown name).
+fn selection<T: for<'de> Deserialize<'de>>(o: &Map<String, Value>, key: &str) -> Option<T> {
+    let name = match option(o, key)? {
+        Value::Array(a) if a.len() == 1 => &a[0],
+        name => name,
     };
-    T::deserialize(&name).map(Some).map_err(|_| {
-        format!("Invalid Option Value: The option '{js_key}' can only be one of the following values\nYou passed in: '{}'", js_string(&name))
-    })
+    T::deserialize(name).ok()
 }
 
-/// `getTemplatingFormatOption` and `_get_selection_list`.
-fn templating(o: &Map<String, Value>) -> Result<TemplatingSetting, String> {
+/// `getTemplatingFormatOption` and `_get_selection_list`. Unknown names are left
+/// out (js-beautify throws).
+fn templating(o: &Map<String, Value>) -> TemplatingSetting {
     match option(o, "templating") {
-        Some(Value::Bool(true)) => Ok(TemplatingSetting::Enabled(true)),
-        Some(Value::Array(a)) => a
-            .iter()
-            .map(|v| {
-                Templating::deserialize(v).map_err(|_| {
-                    format!("Invalid Option Value: The option 'templating' can contain only the following values\nYou passed in: '{}'", js_string(&Value::Array(a.clone())))
-                })
-            })
-            .collect::<Result<_, _>>()
-            .map(TemplatingSetting::List),
-        _ => Ok(TemplatingSetting::Enabled(false)),
+        Some(Value::Bool(true)) => TemplatingSetting::Enabled(true),
+        Some(Value::Array(a)) => TemplatingSetting::List(
+            a.iter()
+                .filter_map(|v| Templating::deserialize(v).ok())
+                .collect(),
+        ),
+        _ => TemplatingSetting::Enabled(false),
     }
 }
 
 /// `getCSSFormatOption`.
-fn css(o: &Map<String, Value>) -> Result<Option<EmbeddedCssFormatConfiguration>, String> {
-    let Some(css) = o.get("css").filter(|v| truthy(Some(v))) else {
-        return Ok(None);
-    };
+fn css(o: &Map<String, Value>) -> Option<EmbeddedCssFormatConfiguration> {
+    let css = o.get("css").filter(|v| truthy(Some(v)))?;
     let c = merge(Some(css));
-    Ok(Some(EmbeddedCssFormatConfiguration {
+    Some(EmbeddedCssFormatConfiguration {
         newline_between_selectors: boolean(&c, "newlineBetweenSelectors"),
         newline_between_rules: boolean(&c, "newlineBetweenRules"),
         space_around_selector_separator: boolean(&c, "spaceAroundSelectorSeparator"),
         brace_style: c.get("braceStyle").and_then(brace_style),
         preserve_new_lines: boolean(&c, "preserveNewLines"),
         max_preserve_new_lines: number(&c, "maxPreserveNewLines", Some(32786)),
-    }))
+    })
 }
 
-/// `HTMLFormatConfiguration` from the merged settings. `Err` where upstream
-/// throws.
-pub fn format_configuration(o: &Map<String, Value>) -> Result<HtmlFormatConfiguration, String> {
+/// `HTMLFormatConfiguration` from the merged settings.
+pub fn format_configuration(o: &Map<String, Value>) -> HtmlFormatConfiguration {
     // `tabSize || 4`. A negative size is 4 too (upstream builds broken indents).
     let tab_size = option(o, "tabSize")
         .and_then(integer)
         .filter(|&n| n > 0)
         .map(|n| n.min(u32::MAX as i64) as u32);
-    Ok(HtmlFormatConfiguration {
+    HtmlFormatConfiguration {
         tab_size,
         insert_spaces: Some(truthy(o.get("insertSpaces"))),
         indent_empty_lines: boolean(o, "indentEmptyLines"),
@@ -175,22 +157,23 @@ pub fn format_configuration(o: &Map<String, Value>) -> Result<HtmlFormatConfigur
         unformatted: string(o, "unformatted"),
         content_unformatted: string(o, "contentUnformatted"),
         indent_inner_html: boolean(o, "indentInnerHtml"),
-        wrap_attributes: selection::<WrapAttributes>(o, "wrapAttributes", "wrap_attributes")?,
+        wrap_attributes: selection(o, "wrapAttributes"),
         wrap_attributes_indent_size: number(o, "wrapAttributesIndentSize", None),
         preserve_new_lines: boolean(o, "preserveNewLines"),
         max_preserve_new_lines: number(o, "maxPreserveNewLines", Some(32786)),
         indent_handlebars: boolean(o, "indentHandlebars"),
         end_with_newline: boolean(o, "endWithNewline"),
         extra_liners: string(o, "extraLiners"),
-        indent_scripts: selection::<IndentScripts>(o, "indentScripts", "indent_scripts")?,
-        templating: Some(templating(o)?),
+        indent_scripts: selection(o, "indentScripts"),
+        templating: Some(templating(o)),
         unformatted_content_delimiter: string(o, "unformattedContentDelimiter"),
-        css: css(o)?,
-    })
+        css: css(o),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use html_languageservice::beautify::WrapAttributes;
     use serde_json::json;
 
     use super::*;
@@ -219,8 +202,7 @@ mod tests {
         let config = c(json!({
             "tabSize": "3", "insertSpaces": 1, "wrapLineLength": "x", "wrapAttributes": ["force"],
             "templating": ["erb"], "unformatted": 5, "maxPreserveNewLines": null
-        }))
-        .unwrap();
+        }));
         assert_eq!(config.tab_size, Some(3));
         assert_eq!(config.insert_spaces, Some(true));
         assert_eq!(config.wrap_line_length, Some(0));
@@ -230,10 +212,18 @@ mod tests {
         );
         assert_eq!(config.unformatted, None);
         assert_eq!(config.max_preserve_new_lines, None);
-        assert!(c(json!({"wrapAttributes": "bad"})).is_err());
-        assert!(c(json!({"templating": ["bad"]})).is_err());
+        // `docs/experimental.md`: js-beautify throws for these.
+        assert_eq!(c(json!({"wrapAttributes": "bad"})).wrap_attributes, None);
+        assert_eq!(
+            c(json!({"wrapAttributes": ["force", "auto"]})).wrap_attributes,
+            None
+        );
         assert!(matches!(
-            c(json!({"templating": "all"})).unwrap().templating,
+            c(json!({"templating": ["bad", "erb"]})).templating,
+            Some(TemplatingSetting::List(l)) if l == [Templating::Erb]
+        ));
+        assert!(matches!(
+            c(json!({"templating": "all"})).templating,
             Some(TemplatingSetting::Enabled(false))
         ));
     }

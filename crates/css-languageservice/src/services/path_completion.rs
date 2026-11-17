@@ -1,8 +1,6 @@
 //! Port of `pathCompletion.ts`.
 
-use lsp_types::{
-    Command, CompletionItem, CompletionItemKind, CompletionTextEdit, Position, Range, TextEdit,
-};
+use lsp_types::{Command, CompletionItem, CompletionItemKind, CompletionTextEdit, Range, TextEdit};
 use text_document::TextDocument;
 
 use crate::services::completion::{
@@ -29,34 +27,45 @@ impl CompletionParticipant for PathCompletionParticipant {
 }
 
 impl PathCompletionParticipant {
-    /// `computeCompletions`. `None` where upstream throws: `Range.create`
-    /// rejects a negative character.
+    /// `computeCompletions`. Only for a context whose range is its value and a cursor
+    /// in the value. Upstream also completes when the cursor is next to the value
+    /// (`u|rl("a")`, after the `)`), with a range away from the cursor.
     pub fn compute_completions(
         &self,
         document: &TextDocument,
         context: &dyn DocumentContext,
         file_system: &dyn FileSystemProvider,
-    ) -> Option<CompletionList> {
+    ) -> CompletionList {
         let mut result = CompletionList::default();
-        let suggest = |value: &str, position, range| {
-            provide_path_suggestions(value, position, range, document, context, file_system)
-        };
-        for c in &self.literal_completions {
-            if matches!(strip_quotes(&c.uri_value), "." | "..") {
-                result.is_incomplete = true;
-            } else {
-                result
-                    .items
-                    .extend(suggest(&c.uri_value, c.position, c.range)?);
+        let values = self
+            .literal_completions
+            .iter()
+            .map(|c| (&c.uri_value, c.position, c.range, false))
+            .chain(
+                self.import_completions
+                    .iter()
+                    .map(|c| (&c.path_value, c.position, c.range, true)),
+            );
+        for (value, position, range, import) in values {
+            let (start, end) = (
+                document.offset_at(range.start),
+                document.offset_at(range.end),
+            );
+            if document.text()[start..end] != *value {
+                continue;
             }
-        }
-        for c in &self.import_completions {
-            if matches!(strip_quotes(&c.path_value), "." | "..") {
+            let (start, end) = strip_quotes(value, start, end);
+            if matches!(&document.text()[start..end], "." | "..") {
                 result.is_incomplete = true;
                 continue;
             }
-            let mut suggestions = suggest(&c.path_value, c.position, c.range)?;
-            if document.language_id() == "scss" {
+            let cursor = document.offset_at(position);
+            if !(start..=end).contains(&cursor) {
+                continue;
+            }
+            let mut suggestions =
+                provide_path_suggestions(document, cursor, start, end, context, file_system);
+            if import && document.language_id() == "scss" {
                 for s in &mut suggestions {
                     if s.label.starts_with('_')
                         && s.label.ends_with(".scss")
@@ -68,39 +77,59 @@ impl PathCompletionParticipant {
             }
             result.items.extend(suggestions);
         }
-        Some(result)
+        result
+    }
+}
+
+/// `stripQuotes`: the offsets of `value` at `start..end` without its quotes. Upstream
+/// takes the range with `shiftRange(range, 1, -1)`, which assumes one line and two
+/// quotes, and throws for a negative character.
+fn strip_quotes(value: &str, start: usize, end: usize) -> (usize, usize) {
+    match value.chars().next() {
+        Some(q @ ('\'' | '"')) if value.len() > 1 && value.ends_with(q) => (start + 1, end - 1),
+        Some('\'' | '"') => (start + 1, end),
+        _ => (start, end),
     }
 }
 
 fn provide_path_suggestions(
-    path_value: &str,
-    position: Position,
-    range: Range,
     document: &TextDocument,
+    cursor: usize,
+    start: usize,
+    end: usize,
     context: &dyn DocumentContext,
     file_system: &dyn FileSystemProvider,
-) -> Option<Vec<CompletionItem>> {
-    let full_value = strip_quotes(path_value);
-    let is_value_quoted = path_value.starts_with(['\'', '"']);
-    let cursor = position.character as i64 - range.start.character as i64;
-    let value_before_cursor = if is_value_quoted {
-        js_slice(full_value, 0, cursor - 1)
-    } else {
-        js_slice(full_value, 0, cursor)
-    };
-    let full_value_range = if is_value_quoted {
-        shift_range(range, 1, -1)?
-    } else {
-        range
-    };
-    let replace_range = path_to_replace_range(&value_before_cursor, full_value, full_value_range)?;
-    Some(suggestions(
+) -> Vec<CompletionItem> {
+    let text = document.text();
+    let value_before_cursor = &text[start..cursor];
+    let full_value = &text[start..end];
+    let replace_range = path_to_replace_range(document, value_before_cursor, full_value, end);
+    suggestions(
         document,
         context,
         file_system,
-        &value_before_cursor,
+        value_before_cursor,
         replace_range,
-    ))
+    )
+}
+
+/// `pathToReplaceRange`: the path segment at the cursor, up to a space.
+fn path_to_replace_range(
+    document: &TextDocument,
+    value_before_cursor: &str,
+    full_value: &str,
+    end: usize,
+) -> Range {
+    let start = end - full_value.len();
+    let Some(last_slash) = value_before_cursor.rfind('/') else {
+        return document.range(start, end);
+    };
+    let after_last_slash = &full_value[last_slash + 1..];
+    let start = end - after_last_slash.len();
+    let end = after_last_slash
+        .find(' ')
+        .map_or(end, |space| start + space);
+    document.range(start, end)
 }
 
 fn suggestions(
@@ -135,67 +164,13 @@ fn suggestions(
             continue;
         }
         let is_dir = file_type == FileType::Directory;
-        if !is_dir {
-            match join_path(&parent_dir, &[&name]) {
-                Ok(path) if path == current_doc_uri => continue,
-                Ok(_) => {}
-                Err(_) => return Vec::new(),
-            }
+        // Upstream rejects when the join throws.
+        if !is_dir && join_path(&parent_dir, &[&name]).is_ok_and(|p| p == current_doc_uri) {
+            continue;
         }
         result.push(create_completion_item(&name, is_dir, replace_range));
     }
     result
-}
-
-fn strip_quotes(value: &str) -> &str {
-    if value.starts_with(['\'', '"']) {
-        let mut chars = value.chars();
-        chars.next();
-        chars.next_back();
-        chars.as_str()
-    } else {
-        value
-    }
-}
-
-/// JS `slice(start, end)` on UTF-16 units.
-fn js_slice(s: &str, start: i64, end: i64) -> String {
-    let units: Vec<u16> = s.encode_utf16().collect();
-    let len = units.len() as i64;
-    let clamp = |i: i64| if i < 0 { (len + i).max(0) } else { i.min(len) } as usize;
-    let (start, end) = (clamp(start), clamp(end));
-    if start >= end {
-        return String::new();
-    }
-    String::from_utf16_lossy(&units[start..end])
-}
-
-fn utf16_index(s: &str, byte: usize) -> i64 {
-    s[..byte].encode_utf16().count() as i64
-}
-
-fn path_to_replace_range(
-    value_before_cursor: &str,
-    full_value: &str,
-    full_value_range: Range,
-) -> Option<Range> {
-    let Some(last_slash) = value_before_cursor.rfind('/') else {
-        return Some(full_value_range);
-    };
-    // The cursor is in the middle of the value: replace from the last slash
-    // before the cursor.
-    let last_slash = utf16_index(value_before_cursor, last_slash);
-    let value_after_last_slash = js_slice(full_value, last_slash + 1, i64::MAX);
-    let start = shift_position(
-        full_value_range.end,
-        -(value_after_last_slash.encode_utf16().count() as i64),
-    )?;
-    // Replace up to a space.
-    let end = match value_after_last_slash.find(' ') {
-        Some(i) => shift_position(start, utf16_index(&value_after_last_slash, i))?,
-        None => full_value_range.end,
-    };
-    Some(Range::new(start, end))
 }
 
 fn create_completion_item(name: &str, is_dir: bool, replace_range: Range) -> CompletionItem {
@@ -231,17 +206,4 @@ fn escape_path(p: &str) -> String {
         out.push(c);
     }
     out
-}
-
-/// `None` for a negative character.
-fn shift_position(pos: Position, offset: i64) -> Option<Position> {
-    let character = u32::try_from(pos.character as i64 + offset).ok()?;
-    Some(Position::new(pos.line, character))
-}
-
-fn shift_range(range: Range, start_offset: i64, end_offset: i64) -> Option<Range> {
-    Some(Range::new(
-        shift_position(range.start, start_offset)?,
-        shift_position(range.end, end_offset)?,
-    ))
 }

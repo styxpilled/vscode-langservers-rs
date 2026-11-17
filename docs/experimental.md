@@ -254,6 +254,38 @@ pass. `tests/stdio.rs` (`deep_nesting`).
   alpha 1 and 0.5) are the same as on `main`. The color fixtures and the
   navigation and facts sweeps pass.
 
+## CSS links and path completion
+
+Upstream is async, and a throw rejects the promise: `findDocumentLinks2` gives no
+links and `doComplete2` no completion (the servers answer `[]` and `null`).
+
+- Links. A link whose resolution throws (an invalid URI in `vscode-uri`, for
+  example `gantry-media://g.png`) is left out; the other links stay. In
+  `package.json`, content that is not an object and an entry that is not a
+  string (`"sass": 5`, `"exports": { ".": { "sass": {} } }`) count as absent,
+  and the resolution goes on as without them. `links_where_upstream_rejects`.
+- Path completion range. Upstream takes the value range with
+  `shiftRange(range, 1, -1)` and moves the end by the length of the name after
+  the last `/`. This assumes one line and two quotes: a value on two lines (an
+  escaped newline) gives a negative character and upstream throws; an unclosed
+  quote loses the last character. The branch takes the value as byte offsets of
+  the text, without its quotes, as the HTML service does. A file name that
+  `joinPath` rejects is not compared with the document.
+- Path completion position. The completion also gives a URL context when the
+  cursor is next to the value: on `url` (`u|rl("a/b")`), before `url(`, or
+  after the `)`; the context range is then not the value. Upstream completes
+  there too, with the text before the cursor from the value and a range away
+  from the cursor (a cursor at the opening quote or after the closing quote
+  takes the whole value). The branch completes paths only when the context
+  range is the value and the cursor is between the quotes.
+  `path_completion_offsets`.
+
+The links sweep skips the calls that upstream rejects and the path completions
+where the branch does not complete or where upstream computes the range on one
+line with two quotes (738 of 15354 calls). Replay: the generated sessions
+`css/features.jsonl` and `css/push.jsonl` complete at each offset, and differ at
+the positions next to a `url(...)` or an import value.
+
 ## CSS server settings
 
 The HTML server uses the same helpers for its formatter settings.
@@ -264,6 +296,9 @@ The HTML server uses the same helpers for its formatter settings.
   `null`, diagnostics are empty. The branch uses the `configure` settings for
   that request and does not cache the result, so the next request asks again.
   `tests/stdio.rs` (`scoped_settings`).
+- `settings: null` in `didChangeConfiguration`. Upstream throws (reading `css`)
+  and keeps the last settings. The branch takes it as no settings, as the HTML
+  server does. `tests/stdio.rs` (`push_diagnostics`).
 - Unknown `braceStyle`. Upstream js-beautify throws on an unknown item, and
   formatting answers `[]`. The branch ignores unknown items; the last known item
   wins. `formatting`, `brace_styles`.
@@ -354,6 +389,11 @@ The HTML server uses the same helpers for its formatter settings.
 - `html.format.unformatted` that is truthy and not a string. Upstream
   js-beautify throws (`unformattedTags.match`), and formatting answers `[]`. The
   branch ignores the value. `scoped_settings`.
+- Format setting names. Upstream js-beautify throws for a `wrapAttributes` or
+  `indentScripts` that is not a known name or a list of one known name, and for
+  an unknown name in `templating`; formatting answers `[]`. The branch uses the
+  default for the first two and leaves unknown `templating` names out.
+  `settings::tests::format_options`.
 - Languages in a document. Upstream `getLanguagesInDocument` stops at three
   embedded languages and then does not add `html`: a document with CSS,
   JavaScript and TypeScript regions has no HTML mode for links, symbols, colors,
@@ -463,3 +503,12 @@ against 1046 MB. The responses are the same as before, except four
   empty cache, 1.9 s with the cached copy; `documentColor` 2.7 s against 0.25 s;
   max request 829 against 170 ms. With the cached copy, the replays differ only
   in one fewer refresh in each of the 3 sessions.
+
+## JSON colors
+
+Upstream `findDocumentColors` counts each string with a `color` or `color-hex`
+format against the limit, also a string that is not a color, and gives one
+color for limit 0. The branch counts colors: at most `limit`, none for 0. The
+servers never pass 0 (a 0 setting is the default limit), so only a document
+with more strings of a color format than the limit (500 in Zed) can show the
+difference. `tests/colors.rs`.
