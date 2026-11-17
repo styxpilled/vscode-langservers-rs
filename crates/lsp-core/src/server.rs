@@ -2,6 +2,7 @@
 //! the client, push diagnostic timers, `runSafe`, and the per-document settings of
 //! `workspace/configuration`.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::{Duration, Instant};
@@ -13,7 +14,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::Writer;
+use crate::{Writer, size};
 
 const VALIDATION_DELAY: Duration = Duration::from_millis(500);
 
@@ -81,6 +82,10 @@ pub struct Core<O, E = ()> {
     next_report_id: u64,
     /// Pull diagnostics: changed documents to validate when no message waits.
     idle_validations: VecDeque<Uri>,
+    /// The document of the last idle validation, for the slow log.
+    idle_uri: Option<Uri>,
+    /// Requests without a response: their slow log label and start.
+    started: RefCell<HashMap<RequestId, (String, Instant)>>,
     shutdown: bool,
 }
 
@@ -99,6 +104,8 @@ impl<O, E> Core<O, E> {
             reports: HashMap::new(),
             next_report_id: 0,
             idle_validations: VecDeque::new(),
+            idle_uri: None,
+            started: RefCell::default(),
             shutdown: false,
         }
     }
@@ -112,11 +119,22 @@ impl<O, E> Core<O, E> {
     }
 
     pub fn send(&self, message: impl Into<Message>) {
-        self.writer.message(message.into());
+        let message = message.into();
+        if let Message::Response(response) = &message {
+            self.finish(&response.id);
+        }
+        self.writer.message(message);
     }
 
     pub fn respond(&self, id: RequestId, result: &impl Serialize) {
+        self.finish(&id);
         self.writer.response(id, result);
+    }
+
+    fn finish(&self, id: &RequestId) {
+        if let Some((label, start)) = self.started.borrow_mut().remove(id) {
+            self.writer.log_slow(&label, start.elapsed());
+        }
     }
 
     pub fn notify(&self, method: &str, params: impl Serialize) {
@@ -294,6 +312,7 @@ impl<O, E> Core<O, E> {
     pub fn next_idle_validation(&mut self) -> Option<Uri> {
         while let Some(uri) = self.idle_validations.pop_front() {
             if !self.report_is_current(&uri) {
+                self.idle_uri = Some(uri.clone());
                 return Some(uri);
             }
         }
@@ -362,6 +381,38 @@ pub trait Service: Sized {
     fn idle(&mut self) -> bool {
         false
     }
+
+    /// The text length of an open document, for the slow log.
+    fn document_len(&self, _uri: &Uri) -> Option<usize> {
+        None
+    }
+}
+
+/// `what uri (size)`: the slow log label of work on the document `uri`.
+fn label<S: Service>(service: &S, what: &str, uri: Option<&str>) -> String {
+    let Some(uri) = uri else {
+        return what.to_owned();
+    };
+    match uri
+        .parse::<Uri>()
+        .ok()
+        .and_then(|u| service.document_len(&u))
+    {
+        Some(len) => format!("{what} {uri} ({})", size(len)),
+        None => format!("{what} {uri}"),
+    }
+}
+
+fn text_document_uri(params: &Value) -> Option<&str> {
+    params.pointer("/textDocument/uri").and_then(Value::as_str)
+}
+
+fn log_slow<S: Service>(service: &mut S, start: Instant, what: &str, uri: Option<&str>) {
+    let elapsed = start.elapsed();
+    if elapsed >= crate::slow_limit() {
+        let label = label(service, what, uri);
+        service.core().writer.log_slow(&label, elapsed);
+    }
 }
 
 /// The main loop. Returns whether the client sent `shutdown` before `exit`.
@@ -371,8 +422,18 @@ pub fn run<S: Service>(service: &mut S) -> bool {
         let message = match core.inbox.pop_front() {
             Some(message) => message,
             None => {
-                if core.receiver.is_empty() && core.events.1.is_empty() && service.idle() {
-                    continue;
+                if core.receiver.is_empty() && core.events.1.is_empty() {
+                    core.idle_uri = None;
+                    let start = Instant::now();
+                    if service.idle() {
+                        let uri = service.core().idle_uri.take();
+                        let what = match uri {
+                            Some(_) => "idle validation",
+                            None => "idle work",
+                        };
+                        log_slow(service, start, what, uri.as_ref().map(|u| u.as_str()));
+                        continue;
+                    }
                 }
                 let core = service.core();
                 let receiver = core.receiver.clone();
@@ -394,39 +455,51 @@ pub fn run<S: Service>(service: &mut S) -> bool {
                     }
                     recv(timer) -> _ => {
                         for uri in service.core().due_validations() {
-                            service.validate(uri);
+                            let start = Instant::now();
+                            service.validate(uri.clone());
+                            log_slow(service, start, "validation", Some(uri.as_str()));
                         }
                         continue;
                     }
                 }
             }
         };
-        let core = service.core();
         match message {
             Message::Request(request) if request.method == "shutdown" => {
+                let core = service.core();
                 core.shutdown = true;
                 core.send(Response::new_ok(request.id, Value::Null));
             }
             Message::Request(request) => {
-                if core.take_cancellation(&request.id) {
-                    core.respond_cancelled(request.id);
+                if service.core().take_cancellation(&request.id) {
+                    service.core().respond_cancelled(request.id);
                 } else {
+                    let label = label(service, &request.method, text_document_uri(&request.params));
+                    let started = (label, Instant::now());
+                    service
+                        .core()
+                        .started
+                        .borrow_mut()
+                        .insert(request.id.clone(), started);
                     service.dispatch(request);
                 }
             }
             Message::Notification(notification) if notification.method == "exit" => {
-                return core.shutdown;
+                return service.core().shutdown;
             }
             Message::Notification(notification) => {
                 let method = notification.method.clone();
+                let uri = text_document_uri(&notification.params).map(str::to_owned);
+                let start = Instant::now();
                 if let Err(e) = service.on_notification(notification) {
                     service
                         .core()
                         .log_error(&format!("Error while handling {method}: {e}"));
                 }
+                log_slow(service, start, &method, uri.as_deref());
             }
             Message::Response(response) => {
-                if let Some(kind) = core.outgoing.remove(&response.id) {
+                if let Some(kind) = service.core().outgoing.remove(&response.id) {
                     service.on_response(response, kind);
                 }
             }

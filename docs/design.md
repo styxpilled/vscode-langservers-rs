@@ -31,18 +31,21 @@
 - `crates/lsp-core`: the parts of the servers that do not depend on the
   language.
   - Stdio threads, and `run_server`, which runs the server loop on a thread with
-    a 256 MiB stack (`experimental.md`, "Deep nesting"). Responses and
-    notifications are serialized directly from the `lsp-types` values (a
-    `serde_json::Value` takes about 8 times the memory of its JSON text).
+    a 256 MiB stack (`experimental.md`, "Deep nesting"). The reader is
+    `Message::read` with the body size and the decode time, for the slow log
+    (`experimental.md`, "Slow log"). Responses and notifications are serialized
+    directly from the `lsp-types` values (a `serde_json::Value` takes about 8
+    times the memory of its JSON text).
   - `server.rs`: `Core` (requests to the client, push diagnostic timers with 500
     ms delay, `publishDiagnostics`, refresh, the pull report cache with
     `resultId` and the queue of idle validations, `experimental.md` "Pull
     diagnostics") and `run`, the main loop of a `Service`: `shutdown` and
     `exit`, a lookahead for the `$/cancelRequest` of each request, timers,
-    events from worker threads, and work while no message waits. `handle` is
-    `runSafe` (an error or a panic gives the error value and a log message).
-    `ScopedSettings` is `getDocumentSettings`: the `workspace/configuration`
-    result of each document, and the jobs that wait for it.
+    events from worker threads, work while no message waits, and the slow log of
+    each step. `handle` is `runSafe` (an error or a panic gives the error value
+    and a log message). `ScopedSettings` is `getDocumentSettings`: the
+    `workspace/configuration` result of each document, and the jobs that wait
+    for it.
   - `completion.rs`: small completion lists (`experimental.md`).
   - Result limits and the symbol depth cap.
 - `crates/lsp-recorder`: `lsp-recorder` and `lsp-replay` (see `testing.md`).

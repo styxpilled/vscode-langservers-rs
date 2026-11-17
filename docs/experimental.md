@@ -157,6 +157,30 @@ time between each change and the next pull, the idle validation is complete
 before 684 of the 686 JSON pulls that follow a change. CSS and HTML validation
 takes less than 1 ms.
 
+## Slow log
+
+Upstream logs nothing about time. The branch (`lsp-core`, all three servers)
+sends `window/logMessage` (type 4, Log) for each step of the server that takes
+50 ms or more. `VSCODE_LANGSERVERS_SLOW_MS` sets the limit; `0` logs each step.
+In Zed: `lsp.<name>.binary.env`; the lines are in the server log.
+
+- `slow: read <method> (<body size>): <ms> ms`: the JSON decode of a message on
+  the reader thread.
+- `slow: <method> <uri> (<document size>): <ms> ms`: a request from its start to
+  its response, also when it waits (settings, schemas); a notification.
+- `slow: validation <uri>`, `slow: idle validation <uri>`, `slow: idle work`:
+  push validation, idle validation, the JSON schema prefetch.
+
+Cost: two clock reads for each step, and for each request a label (one URI parse
+and one map lookup). Responses, events and the `$/cancelRequest` lookahead are
+not timed. `tests/stdio.rs` (JSON) `slow_log`, `lsp-core` `read_messages`.
+
+Field data. All Zed sessions in `.scratch/sessions` (86 replays): two steps of
+50 ms or more, both the first `diagnostic` of `large-file.json` (25 MB, 85 ms).
+With limit 0, the same session: decode of its `didOpen` 43 ms, `didOpen` 18 ms,
+`didClose` 3 ms; no other step on a large document. The sessions have no
+`didChange` and no `documentSymbol` on a large document.
+
 ## CSS parse time
 
 Upstream tries some parse functions again at the same offset. In nested input
@@ -256,8 +280,8 @@ pass. `tests/stdio.rs` (`deep_nesting`).
 
 ## CSS links and path completion
 
-Upstream is async, and a throw rejects the promise: `findDocumentLinks2` gives no
-links and `doComplete2` no completion (the servers answer `[]` and `null`).
+Upstream is async, and a throw rejects the promise: `findDocumentLinks2` gives
+no links and `doComplete2` no completion (the servers answer `[]` and `null`).
 
 - Links. A link whose resolution throws (an invalid URI in `vscode-uri`, for
   example `gantry-media://g.png`) is left out; the other links stay. In
@@ -272,13 +296,12 @@ links and `doComplete2` no completion (the servers answer `[]` and `null`).
   the text, without its quotes, as the HTML service does. A file name that
   `joinPath` rejects is not compared with the document.
 - Path completion position. The completion also gives a URL context when the
-  cursor is next to the value: on `url` (`u|rl("a/b")`), before `url(`, or
-  after the `)`; the context range is then not the value. Upstream completes
-  there too, with the text before the cursor from the value and a range away
-  from the cursor (a cursor at the opening quote or after the closing quote
-  takes the whole value). The branch completes paths only when the context
-  range is the value and the cursor is between the quotes.
-  `path_completion_offsets`.
+  cursor is next to the value: on `url` (`u|rl("a/b")`), before `url(`, or after
+  the `)`; the context range is then not the value. Upstream completes there
+  too, with the text before the cursor from the value and a range away from the
+  cursor (a cursor at the opening quote or after the closing quote takes the
+  whole value). The branch completes paths only when the context range is the
+  value and the cursor is between the quotes. `path_completion_offsets`.
 
 The links sweep skips the calls that upstream rejects and the path completions
 where the branch does not complete or where upstream computes the range on one
@@ -507,8 +530,8 @@ against 1046 MB. The responses are the same as before, except four
 ## JSON colors
 
 Upstream `findDocumentColors` counts each string with a `color` or `color-hex`
-format against the limit, also a string that is not a color, and gives one
-color for limit 0. The branch counts colors: at most `limit`, none for 0. The
-servers never pass 0 (a 0 setting is the default limit), so only a document
-with more strings of a color format than the limit (500 in Zed) can show the
-difference. `tests/colors.rs`.
+format against the limit, also a string that is not a color, and gives one color
+for limit 0. The branch counts colors: at most `limit`, none for 0. The servers
+never pass 0 (a 0 setting is the default limit), so only a document with more
+strings of a color format than the limit (500 in Zed) can show the difference.
+`tests/colors.rs`.

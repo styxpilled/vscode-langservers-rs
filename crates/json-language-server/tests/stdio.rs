@@ -22,9 +22,14 @@ impl Client {
     }
 
     fn start_with_cache(capabilities: Value, options: Value, cache: &str) -> Client {
+        Client::start_with_env(capabilities, options, &[("JSON_SCHEMA_CACHE", cache)])
+    }
+
+    fn start_with_env(capabilities: Value, options: Value, env: &[(&str, &str)]) -> Client {
         let mut child = Command::new(env!("CARGO_BIN_EXE_vscode-json-language-server"))
             .arg("--stdio")
-            .env("JSON_SCHEMA_CACHE", cache)
+            .env("JSON_SCHEMA_CACHE", "")
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -373,6 +378,40 @@ fn pull_diagnostics_without_schema() {
             "End of file expected."
         ]
     );
+    assert_eq!(client.exit(), 0);
+}
+
+#[test]
+fn slow_log() {
+    let mut client =
+        Client::start_with_env(json!({}), json!({}), &[("VSCODE_LANGSERVERS_SLOW_MS", "0")]);
+    let uri = "file:///slow.json";
+    client.open(uri, "json", "[1]");
+    let id = client.send_request(
+        "textDocument/documentSymbol",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    let mut logs = Vec::new();
+    loop {
+        match client.recv() {
+            Message::Response(r) if r.id == id => break,
+            Message::Notification(n) if n.method == "window/logMessage" => {
+                assert_eq!(n.params["type"], 4);
+                let message = n.params["message"].as_str().unwrap();
+                logs.push(message[..message.rfind(": ").unwrap()].to_owned());
+            }
+            _ => {}
+        }
+    }
+    let expected = [
+        "slow: read textDocument/didOpen (148 B)",
+        "slow: textDocument/didOpen file:///slow.json (3 B)",
+        "slow: read textDocument/documentSymbol (117 B)",
+        "slow: textDocument/documentSymbol file:///slow.json (3 B)",
+    ];
+    for line in expected {
+        assert!(logs.iter().any(|l| l == line), "{line} not in {logs:?}");
+    }
     assert_eq!(client.exit(), 0);
 }
 

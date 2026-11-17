@@ -786,6 +786,10 @@ impl Service for Server {
         &mut self.core
     }
 
+    fn document_len(&self, uri: &Uri) -> Option<usize> {
+        self.documents.get(uri).map(|d| d.text.text().len())
+    }
+
     fn dispatch(&mut self, request: Request) {
         self.request(request);
     }
