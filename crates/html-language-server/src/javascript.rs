@@ -3,9 +3,11 @@
 //! TypeScript 5 language service; the results come from tsrs and keep the
 //! shape of upstream (`docs/differences/html-server.md`).
 //!
-//! As upstream, each language has one service with one current file: each
-//! request sets its text to the embedded document. tsrs keeps the parsed
-//! libraries, so a change of the current file parses only that file.
+//! Each language has one service. Upstream has one file, the embedded
+//! document; the branch has one file for each script element and one for the
+//! event handler attributes (`embedded::ScriptFile`), and maps the positions.
+//! A file whose text did not change stays, so tsrs parses and checks only the
+//! changed files.
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -28,6 +30,7 @@ use tsrs_lsproto as lsproto;
 use tsrs_project::{Session, SessionInit, SessionOptions, new_session};
 use tsrs_vfs::{bundled, vfstest};
 
+use crate::embedded::{ScriptFile, View};
 use crate::modes::Settings;
 
 /// `FILE_PROTOCOL`.
@@ -165,9 +168,9 @@ pub struct JavaScriptMode {
     language_id: &'static str,
     session: Arc<Session>,
     ctx: Context,
-    file: lsproto::DocumentUri,
-    /// The text of the current file; `None` before the first request.
-    current: RefCell<Option<String>>,
+    extension: &'static str,
+    /// The texts of the open script files; file `i` is `uri(i)`.
+    files: RefCell<Vec<String>>,
     version: Cell<i32>,
     host_settings: Cell<HostSettings>,
 }
@@ -244,8 +247,8 @@ impl JavaScriptMode {
             language_id,
             session,
             ctx,
-            file: lsproto::DocumentUri(format!("file://{ROOT}/{language_id}.{extension}")),
-            current: RefCell::new(None),
+            extension,
+            files: RefCell::default(),
             version: Cell::new(0),
             host_settings: Cell::new(HostSettings::default()),
         };
@@ -297,59 +300,103 @@ impl JavaScriptMode {
         Ok(())
     }
 
-    /// `host.getLanguageService`: makes `text` the current file.
-    fn service(&self, text: &str) -> Result<Arc<LanguageService>, String> {
-        let mut current = self.current.borrow_mut();
-        if current.as_deref() != Some(text) {
-            let version = self.version.get() + 1;
-            self.version.set(version);
-            if current.is_none() {
-                let kind = if self.language_id == "javascript" {
-                    lsproto::LanguageKind::JAVA_SCRIPT
-                } else {
-                    lsproto::LanguageKind::TYPE_SCRIPT
-                };
-                self.session.did_open_file(
-                    &self.ctx,
-                    self.file.clone(),
-                    version,
-                    text.to_owned(),
-                    kind,
-                );
-            } else {
-                self.session.did_change_file(
-                    &self.ctx,
-                    self.file.clone(),
-                    version,
-                    vec![lsproto::TextDocumentContentChangePartialOrWholeDocument {
-                        whole_document: Some(lsproto::TextDocumentContentChangeWholeDocument {
-                            text: text.to_owned(),
-                        }),
-                        ..Default::default()
-                    }],
-                );
-            }
-            *current = Some(text.to_owned());
-        }
+    fn uri(&self, i: usize) -> lsproto::DocumentUri {
+        lsproto::DocumentUri(format!(
+            "file://{ROOT}/{}-{i}.{}",
+            self.language_id, self.extension
+        ))
+    }
+
+    /// The index of a script file URI.
+    fn file_index(&self, uri: &str) -> Option<usize> {
+        let prefix = format!("file://{ROOT}/{}-", self.language_id);
+        uri.strip_prefix(&prefix)?
+            .strip_suffix(self.extension)?
+            .strip_suffix('.')?
+            .parse()
+            .ok()
+    }
+
+    #[cfg(test)]
+    pub fn version(&self) -> i32 {
+        self.version.get()
+    }
+
+    fn next_version(&self) -> i32 {
+        self.version.set(self.version.get() + 1);
+        self.version.get()
+    }
+
+    fn open(&self, uri: lsproto::DocumentUri, text: &str) {
+        let kind = if self.language_id == "javascript" {
+            lsproto::LanguageKind::JAVA_SCRIPT
+        } else {
+            lsproto::LanguageKind::TYPE_SCRIPT
+        };
+        let version = self.next_version();
         self.session
-            .get_language_service(&self.ctx, &self.file)
+            .did_open_file(&self.ctx, uri, version, text.to_owned(), kind);
+    }
+
+    /// Makes the script files of `docs` the open files. A file whose text did
+    /// not change stays, so tsrs does not parse and check it again.
+    fn sync(&self, docs: ScriptDocs) {
+        let mut open = self.files.borrow_mut();
+        for (i, file) in docs.files.iter().enumerate() {
+            let text = file.document.text();
+            match open.get(i) {
+                Some(current) if current == text => {}
+                Some(_) => {
+                    let version = self.next_version();
+                    self.session.did_change_file(
+                        &self.ctx,
+                        self.uri(i),
+                        version,
+                        vec![lsproto::TextDocumentContentChangePartialOrWholeDocument {
+                            whole_document: Some(lsproto::TextDocumentContentChangeWholeDocument {
+                                text: text.to_owned(),
+                            }),
+                            ..Default::default()
+                        }],
+                    );
+                    open[i] = text.to_owned();
+                }
+                None => {
+                    self.open(self.uri(i), text);
+                    open.push(text.to_owned());
+                }
+            }
+        }
+        while open.len() > docs.files.len() {
+            open.pop();
+            self.session.did_close_file(&self.ctx, self.uri(open.len()));
+        }
+    }
+
+    /// `host.getLanguageService` for script file `i` of `docs`.
+    fn service(&self, docs: ScriptDocs, i: usize) -> Result<Arc<LanguageService>, String> {
+        self.sync(docs);
+        self.session
+            .get_language_service(&self.ctx, &self.uri(i))
             .map_err(error)
     }
 
-    /// `doValidation` for the embedded documents of the module scripts and
-    /// of the other scripts.
+    /// `doValidation` of all script files.
     pub fn validation(
         &self,
-        documents: &[TextDocument],
+        docs: ScriptDocs,
         settings: Settings,
     ) -> Result<Vec<Diagnostic>, String> {
         self.update_host_settings(settings)?;
         let mut result = Vec::new();
-        for js in documents {
-            let service = self.service(js.text())?;
-            let program = service.get_program();
+        if docs.files.is_empty() {
+            return Ok(result);
+        }
+        let service = self.service(docs, 0)?;
+        let program = service.get_program();
+        for (i, js) in docs.files.iter().enumerate() {
             let file = program
-                .get_source_file(&self.file.file_name())
+                .get_source_file(&self.uri(i).file_name())
                 .ok_or("no source file")?;
             let diagnostics = program
                 .get_syntactic_diagnostics(&self.ctx, Some(file))
@@ -362,8 +409,10 @@ impl JavaScriptMode {
                     d,
                     "\n",
                 );
+                let mut range = range_at(&js.document, d.pos().unwrap_or(0), d.end().unwrap_or(0));
+                docs.view(i).range(&mut range);
                 result.push(Diagnostic {
-                    range: range_at(js, d.pos().unwrap_or(0), d.end().unwrap_or(0)),
+                    range,
                     severity: Some(DiagnosticSeverity::ERROR),
                     source: Some(self.language_id.to_owned()),
                     message: String::from_utf8_lossy(&message).into_owned(),
@@ -377,24 +426,32 @@ impl JavaScriptMode {
     /// `doComplete`.
     pub fn complete(
         &self,
-        js: &TextDocument,
+        docs: ScriptDocs,
         uri: &str,
         position: Position,
     ) -> Result<Box<RawValue>, String> {
-        let service = self.service(js.text())?;
+        let mut list = CompletionList {
+            is_incomplete: false,
+            items: Vec::new(),
+        };
+        let Some((i, p)) = docs.locate(position) else {
+            return to_raw_value(&list).map_err(|e| e.to_string());
+        };
+        let service = self.service(docs, i)?;
         let response = service
-            .provide_completion(&self.ctx, &self.file, to_ts(position), None)
+            .provide_completion(&self.ctx, &self.uri(i), to_ts(p), None)
             .map_err(error)?;
         let items = response.list.map(|l| l.items).unwrap_or_default();
-        let offset = js.offset_at(position);
-        let (start, end) = word_at_text(js.text(), offset);
-        let range = range_at(js, start as u32, end as u32);
+        let js = &docs.files[i].document;
+        let (start, end) = word_at_text(js.text(), js.offset_at(p));
+        let mut range = range_at(js, start as u32, end as u32);
+        docs.view(i).range(&mut range);
         let data = ItemData {
             language_id: self.language_id,
             uri,
-            offset,
+            offset: docs.html.offset_at(position),
         };
-        let items: Vec<Item> = items
+        list.items = items
             .iter()
             .filter(|item| {
                 // Upstream does not ask for entries with an insert text.
@@ -418,24 +475,29 @@ impl JavaScriptMode {
                 data: &data,
             })
             .collect();
-        let list = CompletionList {
-            is_incomplete: false,
-            items,
-        };
         to_raw_value(&list).map_err(|e| e.to_string())
     }
 
-    /// `doResolve`.
-    pub fn resolve(&self, js: &TextDocument, mut item: Value) -> Result<Value, String> {
+    /// `doResolve`. The item data has the offset in the HTML document.
+    pub fn resolve(&self, docs: ScriptDocs, mut item: Value) -> Result<Value, String> {
         let (Some(label), Some(offset)) = (
             item.get("label").and_then(Value::as_str),
-            item.pointer("/data/offset").and_then(Value::as_i64),
+            item.pointer("/data/offset").and_then(Value::as_u64),
         ) else {
             return Ok(item);
         };
-        let service = self.service(js.text())?;
+        // An offset outside the scripts (an item of an older version) resolves
+        // in the first file: tsrs finds global names at each position.
+        let offset = offset as usize;
+        let Some((i, offset)) = docs.locate_offset(offset).or_else(|| {
+            let file = docs.files.first()?;
+            Some((0, file.map.to_compact(offset)))
+        }) else {
+            return Ok(item);
+        };
+        let service = self.service(docs, i)?;
         let data = lsproto::CompletionItemData {
-            file_name: self.file.file_name(),
+            file_name: self.uri(i).file_name(),
             position: offset as i32,
             name: label.to_owned(),
             ..Default::default()
@@ -466,38 +528,49 @@ impl JavaScriptMode {
         Ok(item)
     }
 
-    pub fn hover(&self, js: &TextDocument, position: Position) -> Result<Value, String> {
-        let service = self.service(js.text())?;
+    pub fn hover(&self, docs: ScriptDocs, position: Position) -> Result<Value, String> {
+        let Some((i, p)) = docs.locate(position) else {
+            return Ok(Value::Null);
+        };
+        let service = self.service(docs, i)?;
         let params = lsproto::HoverParams {
-            text_document: lsproto::TextDocumentIdentifier {
-                uri: self.file.clone(),
-            },
-            position: to_ts(position),
+            text_document: lsproto::TextDocumentIdentifier { uri: self.uri(i) },
+            position: to_ts(p),
             ..Default::default()
         };
         let hover = service.provide_hover(&self.ctx, &params).map_err(error)?;
-        Ok(hover.hover.map_or(Value::Null, |h| json(&h)))
+        let mut hover = hover.hover.map_or(Value::Null, |h| json(&h));
+        if let Some(range) = hover.get_mut("range") {
+            map_range(docs.view(i), range);
+        }
+        Ok(hover)
     }
 
-    pub fn signature_help(&self, js: &TextDocument, position: Position) -> Result<Value, String> {
-        let service = self.service(js.text())?;
+    pub fn signature_help(&self, docs: ScriptDocs, position: Position) -> Result<Value, String> {
+        let Some((i, p)) = docs.locate(position) else {
+            return Ok(Value::Null);
+        };
+        let service = self.service(docs, i)?;
         let help = service
-            .provide_signature_help(&self.ctx, &self.file, to_ts(position), None)
+            .provide_signature_help(&self.ctx, &self.uri(i), to_ts(p), None)
             .map_err(error)?;
         Ok(json(&help))
     }
 
     pub fn rename(
         &self,
-        js: &TextDocument,
+        docs: ScriptDocs,
         uri: &str,
         position: Position,
         new_name: &str,
     ) -> Result<Value, String> {
-        let service = self.service(js.text())?;
+        let Some((i, p)) = docs.locate(position) else {
+            return Ok(Value::Null);
+        };
+        let service = self.service(docs, i)?;
         let mut params = lsproto::RenameParams::default();
-        params.text_document.uri = self.file.clone();
-        params.position = to_ts(position);
+        params.text_document.uri = self.uri(i);
+        params.position = to_ts(p);
         params.new_name = new_name.to_owned();
         let Ok(edit) = service.provide_rename(&self.ctx, &params, None) else {
             return Ok(Value::Null);
@@ -506,58 +579,77 @@ impl JavaScriptMode {
         let Some(changes) = edit.get("changes").and_then(Value::as_object) else {
             return Ok(Value::Null);
         };
-        let edits: Vec<Value> = changes
-            .values()
-            .flat_map(|e| e.as_array().cloned().unwrap_or_default())
-            .collect();
+        let mut edits = Vec::new();
+        for (file, file_edits) in changes {
+            let Some(j) = self.file_index(file) else {
+                continue;
+            };
+            for mut e in file_edits.as_array().cloned().unwrap_or_default() {
+                map_range(docs.view(j), &mut e["range"]);
+                edits.push(e);
+            }
+        }
         Ok(json!({ "changes": { uri: edits } }))
     }
 
     pub fn document_highlights(
         &self,
-        js: &TextDocument,
+        docs: ScriptDocs,
         position: Position,
     ) -> Result<Value, String> {
-        let service = self.service(js.text())?;
-        let highlights = service
-            .provide_document_highlights(&self.ctx, &self.file, to_ts(position))
+        let Some((i, p)) = docs.locate(position) else {
+            return Ok(json!([]));
+        };
+        let service = self.service(docs, i)?;
+        let files: Vec<_> = (0..docs.files.len()).map(|j| self.uri(j)).collect();
+        let result = service
+            .provide_multi_document_highlights(&self.ctx, &self.uri(i), to_ts(p), &files)
             .map_err(error)?;
-        let mut highlights = json(&highlights);
-        // Upstream has `Write` or `Text`.
-        for h in highlights.as_array_mut().into_iter().flatten() {
-            if h["kind"] != json!(3) {
-                h["kind"] = json!(1);
+        let mut highlights = Vec::new();
+        for file in result.multi_document_highlights.into_iter().flatten() {
+            let Some(j) = self.file_index(&file.uri.0) else {
+                continue;
+            };
+            for h in &file.highlights {
+                let mut h = json(h);
+                map_range(docs.view(j), &mut h["range"]);
+                // Upstream has `Write` or `Text`.
+                if h["kind"] != json!(3) {
+                    h["kind"] = json!(1);
+                }
+                highlights.push(h);
             }
         }
-        Ok(if highlights.is_null() {
-            json!([])
-        } else {
-            highlights
-        })
+        Ok(Value::Array(highlights))
     }
 
-    pub fn document_symbols(&self, js: &TextDocument, uri: &str) -> Result<Vec<Value>, String> {
-        let service = self.service(js.text())?;
-        let symbols = service
-            .provide_document_symbols(&self.ctx, &self.file)
-            .map_err(error)?;
-        let mut symbols = json(&symbols);
+    /// The symbols of all script files.
+    pub fn document_symbols(&self, docs: ScriptDocs, uri: &str) -> Result<Vec<Value>, String> {
         let mut result = Vec::new();
-        for mut s in symbols
-            .as_array_mut()
-            .map(std::mem::take)
-            .unwrap_or_default()
-        {
-            s["location"]["uri"] = json!(uri);
-            result.push(s);
+        for i in 0..docs.files.len() {
+            let service = self.service(docs, i)?;
+            let symbols = service
+                .provide_document_symbols(&self.ctx, &self.uri(i))
+                .map_err(error)?;
+            let mut symbols = json(&symbols);
+            for mut s in symbols
+                .as_array_mut()
+                .map(std::mem::take)
+                .unwrap_or_default()
+            {
+                s["location"]["uri"] = json!(uri);
+                map_range(docs.view(i), &mut s["location"]["range"]);
+                result.push(s);
+            }
         }
         Ok(result)
     }
 
-    fn map_location(&self, uri: &str, mut location: Value) -> Option<Value> {
+    fn map_location(&self, docs: ScriptDocs, uri: &str, mut location: Value) -> Option<Value> {
         let file = location["uri"].as_str()?.to_owned();
-        if file == self.file.0 {
+        if let Some(i) = self.file_index(&file) {
             location["uri"] = json!(uri);
+            map_range(docs.view(i), &mut location["range"]);
         } else {
             let name = file.rsplit('/').next()?;
             library(name)?;
@@ -568,13 +660,16 @@ impl JavaScriptMode {
 
     pub fn definition(
         &self,
-        js: &TextDocument,
+        docs: ScriptDocs,
         uri: &str,
         position: Position,
     ) -> Result<Value, String> {
-        let service = self.service(js.text())?;
+        let Some((i, p)) = docs.locate(position) else {
+            return Ok(Value::Null);
+        };
+        let service = self.service(docs, i)?;
         let definition = service
-            .provide_definition(&self.ctx, &self.file, to_ts(position))
+            .provide_definition(&self.ctx, &self.uri(i), to_ts(p))
             .map_err(error)?;
         let locations = match json(&definition) {
             Value::Null => return Ok(Value::Null),
@@ -584,23 +679,24 @@ impl JavaScriptMode {
         Ok(Value::Array(
             locations
                 .into_iter()
-                .filter_map(|l| self.map_location(uri, l))
+                .filter_map(|l| self.map_location(docs, uri, l))
                 .collect(),
         ))
     }
 
     pub fn references(
         &self,
-        js: &TextDocument,
+        docs: ScriptDocs,
         uri: &str,
         position: Position,
     ) -> Result<Vec<Value>, String> {
-        let service = self.service(js.text())?;
+        let Some((i, p)) = docs.locate(position) else {
+            return Ok(Vec::new());
+        };
+        let service = self.service(docs, i)?;
         let params = lsproto::ReferenceParams {
-            text_document: lsproto::TextDocumentIdentifier {
-                uri: self.file.clone(),
-            },
-            position: to_ts(position),
+            text_document: lsproto::TextDocumentIdentifier { uri: self.uri(i) },
+            position: to_ts(p),
             context: lsproto::ReferenceContext {
                 include_declaration: true,
             },
@@ -614,25 +710,38 @@ impl JavaScriptMode {
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|l| l["uri"] == json!(self.file.0))
-            .map(|l| json!({ "uri": uri, "range": l["range"] }))
+            .filter_map(|l| {
+                let j = self.file_index(l["uri"].as_str()?)?;
+                let mut range = l["range"].clone();
+                map_range(docs.view(j), &mut range);
+                Some(json!({ "uri": uri, "range": range }))
+            })
             .collect())
     }
 
-    pub fn selection_range(&self, js: &TextDocument, position: Position) -> Result<Value, String> {
-        let service = self.service(js.text())?;
+    pub fn selection_range(&self, docs: ScriptDocs, position: Position) -> Result<Value, String> {
+        let Some((i, p)) = docs.locate(position) else {
+            return Ok(Value::Null);
+        };
+        let service = self.service(docs, i)?;
         let mut params = lsproto::SelectionRangeParams::default();
-        params.text_document.uri = self.file.clone();
-        params.positions = vec![to_ts(position)];
+        params.text_document.uri = self.uri(i);
+        params.positions = vec![to_ts(p)];
         let ranges = service
             .provide_selection_ranges(&self.ctx, &params)
             .map_err(error)?;
-        let ranges = json(&ranges);
-        Ok(ranges.get(0).cloned().unwrap_or(Value::Null))
+        let mut range = json(&ranges).get(0).cloned().unwrap_or(Value::Null);
+        let mut current = &mut range;
+        while current.is_object() {
+            map_range(docs.view(i), &mut current["range"]);
+            current = &mut current["parent"];
+        }
+        Ok(range)
     }
 
     /// `format` of the mode: `js` is the embedded document without the
-    /// attribute values.
+    /// attribute values, with the lines and columns of `document`. It is a
+    /// file of its own while it formats.
     pub fn format(
         &self,
         document: &TextDocument,
@@ -641,10 +750,32 @@ impl JavaScriptMode {
         options: &Value,
         settings: Settings,
     ) -> Result<Vec<TextEdit>, String> {
-        let service = self.service(js.text())?;
+        let uri = lsproto::DocumentUri(format!(
+            "file://{ROOT}/{}-format.{}",
+            self.language_id, self.extension
+        ));
+        self.open(uri.clone(), js.text());
+        let result = self.format_file(&uri, document, js, range, options, settings);
+        self.session.did_close_file(&self.ctx, uri);
+        result
+    }
+
+    fn format_file(
+        &self,
+        uri: &lsproto::DocumentUri,
+        document: &TextDocument,
+        js: &TextDocument,
+        range: Range,
+        options: &Value,
+        settings: Settings,
+    ) -> Result<Vec<TextEdit>, String> {
+        let service = self
+            .session
+            .get_language_service(&self.ctx, uri)
+            .map_err(error)?;
         let file = service
             .get_program()
-            .get_source_file(&self.file.file_name())
+            .get_source_file(&uri.file_name())
             .ok_or("no source file")?;
         let format_settings = get(get(settings, "javascript"), "format");
         let tab_size = options.get("tabSize").and_then(Value::as_u64).unwrap_or(0) as u32;
@@ -683,33 +814,37 @@ impl JavaScriptMode {
     }
 
     /// `getFoldingRanges` of the mode.
-    pub fn folding_ranges(&self, js: &TextDocument) -> Result<Vec<FoldingRange>, String> {
-        let service = self.service(js.text())?;
-        let ranges = service
-            .provide_folding_range(&self.ctx, &self.file)
-            .map_err(error)?;
-        let ranges: Vec<FoldingRange> = serde_json::from_value(json(&ranges)).unwrap_or_default();
-        Ok(ranges
-            .into_iter()
-            .filter(|r| r.start_line < r.end_line)
-            .map(|r| {
+    pub fn folding_ranges(&self, docs: ScriptDocs) -> Result<Vec<FoldingRange>, String> {
+        let mut result = Vec::new();
+        for i in 0..docs.files.len() {
+            let service = self.service(docs, i)?;
+            let ranges = service
+                .provide_folding_range(&self.ctx, &self.uri(i))
+                .map_err(error)?;
+            let ranges: Vec<FoldingRange> =
+                serde_json::from_value(json(&ranges)).unwrap_or_default();
+            let js = &docs.files[i].document;
+            let view = docs.view(i);
+            for r in ranges {
                 let start = Position::new(r.start_line, r.start_character.unwrap_or(0));
-                FoldingRange {
-                    kind: folding_kind(&js.text()[js.offset_at(start)..]),
-                    start_line: r.start_line,
-                    end_line: r.end_line,
-                    ..Default::default()
+                let end = view.to_html(Position::new(r.end_line, r.end_character.unwrap_or(0)));
+                let kind = folding_kind(&js.text()[js.offset_at(start)..]);
+                let start = view.to_html(start);
+                if start.line < end.line {
+                    result.push(FoldingRange {
+                        kind,
+                        start_line: start.line,
+                        end_line: end.line,
+                        ..Default::default()
+                    });
                 }
-            })
-            .collect())
+            }
+        }
+        Ok(result)
     }
 
     /// `getSemanticTokens`, in the legend of `semantic_token_legend`.
-    pub fn semantic_tokens(&self, js: &TextDocument) -> Result<Vec<SemanticToken>, String> {
-        let service = self.service(js.text())?;
-        let tokens = service
-            .provide_semantic_tokens(&self.ctx, &self.file)
-            .map_err(error)?;
+    pub fn semantic_tokens(&self, docs: ScriptDocs) -> Result<Vec<SemanticToken>, String> {
         let legend = tsrs_ls::semantic_tokens_legend(
             &lsproto::get_client_capabilities(&self.ctx)
                 .text_document
@@ -730,34 +865,76 @@ impl JavaScriptMode {
                     .map(|i| i as u32)
             })
             .collect();
-        let data = tokens.semantic_tokens.map(|t| t.data).unwrap_or_default();
-        let mut result = Vec::with_capacity(data.len() / 5);
-        let (mut line, mut character) = (0, 0);
-        for t in data.as_chunks::<5>().0 {
-            if t[0] > 0 {
-                line += t[0];
-                character = 0;
-            }
-            character += t[1];
-            let Some(Some(type_index)) = type_map.get(t[3] as usize) else {
-                continue;
-            };
-            let mut modifier_set = 0;
-            for (i, m) in modifier_map.iter().enumerate() {
-                if t[4] & (1 << i) != 0
-                    && let Some(m) = m
-                {
-                    modifier_set |= 1 << m;
+        let mut result = Vec::new();
+        for i in 0..docs.files.len() {
+            let service = self.service(docs, i)?;
+            let tokens = service
+                .provide_semantic_tokens(&self.ctx, &self.uri(i))
+                .map_err(error)?;
+            let data = tokens.semantic_tokens.map(|t| t.data).unwrap_or_default();
+            let (mut line, mut character) = (0, 0);
+            for t in data.as_chunks::<5>().0 {
+                if t[0] > 0 {
+                    line += t[0];
+                    character = 0;
                 }
+                character += t[1];
+                let Some(Some(type_index)) = type_map.get(t[3] as usize) else {
+                    continue;
+                };
+                let mut modifier_set = 0;
+                for (bit, m) in modifier_map.iter().enumerate() {
+                    if t[4] & (1 << bit) != 0
+                        && let Some(m) = m
+                    {
+                        modifier_set |= 1 << m;
+                    }
+                }
+                result.push(SemanticToken {
+                    start: docs.view(i).to_html(Position::new(line, character)),
+                    length: t[2],
+                    type_index: *type_index,
+                    modifier_set,
+                });
             }
-            result.push(SemanticToken {
-                start: Position::new(line, character),
-                length: t[2],
-                type_index: *type_index,
-                modifier_set,
-            });
         }
         Ok(result)
+    }
+}
+
+/// The script files of an HTML document.
+#[derive(Clone, Copy)]
+pub struct ScriptDocs<'a> {
+    pub html: &'a TextDocument,
+    pub files: &'a [ScriptFile],
+}
+
+impl<'a> ScriptDocs<'a> {
+    fn view(self, i: usize) -> View<'a> {
+        View {
+            html: self.html,
+            compact: &self.files[i].document,
+            map: &self.files[i].map,
+        }
+    }
+
+    /// The file of an HTML offset, and the offset in the file.
+    fn locate_offset(self, offset: usize) -> Option<(usize, usize)> {
+        let i = self.files.iter().position(|f| f.map.contains(offset))?;
+        Some((i, self.files[i].map.to_compact(offset)))
+    }
+
+    fn locate(self, position: Position) -> Option<(usize, Position)> {
+        let (i, offset) = self.locate_offset(self.html.offset_at(position))?;
+        Some((i, self.files[i].document.position_at(offset)))
+    }
+}
+
+/// Maps a JSON range of a script file to the HTML document.
+fn map_range(view: View, value: &mut Value) {
+    if let Ok(mut range) = serde_json::from_value::<Range>(value.clone()) {
+        view.range(&mut range);
+        *value = json!(range);
     }
 }
 

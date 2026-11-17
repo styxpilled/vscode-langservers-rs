@@ -51,7 +51,13 @@ impl<'a> Parser<'a> {
 
     pub(crate) fn parse_stylesheet_root(&mut self) -> NodeId {
         let node = self.create(Kind::Stylesheet);
+        self.parse_stylesheet_body(node);
+        self.mark_too_deep(node);
+        self.finish(node)
+    }
 
+    /// The statements up to the end of the source, as children of `node`.
+    pub(crate) fn parse_stylesheet_body(&mut self, node: NodeId) {
         loop {
             let start = self.parse_stylesheet_start();
             if !self.ast.add_child(node, start) {
@@ -101,9 +107,6 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-
-        self.mark_too_deep(node);
-        self.finish(node)
     }
 
     pub(crate) fn parse_stylesheet_start(&mut self) -> Option<NodeId> {

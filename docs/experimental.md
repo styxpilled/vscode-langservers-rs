@@ -427,6 +427,102 @@ The HTML server uses the same helpers for its formatter settings.
   HTML ranges once. `tests::selection_html`. Replay: 6 responses each in
   `html/features.jsonl` and `html/push.jsonl`.
 
+## Embedded documents
+
+Upstream makes each embedded document from the HTML text: the regions of the
+language stay, the other lines become empty, and the line of a region keeps its
+columns as spaces. The script document of a language contains all its regions.
+
+### CSS
+
+Upstream makes the embedded CSS document from the HTML text: CSS regions stay,
+each other character becomes a space (line breaks stay), and a style attribute
+value becomes `__{value}` over the 3 characters before it. The CSS service
+parses this text as one style sheet. An open block or a recovery then passes the
+region end: `b { c</style>` takes the next `<style>` element and the style
+attributes after it as its content, and the errors of these regions are wrong
+(in `broken.html`, `} expected` at the end of the document and `colon expected`
+at an `@import` of the next element).
+
+The branch (`embedded.rs`, `modes.rs`):
+
+- Compact text. The CSS document is the CSS regions one after the other, with a
+  line break between them. An `OffsetMap` gives the HTML offset of each compact
+  offset; requests convert positions in and ranges out. A replacement keeps the
+  length (`&quot;` becomes `"` and 5 spaces, as upstream), so an offset in a
+  region maps one to one. An offset in the `__{` of a style attribute maps to
+  the value start, an offset in a `}` or a line break between regions to the
+  region end.
+- Regions parse alone (`parse_stylesheet_regions` of the CSS parser): the parser
+  stops at each region end, and all statements go into one style sheet. So
+  symbols, variables and `@keyframes` of other regions stay in completion,
+  references and highlights. Errors of an open block are at its region end.
+- Kept parse. A new version of the HTML document keeps the CSS document and
+  style sheet of the last version when the compact CSS text is equal: an edit
+  outside the CSS regions does not parse the CSS again.
+
+Differences in the replays (all in `broken.html`): the diagnostics, symbols,
+completion, highlights, references and hover of its `b { c` and the next style
+element; a selection range of the virtual `__{` rule starts at the value, not
+one character before it; the `Do not use empty rulesets` range of `style=""` is
+empty at the value, not over `="`. `tests.rs`, `mod embedded_css`.
+
+Effect (`gen-embedded-session.mjs`, 134 KB): pull times summed over 3 runs,
+after the 6 edits in the body 24 against 18 ms, after the 9 edits in a script 188
+against 153 ms (the CSS parse stays). Memory does not change.
+
+### Scripts
+
+Upstream has one file in its TypeScript service for each language. Each request
+sets its text to the embedded document of the request's HTML document, so each
+edit anywhere in the HTML document changes the file, and the service parses and
+checks it again. Validation uses one document of the classic scripts and the
+event handler attributes, and one for each module script (`export {};` at the
+end); the other features use one document of all regions, modules too.
+
+The branch (`embedded.rs` `script_files`, `javascript.rs`):
+
+- Script files. One compact file of the classic scripts and the event handler
+  attributes (each attribute with its `;`), then one compact file for each
+  module script, which ends with `export {};`. The files go to tsrs as
+  `/html-server/javascript-<n>.js` (`typescript-<n>.ts`), all open at the same
+  time, so they are one program: a module sees the globals of the classic
+  scripts. Each request finds the file of its position and maps positions in
+  and ranges out (`ScriptDocs`); highlights, references, rename and definition
+  map the ranges of each file. The classic scripts share one file because tsrs,
+  as TypeScript, reports a redeclaration between JavaScript files only with
+  `checkJs` (browsers fail on `let a` in two classic scripts).
+- Kept files. A file whose text did not change stays open as it is, so an edit
+  outside the scripts does not parse or check them again. When the request is
+  for another HTML document, the files change to its files.
+- HTML comments. `<!--x-->` on one line becomes `/*  x */`, the same length;
+  upstream gives `/* x */`, one character shorter, so positions after it on the
+  line move by one.
+- Formatting still uses the upstream embedded document (the formatter reads the
+  columns), as a file of its own while it formats.
+- Completion item data has the HTML offset; a resolve with an offset outside the
+  scripts (an item of an older version) resolves in the first file.
+- Selection ranges (all embedded modes): a parent with the range of its child is
+  removed, and embedded ranges that are not inside the HTML range of the
+  position are dropped (upstream gives the whole document first for a position
+  between statements). Upstream repeats some ranges, for example three times
+  the value of a style attribute.
+
+Differences in the replays (against the CSS change only): diagnostics at the
+end of a script document are at the end of the script region, not at the end of
+the HTML document; selection ranges as above; module scripts do not see each
+other; a completion item at the start of the compact file does not offer the
+identifier under the cursor (`updateModel` in `21634.html`); replayed resolves
+of items with the old `data.offset` resolve in the first file, with tsrs details
+for a position outside a scope (shorter type texts). `tests.rs`
+(`script_files`, `highlights_across_files`, `edit_outside_scripts_keeps_the_files`,
+`resolve_in_second_script`, `selection_in_handler_has_no_repeats`).
+
+Effect (`gen-embedded-session.mjs`, 134 KB, 3 runs): pull times summed after the
+6 edits in the body 18 against 5 ms, after the 5 edits of an attribute name 15
+against 3 ms; after edits in a script the same (the file changes). Memory the
+same.
+
 ## HTML formatter
 
 - Line lengths. Upstream counts the line lengths for wrapping and the attribute

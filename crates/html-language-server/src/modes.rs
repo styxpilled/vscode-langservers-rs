@@ -3,7 +3,8 @@
 //! and `modes/semanticTokens.ts`. Without the `javascript` feature, script
 //! regions have no mode, as with `embeddedLanguages: { javascript: false }`.
 
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
+use std::rc::Rc;
 
 use css_language_server::fs::RequestService;
 use css_language_server::settings::{
@@ -11,7 +12,7 @@ use css_language_server::settings::{
 };
 use css_languageservice::language_facts::CssDataManager;
 use css_languageservice::language_facts::colors::Color;
-use css_languageservice::parser::{Dialect, Stylesheet, parse_stylesheet};
+use css_languageservice::parser::{Dialect, Stylesheet, parse_stylesheet_regions};
 use css_languageservice::services::completion::Completion;
 use css_languageservice::services::links::DocumentLink;
 use css_languageservice::services::navigation::ColorInformation;
@@ -21,8 +22,9 @@ use html_languageservice::services::{
 };
 use html_languageservice::{HtmlDocument, LanguageService};
 use lsp_types::{
-    ColorPresentation, CompletionItem, Diagnostic, DocumentHighlight, DocumentSymbol, FoldingRange,
-    Hover, Location, Position, Range, SelectionRange, SymbolInformation, TextEdit, WorkspaceEdit,
+    ColorPresentation, CompletionItem, CompletionTextEdit, Diagnostic, DocumentHighlight,
+    DocumentSymbol, FoldingRange, Hover, Location, Position, Range, SelectionRange,
+    SymbolInformation, TextEdit, WorkspaceEdit,
 };
 use serde_json::Value;
 #[cfg(feature = "javascript")]
@@ -30,9 +32,11 @@ use serde_json::value::RawValue;
 use text_document::TextDocument;
 
 use crate::context::WorkspaceContext;
-use crate::embedded::{CSS_STYLE_RULE, DocumentRegions};
 #[cfg(feature = "javascript")]
-use crate::javascript::{Script, Scripts};
+use crate::embedded::ScriptFile;
+use crate::embedded::{CSS_STYLE_RULE, DocumentRegions, OffsetMap, View};
+#[cfg(feature = "javascript")]
+use crate::javascript::{Script, ScriptDocs, Scripts};
 use crate::settings::{
     completion_configuration, format_configuration, format_settings, hover_settings,
 };
@@ -71,35 +75,99 @@ impl Completions {
     }
 }
 
+/// The compact embedded CSS document and its style sheet. They depend only on
+/// the text of the CSS regions.
+struct CssModel {
+    document: TextDocument,
+    stylesheet: Stylesheet,
+}
+
+struct Css {
+    model: Rc<CssModel>,
+    map: OffsetMap,
+}
+
+/// The embedded CSS of a document: positions and ranges go through `view`.
+#[derive(Clone, Copy)]
+struct CssView<'a> {
+    view: View<'a>,
+    stylesheet: &'a Stylesheet,
+}
+
+impl CssView<'_> {
+    fn document(&self) -> &TextDocument {
+        self.view.compact
+    }
+
+    fn position(&self, position: Position) -> Position {
+        self.view.to_compact(position)
+    }
+
+    fn range(&self, range: &mut Range) {
+        self.view.range(range);
+    }
+
+    fn selection_range(&self, range: &mut SelectionRange) {
+        self.range(&mut range.range);
+        if let Some(parent) = &mut range.parent {
+            self.selection_range(parent);
+        }
+    }
+
+    fn symbol(&self, symbol: &mut DocumentSymbol) {
+        self.range(&mut symbol.range);
+        self.range(&mut symbol.selection_range);
+        for child in symbol.children.iter_mut().flatten() {
+            self.symbol(child);
+        }
+    }
+}
+
 /// An open document with the models that `LanguageModelCache` keeps.
 pub struct Document {
     pub text: TextDocument,
     html: OnceCell<HtmlDocument>,
     regions: OnceCell<DocumentRegions>,
-    css: OnceCell<(TextDocument, Stylesheet)>,
+    css: OnceCell<Css>,
+    /// The CSS model of the last version, kept when the CSS text did not change.
+    previous_css: Cell<Option<Rc<CssModel>>>,
     #[cfg(feature = "javascript")]
-    scripts: [OnceCell<TextDocument>; 2],
+    scripts: [OnceCell<Vec<ScriptFile>>; 2],
+}
+
+/// The models of a document that its next version can keep.
+#[derive(Default)]
+pub struct Kept {
+    css: Option<Rc<CssModel>>,
 }
 
 impl Document {
     pub fn new(text: TextDocument) -> Self {
+        Document::changed(text, Kept::default())
+    }
+
+    /// The next version of a document, with the models of the last version.
+    pub fn changed(text: TextDocument, kept: Kept) -> Self {
         Document {
             text,
             html: OnceCell::new(),
             regions: OnceCell::new(),
             css: OnceCell::new(),
+            previous_css: Cell::new(kept.css),
             #[cfg(feature = "javascript")]
             scripts: Default::default(),
         }
     }
 
-    /// `jsDocuments`: the embedded document of a script language.
+    /// `jsDocuments`: the script files of a script language.
     #[cfg(feature = "javascript")]
-    fn script(&self, script: Script) -> &TextDocument {
-        self.scripts[script as usize].get_or_init(|| {
-            self.regions()
-                .embedded_document(&self.text, script.id(), false)
-        })
+    fn script(&self, script: Script) -> ScriptDocs<'_> {
+        let files = self.scripts[script as usize]
+            .get_or_init(|| self.regions().script_files(&self.text, script.id()));
+        ScriptDocs {
+            html: &self.text,
+            files,
+        }
     }
 
     pub fn regions(&self) -> &DocumentRegions {
@@ -107,14 +175,56 @@ impl Document {
             .get_or_init(|| DocumentRegions::new(&self.text))
     }
 
-    /// The embedded CSS document and its style sheet.
-    fn css(&self) -> (&TextDocument, &Stylesheet) {
-        let (document, stylesheet) = self.css.get_or_init(|| {
-            let document = self.regions().embedded_document(&self.text, "css", false);
-            let stylesheet = parse_stylesheet(Dialect::Css, document.text());
-            (document, stylesheet)
+    /// The address of the CSS model, to check that a version keeps it.
+    #[cfg(test)]
+    pub fn css_model(&self) -> *const () {
+        Rc::as_ptr(&self.css.get().expect("CSS model").model).cast()
+    }
+
+    /// The text, and the models that the next version can keep.
+    pub fn into_parts(self: Rc<Self>) -> (TextDocument, Kept) {
+        let css = match self.css.get() {
+            Some(css) => Some(css.model.clone()),
+            None => self.previous_css.take(),
+        };
+        let text = match Rc::try_unwrap(self) {
+            Ok(document) => document.text,
+            Err(document) => document.text.clone(),
+        };
+        (text, Kept { css })
+    }
+
+    /// The embedded CSS: the CSS regions one after the other, each parsed
+    /// alone into one style sheet.
+    fn css(&self) -> CssView<'_> {
+        let css = self.css.get_or_init(|| {
+            let (text, map) = self.regions().compact(self.text.text(), "css");
+            let model = match self.previous_css.take() {
+                Some(model) if model.document.text() == text => model,
+                _ => {
+                    let stylesheet = parse_stylesheet_regions(Dialect::Css, &text, &map.regions());
+                    let document = TextDocument::new(
+                        self.text.uri().clone(),
+                        "css",
+                        self.text.version(),
+                        text,
+                    );
+                    Rc::new(CssModel {
+                        document,
+                        stylesheet,
+                    })
+                }
+            };
+            Css { model, map }
         });
-        (document, stylesheet)
+        CssView {
+            view: View {
+                html: &self.text,
+                compact: &css.model.document,
+                map: &css.map,
+            },
+            stylesheet: &css.model.stylesheet,
+        }
     }
 }
 
@@ -177,14 +287,14 @@ impl LanguageModes {
         }
     }
 
-    /// The JavaScript or TypeScript mode, with the embedded document of
+    /// The JavaScript or TypeScript mode, with the script files of
     /// `document`.
     #[cfg(feature = "javascript")]
     fn script<'a>(
         &'a self,
         script: Script,
         document: &'a Document,
-    ) -> (&'a crate::javascript::JavaScriptMode, &'a TextDocument) {
+    ) -> (&'a crate::javascript::JavaScriptMode, ScriptDocs<'a>) {
         let scripts = self.scripts.as_ref().expect("script mode without scripts");
         (scripts.get(script), document.script(script))
     }
@@ -228,13 +338,17 @@ impl LanguageModes {
 
     /// `doValidation` of the CSS mode.
     pub fn css_validation(&self, document: &Document, settings: Settings) -> Vec<Diagnostic> {
-        let (embedded, stylesheet) = document.css();
-        validation::do_validation(
-            embedded,
-            stylesheet,
+        let css = document.css();
+        let mut diagnostics = validation::do_validation(
+            css.document(),
+            css.stylesheet,
             validation_settings(get(settings, "css")).as_ref(),
             &self.css_data,
-        )
+        );
+        for d in &mut diagnostics {
+            css.range(&mut d.range);
+        }
+        diagnostics
     }
 
     /// `doValidation` of a script mode.
@@ -245,11 +359,14 @@ impl LanguageModes {
         document: &Document,
         settings: Settings,
     ) -> Result<Vec<Diagnostic>, String> {
-        let (mode, _) = self.script(script, document);
-        let documents = document
-            .regions()
-            .embedded_documents(&document.text, script.id(), false);
-        mode.validation(&documents, settings)
+        let (mode, docs) = self.script(script, document);
+        mode.validation(docs, settings)
+    }
+
+    /// The number of file changes of a script mode.
+    #[cfg(all(test, feature = "javascript"))]
+    pub fn script_version(&self, script: Script) -> i32 {
+        self.scripts.as_ref().unwrap().get(script).version()
     }
 
     /// `doResolve` of the script modes; other items do not change.
@@ -313,25 +430,41 @@ impl LanguageModes {
                 }
             }
             Mode::Css => {
-                let (embedded, stylesheet) = document.css();
+                let css = document.css();
                 let completion = Completion {
                     dialect: Dialect::Css,
                     data: &self.css_data,
                     markdown: self.css_completion_markdown,
                 };
-                let list = completion.do_complete2(
-                    embedded,
-                    position,
-                    stylesheet,
+                let mut list = completion.do_complete2(
+                    css.document(),
+                    css.position(position),
+                    css.stylesheet,
                     context,
                     Some(&self.request_service),
                     completion_settings(get(get(settings, "css"), "completion")).as_ref(),
                     &mut [],
                 );
+                for item in &mut list.items {
+                    match &mut item.text_edit {
+                        Some(CompletionTextEdit::Edit(edit)) => css.range(&mut edit.range),
+                        Some(CompletionTextEdit::InsertAndReplace(edit)) => {
+                            css.range(&mut edit.insert);
+                            css.range(&mut edit.replace);
+                        }
+                        None => {}
+                    }
+                    for edit in item.additional_text_edits.iter_mut().flatten() {
+                        css.range(&mut edit.range);
+                    }
+                }
                 Completions::List {
                     is_incomplete: list.is_incomplete,
                     items: list.items,
-                    edit_range: list.item_defaults.map(|d| d.edit_range),
+                    edit_range: list.item_defaults.map(|mut d| {
+                        css.range(&mut d.edit_range);
+                        d.edit_range
+                    }),
                 }
             }
             #[cfg(feature = "javascript")]
@@ -363,15 +496,19 @@ impl LanguageModes {
                 hover_settings(get(settings, "html")),
             ),
             Mode::Css => {
-                let (embedded, stylesheet) = document.css();
-                hover::do_hover(
-                    embedded,
-                    position,
-                    stylesheet,
+                let css = document.css();
+                let mut hover = hover::do_hover(
+                    css.document(),
+                    css.position(position),
+                    css.stylesheet,
                     &self.css_data,
                     self.css_hover_markdown,
                     css_hover_settings(get(get(global, "css"), "hover")).as_ref(),
-                )
+                );
+                if let Some(range) = hover.as_mut().and_then(|h| h.range.as_mut()) {
+                    css.range(range);
+                }
+                hover
             }
             #[cfg(feature = "javascript")]
             Mode::Script(script) => {
@@ -394,8 +531,16 @@ impl LanguageModes {
                 self.html_document(document),
             ),
             Mode::Css => {
-                let (embedded, stylesheet) = document.css();
-                navigation::find_document_highlights(embedded, position, stylesheet)
+                let css = document.css();
+                let mut highlights = navigation::find_document_highlights(
+                    css.document(),
+                    css.position(position),
+                    css.stylesheet,
+                );
+                for h in &mut highlights {
+                    css.range(&mut h.range);
+                }
+                highlights
             }
             #[cfg(feature = "javascript")]
             Mode::Script(script) => {
@@ -415,8 +560,15 @@ impl LanguageModes {
     ) -> Result<Option<Value>, String> {
         match mode {
             Mode::Css => {
-                let (embedded, stylesheet) = document.css();
-                let location = navigation::find_definition(embedded, position, stylesheet);
+                let css = document.css();
+                let mut location = navigation::find_definition(
+                    css.document(),
+                    css.position(position),
+                    css.stylesheet,
+                );
+                if let Some(location) = &mut location {
+                    css.range(&mut location.range);
+                }
                 Ok(Some(serde_json::to_value(location).unwrap()))
             }
             #[cfg(feature = "javascript")]
@@ -441,8 +593,16 @@ impl LanguageModes {
     ) -> Result<Vec<Location>, String> {
         match mode {
             Mode::Css => {
-                let (embedded, stylesheet) = document.css();
-                Ok(navigation::find_references(embedded, position, stylesheet))
+                let css = document.css();
+                let mut locations = navigation::find_references(
+                    css.document(),
+                    css.position(position),
+                    css.stylesheet,
+                );
+                for location in &mut locations {
+                    css.range(&mut location.range);
+                }
+                Ok(locations)
             }
             #[cfg(feature = "javascript")]
             Mode::Script(script) => {
@@ -476,10 +636,14 @@ impl LanguageModes {
                 html_navigation::find_document_symbols(&document.text, self.html_document(document))
             }
             Mode::Css => {
-                let (embedded, stylesheet) = document.css();
-                navigation::find_symbol_informations(embedded, stylesheet)
+                let css = document.css();
+                navigation::find_symbol_informations(css.document(), css.stylesheet)
                     .into_iter()
                     .filter(|s| s.name != CSS_STYLE_RULE)
+                    .map(|mut s| {
+                        css.range(&mut s.location.range);
+                        s
+                    })
                     .collect()
             }
             #[cfg(feature = "javascript")]
@@ -502,8 +666,8 @@ impl LanguageModes {
                 self.html_document(document),
             ),
             Mode::Css => {
-                let (embedded, stylesheet) = document.css();
-                navigation::find_document_symbols(embedded, stylesheet)
+                let css = document.css();
+                navigation::find_document_symbols(css.document(), css.stylesheet)
                     .into_iter()
                     .flat_map(|s| {
                         if s.name == CSS_STYLE_RULE {
@@ -511,6 +675,10 @@ impl LanguageModes {
                         } else {
                             vec![s]
                         }
+                    })
+                    .map(|mut s| {
+                        css.symbol(&mut s);
+                        s
                     })
                     .collect()
             }
@@ -539,8 +707,12 @@ impl LanguageModes {
         if mode != Mode::Css {
             return Vec::new();
         }
-        let (embedded, stylesheet) = document.css();
-        navigation::find_document_colors(embedded, stylesheet)
+        let css = document.css();
+        let mut colors = navigation::find_document_colors(css.document(), css.stylesheet);
+        for c in &mut colors {
+            css.range(&mut c.range);
+        }
+        colors
     }
 
     pub fn color_presentations(
@@ -672,7 +844,25 @@ impl LanguageModes {
         document: &Document,
     ) -> Result<Vec<FoldingRange>, String> {
         match mode {
-            Mode::Css => Ok(folding::get_folding_ranges(document.css().0, None)),
+            Mode::Css => {
+                let css = document.css();
+                let line = |line: u32, character: Option<u32>| {
+                    css.view
+                        .to_html(Position::new(line, character.unwrap_or(0)))
+                };
+                Ok(folding::get_folding_ranges(css.document(), None)
+                    .into_iter()
+                    .map(|mut r| {
+                        let start = line(r.start_line, r.start_character);
+                        let end = line(r.end_line, r.end_character);
+                        r.start_line = start.line;
+                        r.end_line = end.line;
+                        r.start_character = r.start_character.map(|_| start.character);
+                        r.end_character = r.end_character.map(|_| end.character);
+                        r
+                    })
+                    .collect())
+            }
             #[cfg(feature = "javascript")]
             Mode::Script(script) => {
                 let (mode, js) = self.script(script, document);
@@ -700,9 +890,15 @@ impl LanguageModes {
                 let mut range = match self.mode_at_position(document, position) {
                     Some(Mode::Html) | None => return Ok(html_range),
                     Some(Mode::Css) => {
-                        let (embedded, stylesheet) = document.css();
-                        selection_range::get_selection_ranges(embedded, &[position], stylesheet)
-                            .swap_remove(0)
+                        let css = document.css();
+                        let mut range = selection_range::get_selection_ranges(
+                            css.document(),
+                            &[css.position(position)],
+                            css.stylesheet,
+                        )
+                        .swap_remove(0);
+                        css.selection_range(&mut range);
+                        range
                     }
                     #[cfg(feature = "javascript")]
                     Some(Mode::Script(script)) => {
@@ -710,6 +906,18 @@ impl LanguageModes {
                         from_json(mode.selection_range(js, position)?)?
                     }
                 };
+                // An embedded range that leaves the HTML range (the root of a
+                // compact document of several regions) is dropped.
+                let inside = |r: Range| {
+                    before_or_same(html_range.range.start, r.start)
+                        && before_or_same(r.end, html_range.range.end)
+                };
+                while !inside(range.range) {
+                    match range.parent.take() {
+                        Some(parent) => range = *parent,
+                        None => return Ok(html_range),
+                    }
+                }
                 let mut top = &mut range;
                 while top
                     .parent
@@ -719,6 +927,7 @@ impl LanguageModes {
                     top = top.parent.as_mut().unwrap();
                 }
                 top.parent = Some(Box::new(html_range));
+                remove_repeated(&mut range);
                 Ok(range)
             })
             .collect()
@@ -996,6 +1205,22 @@ fn from_json<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, String> 
 
 fn before_or_same(a: Position, b: Position) -> bool {
     a.line < b.line || a.line == b.line && a.character <= b.character
+}
+
+/// Removes each parent with the range of its child. The offset map gives a
+/// region bound for each range that ends in text between regions, so ranges
+/// can repeat.
+fn remove_repeated(range: &mut SelectionRange) {
+    let mut current = range;
+    loop {
+        while let Some(parent) = current.parent.take_if(|p| p.range == current.range) {
+            current.parent = parent.parent;
+        }
+        match &mut current.parent {
+            Some(parent) => current = parent,
+            None => return,
+        }
+    }
 }
 
 fn inside_range_but_not_same(r1: Range, r2: Range) -> bool {

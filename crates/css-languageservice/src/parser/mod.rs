@@ -47,6 +47,38 @@ pub fn parse_stylesheet(dialect: Dialect, text: &str) -> Stylesheet {
     }
 }
 
+/// Parses each of `regions`, sorted byte ranges of `text`, alone into one style
+/// sheet: an open block or an error recovery ends at the region end. Not in
+/// upstream, which parses the regions of an HTML document as one text.
+pub fn parse_stylesheet_regions(
+    dialect: Dialect,
+    text: &str,
+    regions: &[std::ops::Range<usize>],
+) -> Stylesheet {
+    let mut parser = Parser::new(dialect, text);
+    let mut root = None;
+    for region in regions {
+        parser.scanner.set_source(&text[..region.end]);
+        parser.scanner.go_back_to(region.start);
+        parser.group_ends = None;
+        let token = parser.scanner.scan();
+        parser.set_token(token);
+        let node = *root.get_or_insert_with(|| parser.create(Kind::Stylesheet));
+        parser.parse_stylesheet_body(node);
+    }
+    let root = match root {
+        Some(node) => {
+            parser.mark_too_deep(node);
+            parser.finish(node)
+        }
+        None => parser.parse_stylesheet_root(),
+    };
+    Stylesheet {
+        ast: parser.ast,
+        root,
+    }
+}
+
 /// `IMark`.
 #[derive(Clone, Copy)]
 pub(crate) struct Mark {

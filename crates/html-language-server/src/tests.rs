@@ -1672,6 +1672,104 @@ constructor Greeter(name: any): Greeter
     }
 
     #[test]
+    fn resolve_in_second_script() {
+        let text = "<p>x</p>
+<script>let a = 1;</script>
+<script>window.|</script>";
+        let (document, position) = at(text);
+        let modes = modes();
+        let context = WorkspaceContext {
+            document_uri: "test://test/test.html",
+            workspace_folders: &[],
+        };
+        let list = modes
+            .complete(JS, &document, position, &context, Some(&json!({})))
+            .unwrap()
+            .into_value();
+        let item = list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["label"] == "location")
+            .unwrap()
+            .clone();
+        assert_eq!(item["data"]["offset"], text.find('|').unwrap());
+        let resolved = modes.resolve(&document, item).unwrap();
+        assert!(
+            resolved["detail"].as_str().unwrap().contains("Location"),
+            "{resolved}"
+        );
+    }
+
+    #[test]
+    fn selection_in_handler_has_no_repeats() {
+        let (document, position) = at("<b onclick=\"|update\"></b>");
+        let ranges = modes().selection_ranges(&document, &[position]).unwrap();
+        let mut chain = Vec::new();
+        let mut current = Some(&ranges[0]);
+        while let Some(r) = current {
+            chain.push(r.range);
+            current = r.parent.as_deref();
+        }
+        assert!(chain.windows(2).all(|w| w[0] != w[1]), "{chain:?}");
+        assert!(chain.len() > 3);
+        // A position between statements: the root of the file of two
+        // regions leaves the script element.
+        let text = "<script>f();
+|
+g();</script><b onclick=\"h()\"></b>";
+        let (document, position) = at(text);
+        let ranges = modes().selection_ranges(&document, &[position]).unwrap();
+        let first = ranges[0].range;
+        let script_end = document
+            .text
+            .position_at(text.find("</script>").unwrap() - 1);
+        assert!(first.end <= script_end, "{first:?}");
+    }
+
+    #[test]
+    fn highlights_across_files() {
+        let text = "<script>var g = 1;</script>\n<script type=\"module\">|g; g;</script>";
+        let (document, position) = at(text);
+        let ranges: Vec<_> = modes()
+            .document_highlights(JS, &document, position)
+            .unwrap()
+            .iter()
+            .map(|h| (h.range.start.line, h.range.start.character))
+            .collect();
+        assert_eq!(ranges, [(0, 12), (1, 22), (1, 25)]);
+    }
+
+    #[test]
+    fn edit_outside_scripts_keeps_the_files() {
+        let modes = modes();
+        let text = "<script>let a = 1;</script><p>x</p><script type=\"module\">a;</script>";
+        let validate = |document: &Document| {
+            modes
+                .script_validation(Script::JavaScript, document, Some(&json!({})))
+                .unwrap();
+            modes.script_version(Script::JavaScript)
+        };
+        let change = |document: std::rc::Rc<Document>, offset: usize| {
+            let position = document.text.position_at(offset);
+            let (text, kept) = document.into_parts();
+            let event = lsp_types::TextDocumentContentChangeEvent {
+                range: Some(Range::new(position, position)),
+                range_length: None,
+                text: "y".to_owned(),
+            };
+            std::rc::Rc::new(Document::changed(text.update(vec![event], 1), kept))
+        };
+        let document = std::rc::Rc::new(document("test://test/test.html", text));
+        let version = validate(&document);
+        let document = change(document, text.find("x</p>").unwrap());
+        assert_eq!(validate(&document), version);
+        let offset = document.text.text().find("a;").unwrap();
+        let document = change(document, offset);
+        assert_eq!(validate(&document), version + 1);
+    }
+
+    #[test]
     fn references_only_in_document() {
         let (document, position) = at("<script>Math.|max(1, 2); Math.max(3, 4);</script>");
         let references = modes().references(JS, &document, position).unwrap();
@@ -1732,5 +1830,124 @@ constructor Greeter(name: any): Greeter
         let line = lib[0]["range"]["start"]["line"].as_u64().unwrap() as usize;
         assert!(content.lines().nth(line).unwrap().contains("PI"));
         assert_eq!(definition("<script>|$;</script>"), json!([]));
+    }
+}
+
+/// Embedded CSS: each region parses alone; positions map to the HTML document.
+mod embedded_css {
+    use lsp_types::Range;
+
+    use super::*;
+    use crate::modes::{Document, Mode};
+
+    fn text_at(document: &Document, range: Range) -> &str {
+        let text = &document.text;
+        &text.text()[text.offset_at(range.start)..text.offset_at(range.end)]
+    }
+
+    #[test]
+    fn regions_parse_alone() {
+        let document = document(
+            "test://test.html",
+            "<style>a { color: red</style>\n<p style=\"colr: red\"></p><style>b { width: 1px }</style>",
+        );
+        let diagnostics = modes().css_validation(&document, None);
+        let actual: Vec<(&str, &str)> = diagnostics
+            .iter()
+            .map(|d| (d.message.as_str(), text_at(&document, d.range)))
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                ("semi-colon expected", ""),
+                ("Unknown property: 'colr'", "colr")
+            ]
+        );
+        assert_eq!(diagnostics[0].range.start, Position::new(0, 21));
+    }
+
+    #[test]
+    fn features_map_ranges() {
+        let modes = modes();
+        let text =
+            "<html>\n<style>\n.a { color: red }\n</style>\n<p style=\"color: blue; col\"></p>";
+        let document = document("test://test.html", text);
+        let at = |needle: &str, delta: usize| {
+            document
+                .text
+                .position_at(text.find(needle).unwrap() + delta)
+        };
+
+        let hover = modes
+            .hover(Mode::Css, &document, at("color: red", 1), None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(text_at(&document, hover.range.unwrap()), "color: red");
+
+        let colors: Vec<&str> = modes
+            .document_colors(Mode::Css, &document)
+            .iter()
+            .map(|c| text_at(&document, c.range))
+            .collect();
+        assert_eq!(colors, ["red", "blue"]);
+
+        let symbols = modes.document_symbols_nested(Mode::Css, &document).unwrap();
+        let symbols: Vec<&str> = symbols
+            .iter()
+            .map(|s| text_at(&document, s.selection_range))
+            .collect();
+        assert_eq!(symbols, [".a"]);
+
+        let highlights = modes
+            .document_highlights(Mode::Css, &document, at(".a", 1))
+            .unwrap();
+        assert_eq!(text_at(&document, highlights[0].range), ".a");
+
+        let context = WorkspaceContext {
+            document_uri: "test://test.html",
+            workspace_folders: &[],
+        };
+        let position = at("col\"", 3);
+        let list = modes
+            .complete(Mode::Css, &document, position, &context, None)
+            .unwrap()
+            .into_value();
+        let item = list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["label"] == "color")
+            .unwrap();
+        let range = item
+            .pointer("/textEdit/range")
+            .or(list.pointer("/itemDefaults/editRange"))
+            .unwrap();
+        let range: Range = serde_json::from_value(range.clone()).unwrap();
+        assert_eq!(text_at(&document, range), "col");
+    }
+
+    #[test]
+    fn edit_outside_styles_keeps_the_parse() {
+        let modes = modes();
+        let text = "<style>a { color: red }</style><p>x</p>";
+        let document = std::rc::Rc::new(document("test://test.html", text));
+        modes.css_validation(&document, None);
+        let model = document.css_model();
+        let change = |document: std::rc::Rc<Document>, offset: usize| {
+            let position = document.text.position_at(offset);
+            let (text, kept) = document.into_parts();
+            let event = lsp_types::TextDocumentContentChangeEvent {
+                range: Some(Range::new(position, position)),
+                range_length: None,
+                text: "y".to_owned(),
+            };
+            std::rc::Rc::new(Document::changed(text.update(vec![event], 1), kept))
+        };
+        let document = change(document, text.find("x").unwrap());
+        modes.css_validation(&document, None);
+        assert_eq!(document.css_model(), model);
+        let document = change(document, text.find("red").unwrap());
+        assert_eq!(modes.css_validation(&document, None).len(), 0);
+        assert_ne!(document.css_model(), model);
     }
 }

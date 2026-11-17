@@ -125,6 +125,9 @@ upstream. On `experimental` it reads at most `MAX_DEPTH` levels
   of the subclasses. `Token` is `Copy` (type, offset, length, `escaped` flag)
   and has no text. `Scanner::text(&token)` gives the source slice, or for a
   token with escapes, scans the token again and collects the text.
+- `parser/mod.rs`: `parse_stylesheet`, and on `experimental`
+  `parse_stylesheet_regions`, which parses each region of a text alone into one
+  style sheet (the embedded CSS of the HTML server).
 - `parser/nodes.rs`: `Ast` arena.
   - `Kind` has one variant for each upstream class. `node_type()` is the fixed
     type of the class, or the stored type for the classes without a `type`
@@ -233,16 +236,20 @@ upstream. On `experimental` it reads at most `MAX_DEPTH` levels
   tsrs (`oxc-project/tsrs`, the Rust port of TypeScript 7). One
   `tsrs_project::Session` for each language (`javascript`, `typescript`),
   created at the first request of that language. The file system is in memory:
-  the bundled TypeScript libraries, without jQuery types. As upstream, each
-  session has one current file (`/html-server/javascript.js` or
-  `typescript.ts`); each request sets its text to the embedded document, and the
-  session parses only that file again. Results come as tsrs `lsproto` values;
+  the bundled TypeScript libraries, without jQuery types. The files of a
+  session are the script files of the last HTML document
+  (`/html-server/javascript-<n>.js`); a file whose text did not change stays.
+  Positions and ranges go through the offset map of each file (`ScriptDocs`).
+  Formatting opens the upstream embedded document as one more file while it
+  formats. Results come as tsrs `lsproto` values;
   `lsproto::json::marshal` makes them `serde_json` values, and the mode changes
   them to the shape of upstream. Diagnostics and formatting use the program and
   `format::format_selection` directly, to get upstream's diagnostic set and
   format settings. tsrs needs Rust 1.99 (`rust-toolchain.toml`).
-- `embedded.rs`: `embeddedSupport.ts`. The embedded documents keep the lines and
-  UTF-16 columns, so positions go between documents unchanged. Module scripts
-  give separate documents for validation.
+- `embedded.rs`: `embeddedSupport.ts`. The embedded CSS document and the script
+  files are compact: the regions one after the other, with an `OffsetMap` to the
+  HTML offsets (`View` converts positions and ranges; `experimental.md`,
+  "Embedded documents"). The upstream embedded document (the HTML lines and
+  UTF-16 columns) stays for script formatting.
 - `settings.rs`: `html.*` settings with the JS semantics of js-beautify.
 - `context.rs`: the HTML `getDocumentContext` (schemes, hierarchical bases).

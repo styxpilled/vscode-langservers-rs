@@ -439,7 +439,8 @@ impl Server {
             .data_manager
             .set_data_providers(true, providers);
         for document in self.documents.values_mut() {
-            *document = Rc::new(Document::new(document.text.clone()));
+            let (text, kept) = document.clone().into_parts();
+            *document = Rc::new(Document::changed(text, kept));
         }
         self.core.invalidate_diagnostics();
     }
@@ -712,14 +713,11 @@ impl Server {
                 let Some(document) = self.documents.remove(&uri) else {
                     return Ok(());
                 };
-                let text = match Rc::try_unwrap(document) {
-                    Ok(document) => document.text,
-                    Err(document) => document.text.clone(),
-                };
+                let (text, kept) = document.into_parts();
                 let single = (p.content_changes.len() == 1).then(|| p.content_changes[0].clone());
                 let text = text.update(p.content_changes, p.text_document.version);
                 self.documents
-                    .insert(uri.clone(), Rc::new(Document::new(text)));
+                    .insert(uri.clone(), Rc::new(Document::changed(text, kept)));
                 self.core.trigger_validation(uri.clone());
                 if self.capabilities.snippet_edit
                     && let Some(change) = single

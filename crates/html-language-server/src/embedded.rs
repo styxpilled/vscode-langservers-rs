@@ -2,7 +2,7 @@
 //! documents keep the lines and the UTF-16 columns of the HTML document.
 
 use html_languageservice::parser::scanner::{Scanner, TokenType};
-use lsp_types::{Position, Range, Uri};
+use lsp_types::{Position, Range};
 use text_document::TextDocument;
 
 pub const CSS_STYLE_RULE: &str = "__";
@@ -212,6 +212,7 @@ impl DocumentRegions {
     }
 
     /// `getEmbeddedDocument`.
+    #[cfg(any(test, feature = "javascript"))]
     pub fn embedded_document(
         &self,
         document: &TextDocument,
@@ -231,49 +232,184 @@ impl DocumentRegions {
             text,
         )
     }
+}
 
-    /// `getEmbeddedDocuments`: without module scripts, one document. Else the
-    /// document of the other regions, then one document for each module.
+/// The text of a region, copied from `html` to `compact`. `start` and `end`
+/// also cover the prefix and the suffix (`__{`, `}`).
+#[derive(Clone, Copy, Debug)]
+struct Segment {
+    html: usize,
+    compact: usize,
+    len: usize,
+    start: usize,
+    end: usize,
+}
+
+/// The offsets of a compact embedded text in the HTML document. Not in
+/// upstream, whose embedded documents are the HTML text with the other regions
+/// as spaces.
+#[derive(Debug, Default)]
+pub struct OffsetMap {
+    segments: Vec<Segment>,
+}
+
+impl OffsetMap {
+    /// Whether a region contains `html`, its end included.
     #[cfg_attr(not(any(test, feature = "javascript")), expect(dead_code))]
-    pub fn embedded_documents(
-        &self,
-        document: &TextDocument,
-        language_id: &str,
-        ignore_attribute_values: bool,
-    ) -> Vec<TextDocument> {
-        let modules = || {
-            self.regions
-                .iter()
-                .filter(|r| r.language_id == Some(language_id) && r.is_module)
-        };
-        if modules().next().is_none() {
-            return vec![self.embedded_document(document, language_id, ignore_attribute_values)];
+    pub fn contains(&self, html: usize) -> bool {
+        let i = self.segments.partition_point(|s| s.html <= html);
+        i.checked_sub(1)
+            .is_some_and(|i| html <= self.segments[i].html + self.segments[i].len)
+    }
+
+    /// The compact ranges of the regions, with prefix and suffix.
+    pub fn regions(&self) -> Vec<std::ops::Range<usize>> {
+        self.segments.iter().map(|s| s.start..s.end).collect()
+    }
+
+    /// An HTML offset outside the regions gives the nearest region bound
+    /// before it.
+    pub fn to_compact(&self, html: usize) -> usize {
+        let i = self.segments.partition_point(|s| s.html <= html);
+        match i.checked_sub(1) {
+            Some(i) => {
+                let s = self.segments[i];
+                s.compact + (html - s.html).min(s.len)
+            }
+            None => self.segments.first().map_or(0, |s| s.compact),
         }
-        let new = |uri: Uri, text| TextDocument::new(uri, language_id, document.version(), text);
-        let old = document.text();
-        let text = embedded_text(
-            old,
-            self.regions.iter().filter(|r| !r.is_module),
-            language_id,
-            ignore_attribute_values,
-        );
-        let mut result = vec![new(document.uri().clone(), text)];
-        for (i, region) in modules().enumerate() {
-            let mut text = embedded_text(
-                old,
-                std::iter::once(region),
-                language_id,
-                ignore_attribute_values,
-            );
-            text.push_str("\nexport {};");
-            let uri = format!("{}.module-{i}", document.uri().as_str());
-            result.push(new(uri.parse().unwrap(), text));
+    }
+
+    /// An offset in a prefix gives the region start; in a suffix or between
+    /// regions, the region end.
+    pub fn to_html(&self, compact: usize) -> usize {
+        let i = self.segments.partition_point(|s| s.start <= compact);
+        match i.checked_sub(1) {
+            Some(i) => {
+                let s = self.segments[i];
+                s.html + compact.saturating_sub(s.compact).min(s.len)
+            }
+            None => self.segments.first().map_or(0, |s| s.html),
         }
-        result
     }
 }
 
+/// Positions between an HTML document and a compact embedded document.
+#[derive(Clone, Copy)]
+pub struct View<'a> {
+    pub html: &'a TextDocument,
+    pub compact: &'a TextDocument,
+    pub map: &'a OffsetMap,
+}
+
+impl View<'_> {
+    pub fn to_compact(self, position: Position) -> Position {
+        let offset = self.map.to_compact(self.html.offset_at(position));
+        self.compact.position_at(offset)
+    }
+
+    pub fn to_html(self, position: Position) -> Position {
+        let offset = self.map.to_html(self.compact.offset_at(position));
+        self.html.position_at(offset)
+    }
+
+    pub fn range(self, range: &mut Range) {
+        *range = Range::new(self.to_html(range.start), self.to_html(range.end));
+    }
+}
+
+/// A script file of the JavaScript mode, with its offsets in the HTML document.
+#[cfg_attr(not(any(test, feature = "javascript")), expect(dead_code))]
+pub struct ScriptFile {
+    pub document: TextDocument,
+    pub map: OffsetMap,
+}
+
+impl DocumentRegions {
+    /// The regions of `language_id` one after the other, with a line break
+    /// between them, and their offsets in `html`.
+    pub fn compact(&self, html: &str, language_id: &str) -> (String, OffsetMap) {
+        compact(
+            html,
+            self.regions
+                .iter()
+                .filter(|c| c.language_id == Some(language_id)),
+        )
+    }
+
+    /// The script files of `language_id`: the classic scripts and the event
+    /// handler attributes, then one file for each module, which ends with
+    /// `export {};`. The classic scripts share one file because tsrs reports
+    /// a redeclaration between JavaScript files only with `checkJs`.
+    #[cfg_attr(not(any(test, feature = "javascript")), expect(dead_code))]
+    pub fn script_files(&self, document: &TextDocument, language_id: &str) -> Vec<ScriptFile> {
+        let html = document.text();
+        let regions = || {
+            self.regions
+                .iter()
+                .filter(move |c| c.language_id == Some(language_id))
+        };
+        let file = |(mut text, map): (String, OffsetMap), module: bool| {
+            if module {
+                text.push_str("\nexport {};");
+            }
+            let document = TextDocument::new(
+                document.uri().clone(),
+                language_id,
+                document.version(),
+                text,
+            );
+            ScriptFile { document, map }
+        };
+        let mut files = Vec::new();
+        if regions().any(|c| !c.is_module) {
+            files.push(file(
+                compact(html, regions().filter(|c| !c.is_module)),
+                false,
+            ));
+        }
+        files.extend(
+            regions()
+                .filter(|c| c.is_module)
+                .map(|c| file(compact(html, std::iter::once(c)), true)),
+        );
+        files
+    }
+}
+
+/// `contents` one after the other, with a line break between them, and their
+/// offsets in `html`.
+fn compact<'a>(html: &str, contents: impl Iterator<Item = &'a Region>) -> (String, OffsetMap) {
+    let mut text = String::new();
+    let mut segments = Vec::new();
+    for c in contents {
+        if !segments.is_empty() {
+            text.push('\n');
+        }
+        let start = text.len();
+        text.push_str(prefix(c));
+        let (from, to) = (c.start.min(c.end), c.start.max(c.end));
+        let compact = text.len();
+        update_content(&mut text, c, &html[from..to]);
+        debug_assert_eq!(
+            text.len() - compact,
+            to - from,
+            "a replacement keeps the length"
+        );
+        text.push_str(suffix(c));
+        segments.push(Segment {
+            html: from,
+            compact,
+            len: to - from,
+            start,
+            end: text.len(),
+        });
+    }
+    (text, OffsetMap { segments })
+}
+
 /// The text of `getEmbeddedDocument` for the regions `contents`.
+#[cfg(any(test, feature = "javascript"))]
 fn embedded_text<'a>(
     old: &str,
     contents: impl Iterator<Item = &'a Region>,
@@ -323,7 +459,8 @@ fn update_content(result: &mut String, c: &Region, content: &str) {
     }
 }
 
-/// `<!--x-->` on one line becomes `/* x */`, one character shorter.
+/// `<!--x-->` on one line becomes `/*  x */`. Upstream gives `/* x */`, one
+/// character shorter.
 fn replace_html_comments(result: &mut String, content: &str) {
     let mut rest = content;
     while let Some(i) = rest.find("<!--") {
@@ -337,7 +474,7 @@ fn replace_html_comments(result: &mut String, content: &str) {
             continue;
         };
         result.push_str(&rest[..i]);
-        result.push_str("/* ");
+        result.push_str("/*  ");
         result.push_str(&body[..end]);
         result.push_str(" */");
         rest = &body[end + 3..];
@@ -374,6 +511,7 @@ fn replace_quote_escapes(result: &mut String, content: &str) {
 
 /// `substituteWithWhitespace`: keeps the line breaks of `old`, other
 /// characters become spaces (one for each UTF-16 code unit).
+#[cfg(any(test, feature = "javascript"))]
 fn substitute_with_whitespace(result: &mut String, old: &str, before: &str, after: &str) {
     result.push_str(before);
     let mut accumulated = -(before.encode_utf16().count() as isize);
@@ -444,15 +582,15 @@ mod tests {
             ),
             (
                 "<script><!--this comment should not give error--></script>",
-                "        /* this comment should not give error */         ",
+                "        /*  this comment should not give error */         ",
             ),
             (
                 "<script><!--this comment should not give error--> console.log(\"logging\");</script>",
-                "        /* this comment should not give error */ console.log(\"logging\");         ",
+                "        /*  this comment should not give error */ console.log(\"logging\");         ",
             ),
             (
                 "<script>var data=100; <!--this comment should not give error--> </script>",
-                "        var data=100; /* this comment should not give error */          ",
+                "        var data=100; /*  this comment should not give error */          ",
             ),
             ("<script>/* --> */</script>", "        /* --> */         "),
             (
@@ -461,11 +599,11 @@ mod tests {
             ),
             (
                 "<script><!--commnet1-->\n<!--conment2--></script>",
-                "        /* commnet1 */\n/* conment2 */         ",
+                "        /*  commnet1 */\n/*  conment2 */         ",
             ),
             (
                 "<script><!--a--> foo(); <!--b--></script>",
-                "        /* a */ foo(); /* b */         ",
+                "        /*  a */ foo(); /*  b */         ",
             ),
             (
                 "<div onKeyUp=\"foo()\" onkeydown=\"bar()\"/>",
@@ -486,19 +624,30 @@ mod tests {
             let embedded = regions.embedded_document(&document, "javascript", false);
             assert_eq!(embedded.text(), expected, "{value}");
         }
-        let document =
-            document("<script>let a = 1;</script><script type=\"module\">let a = 2;</script>");
-        let documents =
-            DocumentRegions::new(&document).embedded_documents(&document, "javascript", false);
-        let texts: Vec<_> = documents.iter().map(|d| d.text()).collect();
+    }
+
+    #[test]
+    fn script_files() {
+        let text = "<script>let a = 1;</script><script type=\"module\">let a = 2;</script>\n<b onclick=\"f()\" onkeyup='g()'>";
+        let document = document(text);
+        let files = DocumentRegions::new(&document).script_files(&document, "javascript");
+        let texts: Vec<_> = files.iter().map(|f| f.document.text()).collect();
+        assert_eq!(texts, ["let a = 1;\nf();\ng();", "let a = 2;\nexport {};"]);
+        let g = texts[0].find('g').unwrap();
+        assert_eq!(files[0].map.to_html(g), text.find("g()").unwrap());
+        assert_eq!(files[0].map.to_compact(text.find("g()").unwrap()), g);
+        // The `;` after a handler and the `export {};` of a module map to the region end.
+        let semicolon = texts[0].find(";\ng").unwrap();
         assert_eq!(
-            texts,
-            [
-                "        let a = 1;                                                  ",
-                "                                                 let a = 2;         \nexport {};"
-            ]
+            files[0].map.to_html(semicolon),
+            text.find("\" onkeyup").unwrap()
         );
-        assert_eq!(documents[1].uri().as_str(), "test://test.html.module-0");
+        assert_eq!(
+            files[1].map.to_html(texts[1].len()),
+            text.find("</script>\n").unwrap()
+        );
+        assert!(files[0].map.contains(text.find("</script>").unwrap()));
+        assert!(!files[0].map.contains(text.find("let a = 2").unwrap()));
     }
 
     #[test]
@@ -519,10 +668,10 @@ mod tests {
     #[test]
     fn html_comments() {
         for (content, expected) in [
-            ("a<!--b-->c<!---->", "a/* b */c/*  */"),
+            ("a<!--b-->c<!---->", "a/*  b */c/*   */"),
             ("<!--a\n-->", "<!--a\n-->"),
-            ("<!--<!--a-->", "/* <!--a */"),
-            ("<!--a\u{2028}--><!--b-->", "<!--a\u{2028}-->/* b */"),
+            ("<!--<!--a-->", "/*  <!--a */"),
+            ("<!--a\u{2028}--><!--b-->", "<!--a\u{2028}-->/*  b */"),
         ] {
             let mut result = String::new();
             replace_html_comments(&mut result, content);

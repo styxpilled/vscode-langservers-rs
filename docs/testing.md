@@ -216,6 +216,10 @@ Sessions are in `.scratch/sessions/` (CSS in `css/`, HTML in `html/`).
     gives snippet edits, and a generated document for CSS folding at the end of
     a style region, a range format that starts in a style region and the hover
     settings.
+  - `scripts/html/gen-embedded-session.mjs <zed session> <out> [sections]`: a
+    page with style and script elements and attributes, and typing in the body,
+    a script and a style, each edit with a pull and a completion. For step
+    times, replay with `VSCODE_LANGSERVERS_SLOW_MS=0`.
 
 `sh scripts/replay-all.sh [session ...]` replays each session to Node and Rust
 and diffs the results. Zed locks `target/release/*.exe`, so the Rust servers
