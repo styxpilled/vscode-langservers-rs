@@ -3,6 +3,7 @@
 //! The server then runs the operation again when the content arrives.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,9 +12,9 @@ use vscode_uri::Uri;
 
 pub type FetchResult = Result<String, SchemaRequestError>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
-    Http,
+    /// With the cached copy that is in use, which the fetch checks.
+    Http(Option<Cached>),
     Client,
 }
 
@@ -30,16 +31,18 @@ pub struct SchemaStore {
     state: Arc<Mutex<State>>,
     http: bool,
     file: bool,
+    cache: Option<PathBuf>,
 }
 
 impl SchemaStore {
     /// `handled_protocols`: the `handledSchemaProtocols` initialization option.
-    pub fn new(handled_protocols: &[String]) -> Self {
+    pub fn new(handled_protocols: &[String], cache: Option<PathBuf>) -> Self {
         let handles = |p: &str| handled_protocols.iter().any(|h| h == p);
         SchemaStore {
             state: Arc::default(),
             http: handles("http") || handles("https"),
             file: handles("file"),
+            cache,
         }
     }
 
@@ -58,9 +61,21 @@ impl SchemaStore {
         if let Some(result) = state.content.get(uri) {
             return result.clone();
         }
+        if http && let Some(cached) = self.cache.as_deref().and_then(|d| read_cache(d, uri)) {
+            let content = cached.content.clone();
+            state.content.insert(uri.to_owned(), Ok(content.clone()));
+            state
+                .to_start
+                .push((uri.to_owned(), Source::Http(Some(cached))));
+            return Ok(content);
+        }
         state.missing.insert(uri.to_owned());
         if state.in_flight.insert(uri.to_owned()) {
-            let source = if http { Source::Http } else { Source::Client };
+            let source = if http {
+                Source::Http(None)
+            } else {
+                Source::Client
+            };
             state.to_start.push((uri.to_owned(), source));
         }
         Err(SchemaRequestError {
@@ -143,9 +158,112 @@ pub fn http_agent(settings: &HttpSettings) -> ureq::Agent {
     config.build().into()
 }
 
+/// The folder of the HTTP schema cache. `JSON_SCHEMA_CACHE` sets it; an empty value turns
+/// the cache off.
+pub fn cache_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("JSON_SCHEMA_CACHE") {
+        return (!dir.is_empty()).then(|| dir.into());
+    }
+    let env = |name| {
+        std::env::var_os(name)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    let base = if cfg!(windows) {
+        env("LOCALAPPDATA")
+    } else if cfg!(target_os = "macos") {
+        env("HOME").map(|h| h.join("Library/Caches"))
+    } else {
+        env("XDG_CACHE_HOME").or_else(|| env("HOME").map(|h| h.join(".cache")))
+    };
+    Some(base?.join("vscode-langservers-rs").join("json-schemas"))
+}
+
+pub struct Cached {
+    pub etag: String,
+    pub content: String,
+}
+
+fn cache_path(dir: &Path, uri: &str) -> PathBuf {
+    // FNV-1a: stable across builds, unlike `DefaultHasher`.
+    let hash = uri.bytes().fold(0xcbf29ce484222325u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x100000001b3)
+    });
+    dir.join(format!("{hash:016x}.json"))
+}
+
+/// A cache file has three lines before the content: the URI, the `ETag` and an empty line.
+pub fn read_cache(dir: &Path, uri: &str) -> Option<Cached> {
+    let text = std::fs::read_to_string(cache_path(dir, uri)).ok()?;
+    let mut parts = text.splitn(4, '\n');
+    if parts.next()? != uri {
+        return None;
+    }
+    let etag = parts.next()?.to_owned();
+    parts.next()?;
+    Some(Cached {
+        etag,
+        content: parts.next()?.to_owned(),
+    })
+}
+
+pub fn write_cache(dir: &Path, uri: &str, cached: &Cached) {
+    if uri.contains('\n') || cached.etag.contains('\n') {
+        return;
+    }
+    let path = cache_path(dir, uri);
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let text = format!("{uri}\n{}\n\n{}", cached.etag, cached.content);
+    let written = std::fs::create_dir_all(dir)
+        .and_then(|()| std::fs::write(&temp, text))
+        .and_then(|()| std::fs::rename(&temp, &path));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp);
+        eprintln!("Unable to cache {uri}: {e}");
+    }
+}
+
+pub enum HttpResult {
+    Fetched(FetchResult),
+    /// A 2xx response with its `ETag`.
+    Ok(String, Option<String>),
+    NotModified,
+}
+
 /// `getHTTPRequestService` of `node/jsonServerMain.ts`, with the `request-light` messages.
-pub fn fetch_http(agent: &ureq::Agent, uri: &str, proxy: bool) -> FetchResult {
-    let mut response = match agent.get(uri).call() {
+/// Sends `If-None-Match` when `etag` is given.
+pub fn fetch_http(agent: &ureq::Agent, uri: &str, proxy: bool, etag: Option<&str>) -> HttpResult {
+    let etag = etag.filter(|e| !e.is_empty());
+    let mut request = agent.get(uri);
+    if let Some(etag) = etag {
+        request = request.header("If-None-Match", etag);
+    }
+    let response = request.call();
+    if let Ok(r) = &response {
+        if r.status().as_u16() == 304 && etag.is_some() {
+            return HttpResult::NotModified;
+        }
+        if r.status().is_success() {
+            let etag = r
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            return match read_response(response, uri, proxy) {
+                Ok(text) => HttpResult::Ok(text, etag),
+                Err(e) => HttpResult::Fetched(Err(e)),
+            };
+        }
+    }
+    HttpResult::Fetched(read_response(response, uri, proxy))
+}
+
+fn read_response(
+    response: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    uri: &str,
+    proxy: bool,
+) -> FetchResult {
+    let mut response = match response {
         Ok(response) => response,
         Err(e) => {
             let message = if proxy {

@@ -353,9 +353,10 @@ impl Context<'_> {
             }
         }
 
-        let is_new_root = schema.is_resource_root() && !self.roots.contains(&schema_id);
+        let resource = schema.resource.unwrap_or(schema_id);
+        let is_new_root = schema.resource.is_some() && !self.roots.contains(&resource);
         if is_new_root {
-            self.roots.push(schema_id);
+            self.roots.push(resource);
         }
         self.stack.push(schema_id);
 

@@ -5,11 +5,11 @@
 //! the compiled upstream tests with a recorder. Request responses that are upstream
 //! fixture files are read from `upstream/vscode-json-languageservice/src/test/fixtures`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use json_languageservice::schema::compile_json;
+use json_languageservice::schema::{Dependency, Items, SchemaId, SchemaRef, Schemas, compile_json};
 use json_languageservice::{
     DocumentLanguageSettings, JsonSchemaService, JsonValidation, ResolvedSchema, SchemaAssociation,
     SchemaConfiguration, SchemaContributions, SchemaDiagnostic, SchemaDraft, SchemaRequestError,
@@ -174,20 +174,85 @@ fn schema_diagnostic(d: &SchemaDiagnostic) -> Value {
     v
 }
 
-fn resolved_json(svc: &JsonSchemaService, r: Option<&ResolvedSchema>, with_schema: bool) -> Value {
-    let Some(r) = r else {
+/// Compiles each schema reachable from `id`, which resolves each `$ref` on the way.
+fn compile_all(schemas: &Schemas, id: SchemaId) {
+    let mut stack = vec![id];
+    let mut seen = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let s = &schemas[id];
+        let mut refs: Vec<SchemaRef> = Vec::new();
+        refs.extend(s.properties.iter().flat_map(|p| p.values().copied()));
+        refs.extend(
+            s.pattern_properties
+                .iter()
+                .flat_map(|p| p.iter().map(|p| p.schema)),
+        );
+        refs.extend(s.dependencies.iter().flat_map(|d| {
+            d.values().filter_map(|d| match d {
+                Dependency::Schema(s) => Some(*s),
+                Dependency::Required(_) => None,
+            })
+        }));
+        refs.extend(s.dependent_schemas.iter().flat_map(|d| d.values().copied()));
+        match &s.items {
+            Some(Items::One(r)) => refs.push(*r),
+            Some(Items::Many(items)) => refs.extend(items),
+            None => {}
+        }
+        for list in [&s.any_of, &s.all_of, &s.one_of, &s.prefix_items] {
+            refs.extend(list.iter().flatten());
+        }
+        refs.extend(
+            [
+                s.additional_properties,
+                s.additional_items,
+                s.not,
+                s.contains,
+                s.property_names,
+                s.if_,
+                s.then,
+                s.else_,
+                s.unevaluated_properties,
+                s.unevaluated_items,
+            ]
+            .into_iter()
+            .flatten(),
+        );
+        stack.extend(refs.into_iter().filter_map(|r| match r {
+            SchemaRef::Schema(id) => Some(id),
+            SchemaRef::Bool(_) => None,
+        }));
+        stack.extend(s.dynamic_ref.iter().map(|d| d.0));
+    }
+}
+
+/// Upstream resolves each `$ref` at load. Here the result has the errors of the `$ref`
+/// that are resolved by a compile of the whole schema. Upstream keeps the merged schema
+/// (`schema`); here there is none, so it is not compared.
+fn resolved_json(
+    svc: &mut JsonSchemaService,
+    get: impl Fn(&mut JsonSchemaService) -> Option<Arc<ResolvedSchema>>,
+) -> Value {
+    let Some(r) = svc.run(|s| {
+        let r = get(s)?;
+        compile_all(&r.schemas, r.root);
+        Some(r)
+    }) else {
         return Value::Null;
     };
-    let mut v = json!({
-        "errors": r.errors.iter().map(schema_diagnostic).collect::<Vec<_>>(),
+    let mut errors = r.errors.clone();
+    if errors.is_empty() {
+        errors.extend(r.schemas.errors());
+    }
+    json!({
+        "errors": errors.iter().map(schema_diagnostic).collect::<Vec<_>>(),
         "warnings": r.warnings.iter().map(schema_diagnostic).collect::<Vec<_>>(),
         "schemaDraft": r.schema_draft.map(|d| d as u32),
         "vocabularies": r.active_vocabularies.as_ref().map(|v| v.iter().map(|(k, b)| json!([k, b])).collect::<Vec<_>>()),
-    });
-    if with_schema {
-        v["schema"] = svc.resolved_schema_json(r, &json!("$circular"));
-    }
-    v
+    })
 }
 
 fn contributions(v: &Value) -> SchemaContributions {
@@ -243,7 +308,10 @@ fn replay(ops: &[Value]) -> Vec<String> {
             diffs.push(format!("#{i} {kind}: upstream threw, not replayed"));
             continue;
         }
-        let expected = op.get("result").cloned().unwrap_or(Value::Null);
+        let mut expected = op.get("result").cloned().unwrap_or(Value::Null);
+        if let Some(result) = expected.as_object_mut() {
+            result.remove("schema");
+        }
         let actual: Value = if kind == "validate" {
             if contains_marker(&op["schema"]) {
                 continue;
@@ -305,8 +373,8 @@ fn replay(ops: &[Value]) -> Vec<String> {
                     Value::Null
                 }
                 "getResolvedSchema" => {
-                    let r = service.get_resolved_schema(op["id"].as_str().unwrap());
-                    resolved_json(service, r.as_deref(), true)
+                    let id = op["id"].as_str().unwrap();
+                    resolved_json(service, |s| s.get_resolved_schema(id))
                 }
                 "getSchemaForResource" => {
                     let doc = match op["doc"]["schema"].as_str() {
@@ -319,9 +387,10 @@ fn replay(ops: &[Value]) -> Vec<String> {
                             TextDocument::new("foo://bar/x.json".parse().unwrap(), "json", 0, text);
                         parse(&t, false)
                     });
-                    let r = service
-                        .get_schema_for_resource(op["resource"].as_str().unwrap(), doc.as_ref());
-                    resolved_json(service, r.as_deref(), true)
+                    let resource = op["resource"].as_str().unwrap();
+                    resolved_json(service, |s| {
+                        s.get_schema_for_resource(resource, doc.as_ref())
+                    })
                 }
                 "onResourceChange" => {
                     Value::Bool(service.on_resource_change(op["uri"].as_str().unwrap()))
@@ -446,6 +515,18 @@ const SKIPPED: &[&str] = &[
     "schema / JSON Schema / $dynamicAnchor on a sub-schema shared by reference is registered once",
 ];
 
+/// Differences of the lazy `$ref` resolution (`docs/experimental.md`, "Schema loading").
+const DIFFERENT: &[&str] = &[
+    // The error names the document of the anchor; upstream names the document that the
+    // target was merged into.
+    "schema / JSON Schema / $anchor in draft-07 schema referenced via $ref from 2019-09 schema should not resolve",
+    // `onResourceChange` reloads only the changed document. The recorded responses are a
+    // queue for each URI, so the replay gives the dependent documents older content.
+    "schema / JSON Schema / resetSchema",
+    // The `$id` is embedded in a document that only an unused `$ref` loads.
+    "schema / JSON Schema / Embedded $id in $defs / external references register embedded schemas before traversal continues",
+];
+
 #[test]
 fn upstream_trace() {
     let trace: Vec<Value> =
@@ -453,6 +534,7 @@ fn upstream_trace() {
     let has_fixtures = fixtures_dir().exists();
     let mut failures = Vec::new();
     let mut skipped = 0;
+    let mut different = 0;
     for test in &trace {
         let ops = test["ops"].as_array().unwrap();
         if !has_fixtures && ops.iter().any(|o| o.get("fixture").is_some()) {
@@ -463,6 +545,10 @@ fn upstream_trace() {
         if SKIPPED.contains(&name) {
             continue;
         }
+        if DIFFERENT.contains(&name) {
+            different += 1;
+            continue;
+        }
         let result = std::panic::catch_unwind(|| replay(ops));
         match result {
             Ok(diffs) if diffs.is_empty() => {}
@@ -470,6 +556,7 @@ fn upstream_trace() {
             Err(_) => failures.push(format!("{name}\n  panic")),
         }
     }
+    eprintln!("skipped {different} tests with a documented difference");
     if skipped > 0 {
         eprintln!(
             "skipped {skipped} tests: {} not found",

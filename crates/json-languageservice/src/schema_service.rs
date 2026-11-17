@@ -1,10 +1,12 @@
 //! Port of `services/jsonSchemaService.ts`.
 //!
-//! Upstream loads schemas with promises. Here the request service is called
-//! synchronously, which gives the same order of operations: each resolution is one
-//! promise chain upstream.
+//! Upstream loads a schema with all the schemas that it references, and resolves `$ref` by
+//! merging the target into the referencing schema. Here each schema document is loaded on
+//! first use and kept as is; `$ref` is resolved when a schema node is compiled
+//! ([`crate::schema::Schemas`]). An operation that meets a `$ref` to a document that is not
+//! loaded runs again after the load ([`JsonSchemaService::run`]).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -13,12 +15,14 @@ use regress::Regex;
 use serde_json::Value;
 
 use crate::glob::create_regex;
-use crate::schema::graph::{AnchorMaps, Graph, Obj, ObjId, Val};
-use crate::schema::{SchemaId, SchemaRef, Schemas, compile};
+use crate::schema::doc::Doc;
+use crate::schema::tree::{Kind, Tree};
+use crate::schema::{ResolveFn, SchemaId, SchemaRef, Schemas};
 use crate::validator::{ApplicableSchema, get_schema_draft_from_id};
 use crate::vocabularies::Vocabularies;
 use crate::{AstKind, ErrorCode, JsonDocument, SchemaDraft};
-use vscode_uri::{Uri, decode_uri_component};
+use vscode_uri::Uri;
+pub(crate) use vscode_uri::decode_uri_component;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SchemaRequestError {
@@ -29,7 +33,7 @@ pub struct SchemaRequestError {
 
 pub type SchemaRequestService = Box<dyn FnMut(&str) -> Result<String, SchemaRequestError> + Send>;
 /// `WorkspaceContextService.resolveRelativePath(relativePath, resource)`.
-pub type ResolveRelativePath = Box<dyn Fn(&str, &str) -> String + Send>;
+pub type ResolveRelativePath = Box<dyn Fn(&str, &str) -> String + Send + Sync>;
 pub type FallbackSchemaProvider = Box<dyn Fn(&str) -> Option<Vec<String>> + Send>;
 
 #[derive(Clone, Debug, Default)]
@@ -60,7 +64,11 @@ pub struct SchemaDiagnostic {
     pub related_information: Option<Vec<DiagnosticRelatedInformation>>,
 }
 
-fn to_diagnostic(message: String, code: ErrorCode, related_url: Option<&str>) -> SchemaDiagnostic {
+pub(crate) fn to_diagnostic(
+    message: String,
+    code: ErrorCode,
+    related_url: Option<&str>,
+) -> SchemaDiagnostic {
     let related_information = related_url.and_then(|url| {
         Some(vec![DiagnosticRelatedInformation {
             location: Location {
@@ -79,13 +87,13 @@ fn to_diagnostic(message: String, code: ErrorCode, related_url: Option<&str>) ->
 
 #[derive(Debug)]
 pub struct ResolvedSchema {
-    pub schemas: Schemas,
+    pub schemas: Arc<Schemas>,
     pub root: SchemaId,
+    /// The errors of the root document. `Schemas::errors` has the `$ref` errors.
     pub errors: Vec<SchemaDiagnostic>,
     pub warnings: Vec<SchemaDiagnostic>,
     pub schema_draft: Option<SchemaDraft>,
     pub active_vocabularies: Option<Vocabularies>,
-    graph_root: Option<ObjId>,
 }
 
 impl ResolvedSchema {
@@ -127,24 +135,6 @@ impl ResolvedSchema {
         Some(schema.as_schema())
     }
 }
-
-#[derive(Clone, Debug)]
-struct Unresolved {
-    schema: ObjId,
-    errors: Vec<SchemaDiagnostic>,
-}
-
-#[derive(Debug)]
-struct Handle {
-    uri: String,
-    dependencies: HashSet<String>,
-    anchors: Option<IndexMap<String, ObjId>>,
-    resolved: Option<Arc<ResolvedSchema>>,
-    unresolved: Option<Unresolved>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct HandleId(usize);
 
 struct FilePatternAssociation {
     globs: Vec<(Arc<Regex>, bool)>,
@@ -245,7 +235,7 @@ fn to_display_string(url: &str) -> String {
 }
 
 /// `/^[A-Za-z][A-Za-z0-9+\-.+]*:\/.*/`
-fn has_scheme(s: &str) -> bool {
+pub(crate) fn has_scheme(s: &str) -> bool {
     let b = s.as_bytes();
     if !b.first().is_some_and(u8::is_ascii_alphabetic) {
         return false;
@@ -271,56 +261,32 @@ fn encode_uri_component(s: &str) -> String {
 }
 
 /// JS `str.split('#', 2)`.
-fn split_ref(r: &str) -> (&str, Option<&str>) {
+pub(crate) fn split_ref(r: &str) -> (&str, Option<&str>) {
     let mut parts = r.split('#');
     let first = parts.next().unwrap_or("");
     (first, parts.next())
 }
 
 pub struct JsonSchemaService {
-    graph: Graph,
-    handles: Vec<Handle>,
-    contribution_schemas: IndexMap<String, HandleId>,
+    /// The loaded documents with their base ids, in the order of the base ids.
+    docs: Vec<(Arc<Doc>, u32)>,
+    next_base: u32,
+    snapshot: Option<Arc<Schemas>>,
+    resolved: HashMap<String, Arc<ResolvedSchema>>,
+    /// Schema content given as JSON: contributions, settings, combined and inline schemas.
+    contents: HashMap<String, Arc<Value>>,
+    contribution_ids: IndexMap<String, ()>,
     contribution_associations: Vec<usize>,
-    schemas_by_id: HashMap<String, HandleId>,
     associations: Vec<FilePatternAssociation>,
     file_pattern_associations: Vec<usize>,
     registered_schema_ids: IndexMap<String, ()>,
     request_service: Option<SchemaRequestService>,
-    resolve_relative_path: Option<ResolveRelativePath>,
+    resolve: Option<Arc<ResolveFn>>,
     fallback_schema_provider: Option<FallbackSchemaProvider>,
     cached_schema_for_resource: Option<(String, Option<Arc<ResolvedSchema>>)>,
     id_counter: u32,
     glob_cache: GlobCache,
 }
-
-/// The state of one `resolveSchemaContent` call.
-struct Resolution {
-    handle: HandleId,
-    errors: Vec<SchemaDiagnostic>,
-    embedded_registered_for: HashSet<String>,
-    embedded_schema_uris: HashSet<String>,
-    draft: Option<SchemaDraft>,
-}
-
-impl Resolution {
-    fn is_pre_201909(&self) -> bool {
-        self.draft.is_some_and(|d| d < SchemaDraft::V2019_09)
-    }
-
-    fn allows_dynamic_ref(&self) -> bool {
-        self.draft.is_none_or(|d| d >= SchemaDraft::V2020_12)
-    }
-}
-
-const IGNORED_REF_SIBLINGS: [&str; 5] = ["$ref", "$schema", "$id", "id", "$comment"];
-const RESERVED_KEYS: [&str; 6] = ["$ref", "$defs", "definitions", "$schema", "$id", "id"];
-const KEEP_ON_WRAPPER_KEYS: [&str; 4] = [
-    "$recursiveAnchor",
-    "$dynamicAnchor",
-    "unevaluatedItems",
-    "unevaluatedProperties",
-];
 
 impl JsonSchemaService {
     pub fn new(
@@ -329,16 +295,18 @@ impl JsonSchemaService {
         fallback_schema_provider: Option<FallbackSchemaProvider>,
     ) -> Self {
         JsonSchemaService {
-            graph: Graph::default(),
-            handles: Vec::new(),
-            contribution_schemas: IndexMap::new(),
+            docs: Vec::new(),
+            next_base: 2,
+            snapshot: None,
+            resolved: HashMap::new(),
+            contents: HashMap::new(),
+            contribution_ids: IndexMap::new(),
             contribution_associations: Vec::new(),
-            schemas_by_id: HashMap::new(),
             associations: Vec::new(),
             file_pattern_associations: Vec::new(),
             registered_schema_ids: IndexMap::new(),
             request_service,
-            resolve_relative_path,
+            resolve: resolve_relative_path.map(Arc::from),
             fallback_schema_provider,
             cached_schema_for_resource: None,
             id_counter: 0,
@@ -357,39 +325,43 @@ impl JsonSchemaService {
             .collect()
     }
 
-    /// `onResourceChange`. Returns whether a loaded schema was cleared.
+    /// The current snapshot of the loaded documents.
+    pub fn schemas(&mut self) -> Arc<Schemas> {
+        self.snapshot
+            .get_or_insert_with(|| Arc::new(Schemas::new(&self.docs, self.resolve.clone())))
+            .clone()
+    }
+
+    fn changed(&mut self) {
+        self.snapshot = None;
+        self.resolved.clear();
+        self.cached_schema_for_resource = None;
+    }
+
+    /// Removes the loaded documents for which `drop` is true. Returns whether one was removed.
+    fn drop_docs(&mut self, drop: impl Fn(&Doc) -> bool) -> bool {
+        let before = self.docs.len();
+        self.docs.retain(|(doc, _)| !drop(doc));
+        let removed = self.docs.len() < before;
+        if removed {
+            self.changed();
+        }
+        removed
+    }
+
+    /// `onResourceChange`. Returns whether a loaded schema was removed. Documents that
+    /// reference it need no change: `$ref` is resolved again in the next snapshot.
     pub fn on_resource_change(&mut self, uri: &str) -> bool {
         self.cached_schema_for_resource = None;
-        let mut has_changes = false;
-        let mut to_walk = vec![normalize_id(uri)];
-        let mut all: Vec<Option<HandleId>> =
-            self.schemas_by_id.values().copied().map(Some).collect();
-        while let Some(curr) = to_walk.pop() {
-            for slot in &mut all {
-                let Some(h) = *slot else {
-                    continue;
-                };
-                let handle = &self.handles[h.0];
-                if handle.uri == curr || handle.dependencies.contains(&curr) {
-                    if handle.uri != curr {
-                        to_walk.push(handle.uri.clone());
-                    }
-                    if self.clear_schema(h) {
-                        has_changes = true;
-                    }
-                    *slot = None;
-                }
-            }
-        }
-        has_changes
+        let uri = normalize_id(uri);
+        self.drop_docs(|doc| doc.uri == uri)
     }
 
     pub fn set_schema_contributions(&mut self, contributions: &SchemaContributions) {
         for (id, schema) in &contributions.schemas {
             let id = normalize_id(id);
-            let content = self.content_from_json(schema);
-            let handle = self.add_schema_handle(&id, Some(content));
-            self.contribution_schemas.insert(id, handle);
+            self.set_content(&id, schema);
+            self.contribution_ids.insert(id, ());
         }
         for association in &contributions.schema_associations {
             let uris = association.uris.iter().map(|u| normalize_id(u)).collect();
@@ -402,34 +374,13 @@ impl JsonSchemaService {
         }
     }
 
-    fn content_from_json(&mut self, schema: &Value) -> ObjId {
-        match self.graph.add_json(schema) {
-            Val::Obj(obj) => obj,
-            _ => self.graph.new_obj(),
+    fn set_content(&mut self, id: &str, schema: &Value) {
+        if self.contents.get(id).is_some_and(|c| **c == *schema) {
+            return;
         }
-    }
-
-    fn add_schema_handle(&mut self, id: &str, content: Option<ObjId>) -> HandleId {
-        let handle = HandleId(self.handles.len());
-        self.handles.push(Handle {
-            uri: id.to_owned(),
-            dependencies: HashSet::new(),
-            anchors: None,
-            resolved: None,
-            unresolved: content.map(|schema| Unresolved {
-                schema,
-                errors: Vec::new(),
-            }),
-        });
-        self.schemas_by_id.insert(id.to_owned(), handle);
-        handle
-    }
-
-    fn get_or_add_schema_handle(&mut self, id: &str) -> HandleId {
-        match self.schemas_by_id.get(id) {
-            Some(&h) => h,
-            None => self.add_schema_handle(id, None),
-        }
+        self.contents
+            .insert(id.to_owned(), Arc::new(schema.clone()));
+        self.drop_docs(|doc| doc.uri == id);
     }
 
     fn add_file_pattern_association(
@@ -460,95 +411,96 @@ impl JsonSchemaService {
                 vec![id.clone()],
             );
         }
-        match &config.schema {
-            Some(schema) => {
-                let content = self.content_from_json(schema);
-                self.add_schema_handle(&id, Some(content));
-            }
-            None => {
-                self.get_or_add_schema_handle(&id);
-            }
+        if let Some(schema) = &config.schema {
+            self.set_content(&id, schema);
         }
     }
 
-    /// Like [`Self::clear_external_schemas`], but also frees the schema graph, which only
-    /// grows. Registers `contributions` again, so loaded contributions are resolved again.
+    /// Removes all schemas and configuration, then registers `contributions`.
     pub fn reset(&mut self, contributions: &SchemaContributions) {
         let glob_cache = std::mem::take(&mut self.glob_cache);
         *self = JsonSchemaService::new(
             self.request_service.take(),
-            self.resolve_relative_path.take(),
+            None,
             self.fallback_schema_provider.take(),
-        );
+        )
+        .with_resolve(self.resolve.take());
         self.glob_cache = glob_cache;
         self.set_schema_contributions(contributions);
         self.clear_external_schemas();
     }
 
+    fn with_resolve(mut self, resolve: Option<Arc<ResolveFn>>) -> Self {
+        self.resolve = resolve;
+        self
+    }
+
     pub fn clear_external_schemas(&mut self) {
-        self.schemas_by_id.clear();
         self.file_pattern_associations.clear();
         self.registered_schema_ids.clear();
-        self.cached_schema_for_resource = None;
-        for (id, &handle) in &self.contribution_schemas {
-            self.schemas_by_id.insert(id.clone(), handle);
+        let contributions = &self.contribution_ids;
+        self.contents.retain(|id, _| contributions.contains_key(id));
+        for id in self.contribution_ids.keys() {
             self.registered_schema_ids.insert(id.clone(), ());
         }
         self.file_pattern_associations
             .extend(self.contribution_associations.iter().copied());
+        let contributions = self.contribution_ids.clone();
+        self.drop_docs(|doc| !contributions.contains_key(&doc.uri));
+        self.changed();
     }
 
     pub fn get_resolved_schema(&mut self, schema_id: &str) -> Option<Arc<ResolvedSchema>> {
         let id = normalize_id(schema_id);
-        let handle = *self.schemas_by_id.get(&id)?;
-        Some(self.resolved(handle))
+        let known = self.registered_schema_ids.contains_key(&id)
+            || self.contents.contains_key(&id)
+            || self.schemas().resource(&id).is_some();
+        known.then(|| self.resolve(&id))
     }
 
-    fn clear_schema(&mut self, h: HandleId) -> bool {
-        let handle = &mut self.handles[h.0];
-        let has_changes = handle.unresolved.is_some();
-        handle.resolved = None;
-        handle.unresolved = None;
-        handle.dependencies.clear();
-        handle.anchors = None;
-        has_changes
-    }
-
-    fn set_schema_content(&mut self, h: HandleId, content: ObjId) {
-        let handle = &mut self.handles[h.0];
-        handle.unresolved = Some(Unresolved {
-            schema: content,
-            errors: Vec::new(),
-        });
-        handle.resolved = None;
-        handle.anchors = None;
-    }
-
-    fn unresolved(&mut self, h: HandleId) -> Unresolved {
-        if let Some(u) = &self.handles[h.0].unresolved {
-            return u.clone();
+    /// Loads the documents that the last operation needed. Returns whether one was loaded.
+    pub fn load_missing(&mut self) -> bool {
+        let Some(snapshot) = self.snapshot.clone() else {
+            return false;
+        };
+        let mut loaded = false;
+        for uri in snapshot.missing() {
+            if snapshot.resource(&uri).is_none() && !self.docs.iter().any(|(d, _)| d.uri == uri) {
+                self.load(&uri);
+                loaded = true;
+            }
         }
-        let uri = self.handles[h.0].uri.clone();
-        let u = self.load_schema(&uri);
-        self.handles[h.0].unresolved = Some(u.clone());
-        u
+        loaded
     }
 
-    fn resolved(&mut self, h: HandleId) -> Arc<ResolvedSchema> {
-        if let Some(r) = &self.handles[h.0].resolved {
-            return r.clone();
+    /// Runs `f`, and again while it needs documents that are not loaded.
+    pub fn run<T>(&mut self, mut f: impl FnMut(&mut Self) -> T) -> T {
+        loop {
+            let result = f(self);
+            if !self.load_missing() {
+                return result;
+            }
         }
-        let unresolved = self.unresolved(h);
-        let resolved = Arc::new(self.resolve_schema_content(unresolved, h));
-        self.handles[h.0].resolved = Some(resolved.clone());
-        resolved
     }
 
-    fn load_schema(&mut self, url: &str) -> Unresolved {
-        let empty = self.graph.new_obj();
-        let fail = |message: String, code: ErrorCode| Unresolved {
-            schema: empty,
-            errors: vec![to_diagnostic(message, code, Some(url))],
+    fn load(&mut self, uri: &str) {
+        let (tree, errors) = match self.contents.get(uri) {
+            Some(value) => (Tree::from_json(value), Vec::new()),
+            None => self.fetch(uri),
+        };
+        let doc = Doc::new(uri.to_owned(), tree, errors, self.resolve.as_deref());
+        let len = doc.tree.len().max(1) as u32;
+        self.docs.push((Arc::new(doc), self.next_base));
+        self.next_base += len;
+        self.changed();
+    }
+
+    fn fetch(&mut self, url: &str) -> (Tree, Vec<SchemaDiagnostic>) {
+        let fail = |message: String, code: ErrorCode| {
+            (
+                Tree::default(),
+                vec![to_diagnostic(message, code, Some(url))],
+            )
         };
         let Some(request) = self.request_service.as_mut() else {
             return fail(
@@ -584,8 +536,7 @@ impl JsonSchemaService {
                     content =
                         content.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
                 }
-                let (value, first_error) = self.graph.parse(content);
-
+                let (tree, first_error) = Tree::parse(content);
                 if let Some(offset) = first_error {
                     let offset = content[..offset.min(content.len())].encode_utf16().count();
                     errors.push(to_diagnostic(
@@ -597,11 +548,7 @@ impl JsonSchemaService {
                         Some(url),
                     ));
                 }
-                let schema = match value {
-                    Some(Val::Obj(obj)) => obj,
-                    _ => empty,
-                };
-                Unresolved { schema, errors }
+                (tree, errors)
             }
             Err(error) => {
                 let mut code = ErrorCode::SCHEMA_RESOLVE_ERROR;
@@ -620,56 +567,29 @@ impl JsonSchemaService {
         }
     }
 
-    fn resolve_path(&self, id: &str, base: &str) -> String {
-        match &self.resolve_relative_path {
-            Some(resolve) if !has_scheme(id) => resolve(id, base),
-            _ => id.to_owned(),
+    /// The resolved schema for a normalized URI. Loads its document if needed.
+    pub fn resolve(&mut self, uri: &str) -> Arc<ResolvedSchema> {
+        if let Some(r) = self.resolved.get(uri) {
+            return r.clone();
         }
-    }
-
-    /// `$id || id || $originalId`.
-    fn schema_id(&self, obj: ObjId) -> Option<Val> {
-        let o = &self.graph[obj];
-        o.get("$id")
-            .filter(|v| v.is_truthy())
-            .or_else(|| o.get("id").filter(|v| v.is_truthy()))
-            .cloned()
-            .or_else(|| {
-                o.original_id
-                    .clone()
-                    .filter(|s| !s.is_empty())
-                    .map(|s| Val::Str(s.into()))
-            })
-    }
-
-    /// The id of a schema if it is a string that starts a new base URI.
-    fn base_id(&self, obj: ObjId) -> Option<String> {
-        match self.schema_id(obj) {
-            Some(Val::Str(id)) if !id.starts_with('#') => Some(id.to_string()),
-            _ => None,
-        }
-    }
-
-    fn has_ref_sibling_keywords(&self, obj: ObjId) -> bool {
-        self.graph[obj]
-            .keys()
-            .any(|k| !IGNORED_REF_SIBLINGS.contains(&k))
-    }
-
-    fn resolve_schema_content(
-        &mut self,
-        unresolved: Unresolved,
-        handle: HandleId,
-    ) -> ResolvedSchema {
-        let schema = unresolved.schema;
-        let draft = self
-            .graph
-            .get(schema, "$schema")
-            .filter(|v| v.is_truthy())
-            .and_then(|v| get_schema_draft_from_id(v.as_str()?));
-        if draft == Some(SchemaDraft::V3) {
-            return ResolvedSchema {
-                schemas: Schemas::default(),
+        let mut set = self.schemas();
+        let (d, n) = match set.resource(uri) {
+            Some(found) => found,
+            None => {
+                self.load(uri);
+                set = self.schemas();
+                set.resource(uri).expect("a loaded document is a resource")
+            }
+        };
+        let doc = set.doc(d);
+        let tree = &doc.tree;
+        let draft = tree
+            .get_truthy(n, "$schema")
+            .and_then(|v| get_schema_draft_from_id(tree.str(v)?))
+            .or(if n == 0 { doc.draft } else { None });
+        let resolved = if draft == Some(SchemaDraft::V3) {
+            ResolvedSchema {
+                schemas: set.clone(),
                 root: SchemaId::TRUE,
                 errors: vec![to_diagnostic(
                     "Draft-03 schemas are not supported.".to_owned(),
@@ -679,724 +599,83 @@ impl JsonSchemaService {
                 warnings: Vec::new(),
                 schema_draft: draft,
                 active_vocabularies: None,
-                graph_root: None,
-            };
-        }
-        let mut res = Resolution {
-            handle,
-            errors: unresolved.errors,
-            embedded_registered_for: HashSet::new(),
-            embedded_schema_uris: HashSet::new(),
-            draft,
+            }
+        } else {
+            let mut errors = doc.load_errors.clone();
+            errors.extend(doc.errors.iter().cloned());
+            let metaschema = tree
+                .get(n, "$schema")
+                .and_then(|v| tree.str(v))
+                .map(|m| (m.to_owned(), doc.base(n, false).to_owned()));
+            let active_vocabularies =
+                metaschema.and_then(|(m, base)| self.resolve_metaschema_vocabularies(&m, &base));
+            // Loads append documents, so `d` stays valid.
+            let set = self.schemas();
+            ResolvedSchema {
+                root: set.node_ref(d, n, false).as_schema(),
+                schemas: set,
+                errors,
+                warnings: Vec::new(),
+                schema_draft: draft,
+                active_vocabularies,
+            }
         };
-
-        let uri = self.handles[handle.0].uri.clone();
-        self.register_embedded_schemas(&mut res, schema, &uri);
-
-        let anchors = self.collect_anchors(&mut res, schema);
-
-        self.handles[handle.0].anchors = Some(anchors);
-        self.collect_dynamic_anchors(&res, schema);
-
-        let active_vocabularies = self.resolve_metaschema_vocabularies(schema, &uri);
-        self.resolve_refs(&mut res, schema, schema, handle);
-
-        let (schemas, root) = compile(&self.graph, schema);
-
-        ResolvedSchema {
-            schemas,
-            root,
-            errors: res.errors,
-            warnings: Vec::new(),
-            schema_draft: draft,
-            active_vocabularies,
-            graph_root: Some(schema),
-        }
-    }
-
-    /// The resolved schema as JSON, as upstream holds it. A cycle becomes `cycle`.
-    /// For tests that compare with upstream.
-    pub fn resolved_schema_json(&self, resolved: &ResolvedSchema, cycle: &Value) -> Value {
-        match resolved.graph_root {
-            Some(root) => self.graph.to_json_marked(&Val::Obj(root), cycle),
-            None => Value::Object(Default::default()),
-        }
+        let resolved = Arc::new(resolved);
+        self.resolved.insert(uri.to_owned(), resolved.clone());
+        resolved
     }
 
     fn resolve_metaschema_vocabularies(
         &mut self,
-        schema: ObjId,
+        metaschema: &str,
         base: &str,
     ) -> Option<Vocabularies> {
-        let metaschema = self.graph.get_str(schema, "$schema")?.to_owned();
-        let uri = normalize_id(&self.resolve_path(&metaschema, base));
-        let handle = self.get_or_add_schema_handle(&uri);
-        let meta = self.unresolved(handle).schema;
-        let meta_draft = self
-            .graph
-            .get(meta, "$schema")
-            .filter(|v| v.is_truthy())
-            .and_then(|v| get_schema_draft_from_id(v.as_str()?));
+        let uri = normalize_id(&match &self.resolve {
+            Some(resolve) if !has_scheme(metaschema) => resolve(metaschema, base),
+            _ => metaschema.to_owned(),
+        });
+        let mut set = self.schemas();
+        if set.resource(&uri).is_none() {
+            self.load(&uri);
+            set = self.schemas();
+        }
+        let (d, n) = set.resource(&uri)?;
+        let tree = &set.doc(d).tree;
+        let meta_draft = tree
+            .get_truthy(n, "$schema")
+            .and_then(|v| get_schema_draft_from_id(tree.str(v)?));
         let is_2019_or_later = meta_draft.is_some_and(|d| d >= SchemaDraft::V2019_09);
-        let vocabulary = self.graph.get(meta, "$vocabulary");
-        let has_vocabulary = matches!(vocabulary, Some(Val::Obj(_) | Val::Arr(_)));
+        let vocabulary = tree.get(n, "$vocabulary");
+        let has_vocabulary =
+            vocabulary.is_some_and(|v| matches!(tree.kind(v), Kind::Obj(..) | Kind::Arr(..)));
         if !has_vocabulary && !is_2019_or_later {
             return None;
         }
-        let vocabs: Vocabularies = match vocabulary {
-            Some(Val::Obj(v)) => self.graph[*v]
-                .iter()
-                .map(|(uri, required)| (uri.to_owned(), matches!(required, Val::Bool(true))))
+        let vocabulary = vocabulary?;
+        let vocabs: Vocabularies = match tree.kind(vocabulary) {
+            Kind::Obj(..) => tree
+                .entries(vocabulary)
+                .map(|(uri, required)| {
+                    (
+                        uri.to_owned(),
+                        matches!(tree.kind(required), Kind::Bool(true)),
+                    )
+                })
                 .collect(),
-            Some(Val::Arr(items)) => items
+            Kind::Arr(..) => tree
+                .items(vocabulary)
                 .iter()
                 .enumerate()
-                .map(|(i, required)| (i.to_string(), matches!(required, Val::Bool(true))))
+                .map(|(i, &required)| {
+                    (
+                        i.to_string(),
+                        matches!(tree.kind(required), Kind::Bool(true)),
+                    )
+                })
                 .collect(),
             _ => return None,
         };
         (!vocabs.is_empty()).then_some(vocabs)
-    }
-
-    fn find_section_and_base(
-        &mut self,
-        root: ObjId,
-        path: &str,
-        base_handle: HandleId,
-    ) -> (Option<Val>, HandleId) {
-        let Some(path) = decode_uri_component(path) else {
-            return (None, base_handle);
-        };
-        let path = path.strip_prefix('/').unwrap_or(&path);
-        let mut current = Val::Obj(root);
-        let mut current_base = base_handle;
-        for part in path.split('/') {
-            let part = part.replace("~1", "/").replace("~0", "~");
-            let next = match &current {
-                Val::Obj(obj) => self.graph[*obj].get(&part).cloned(),
-                Val::Arr(items) => crate::schema::graph::array_index(&part)
-                    .and_then(|i| items.get(i as usize).cloned()),
-                _ => None,
-            };
-            match next {
-                None => return (None, current_base),
-                Some(Val::Null) => return (Some(Val::Null), current_base),
-                Some(v) => current = v,
-            }
-            if let Val::Obj(obj) = current
-                && let Some(id) = self.base_id(obj)
-            {
-                let base_uri = self.handles[current_base.0].uri.clone();
-                let resolved = normalize_id(&self.resolve_path(&id, &base_uri));
-                current_base = self.get_or_add_schema_handle(&resolved);
-            }
-        }
-        (Some(current), current_base)
-    }
-
-    fn find_schema_by_id(
-        &mut self,
-        res: &mut Resolution,
-        root: ObjId,
-        handle: HandleId,
-        id: &str,
-    ) -> Option<ObjId> {
-        if self.handles[handle.0].anchors.is_none() {
-            let anchors = self.collect_anchors(res, root);
-            self.handles[handle.0].anchors = Some(anchors);
-        }
-        self.handles[handle.0].anchors.as_ref()?.get(id).copied()
-    }
-
-    fn union_anchor_maps(&mut self, target: ObjId, src: Option<Box<AnchorMaps>>) {
-        let Some(src) = src else {
-            return;
-        };
-        let maps = self.graph[target].anchor_maps.get_or_insert_default();
-        for (name, node) in src.dynamic {
-            maps.dynamic.entry(name).or_insert(node);
-        }
-    }
-
-    fn merge(&mut self, target: ObjId, section: ObjId) {
-        let target_has_siblings = self.has_ref_sibling_keywords(target);
-        let entries: Vec<(String, Val)> = self.graph[section]
-            .iter()
-            .filter(|(k, _)| *k != "id" && *k != "$id")
-            .map(|(k, v)| (k.to_owned(), v.clone()))
-            .collect();
-        for (key, value) in entries {
-            let deep = matches!(key.as_str(), "properties" | "patternProperties");
-            let value = match (&value, self.graph.get(target, &key)) {
-                (Val::Obj(src), Some(Val::Obj(dst))) if deep => {
-                    let mut merged = self.graph[*dst].spread();
-                    let src_entries: Vec<(String, Val)> = self.graph[*src]
-                        .iter()
-                        .map(|(k, v)| (k.to_owned(), v.clone()))
-                        .collect();
-                    for (k, v) in src_entries {
-                        merged.set(&k, v);
-                    }
-                    Val::Obj(self.graph.add(merged))
-                }
-                _ => value,
-            };
-            self.graph[target].set(&key, value);
-        }
-        if let Some(Val::Str(id)) = self.schema_id(section)
-            && self.schema_id(target).is_none()
-            && !target_has_siblings
-        {
-            self.graph[target].original_id = Some(id.to_string());
-        }
-        let src = &self.graph[section];
-        let (src_info, src_maps) = (src.dynamic_ref_info, src.anchor_maps.clone());
-        if src_info.is_some() && self.graph[target].dynamic_ref_info.is_none() {
-            self.graph[target].dynamic_ref_info = src_info;
-        }
-        self.union_anchor_maps(target, src_maps);
-    }
-
-    fn needs_scope_isolation(
-        &self,
-        res: &Resolution,
-        referenced: ObjId,
-        referencing: ObjId,
-    ) -> bool {
-        let g = &self.graph;
-        let has = |obj: ObjId, k: &str| g.has(obj, k);
-        let has_any = |obj: ObjId, ks: &[&str]| ks.iter().any(|k| g.has(obj, k));
-        let is_array = |obj: ObjId, k: &str| matches!(g.get(obj, k), Some(Val::Arr(_)));
-        const OBJECT_PROPERTY: [&str; 2] = ["properties", "patternProperties"];
-        const OBJECT_EVALUATOR: [&str; 10] = [
-            "properties",
-            "patternProperties",
-            "additionalProperties",
-            "dependentSchemas",
-            "allOf",
-            "anyOf",
-            "oneOf",
-            "if",
-            "then",
-            "else",
-        ];
-        const ARRAY_EVALUATOR: [&str; 9] = [
-            "items",
-            "additionalItems",
-            "prefixItems",
-            "allOf",
-            "anyOf",
-            "oneOf",
-            "if",
-            "then",
-            "else",
-        ];
-        const CONTAINS_BOUND: [&str; 2] = ["minContains", "maxContains"];
-        const BRANCH: [&str; 2] = ["then", "else"];
-        const ARRAY_APPLICATOR: [&str; 3] = ["items", "prefixItems", "additionalItems"];
-        let uses_2020_12 = res.draft.is_none_or(|d| d >= SchemaDraft::V2020_12);
-
-        (has(referenced, "additionalProperties") && has_any(referencing, &OBJECT_PROPERTY))
-            || (has(referenced, "additionalItems") && is_array(referencing, "items"))
-            || (has(referenced, "unevaluatedProperties") && has_any(referencing, &OBJECT_EVALUATOR))
-            || (has(referenced, "unevaluatedItems")
-                && (has_any(referencing, &ARRAY_EVALUATOR)
-                    || (uses_2020_12 && has(referencing, "contains"))))
-            || (has(referencing, "unevaluatedItems") && has_any(referenced, &ARRAY_APPLICATOR))
-            || (has(referenced, "contains") && has_any(referencing, &CONTAINS_BOUND))
-            || (is_array(referenced, "items") && is_array(referencing, "items"))
-            || (has_any(referenced, &CONTAINS_BOUND) && has(referencing, "contains"))
-            || (has(referenced, "if") && has_any(referencing, &BRANCH))
-            || (has_any(referenced, &BRANCH) && has(referencing, "if"))
-            || (uses_2020_12 && has(referenced, "items") && has(referencing, "prefixItems"))
-    }
-
-    fn merge_ref(
-        &mut self,
-        res: &mut Resolution,
-        target: ObjId,
-        source_root: ObjId,
-        source_handle: HandleId,
-        ref_segment: Option<&str>,
-        isolate_external_resource: bool,
-    ) {
-        let mut section_base = source_handle;
-        let section = match ref_segment {
-            None | Some("") => Some(Val::Obj(source_root)),
-            Some(seg) if seg.starts_with('/') => {
-                let (section, base) = self.find_section_and_base(source_root, seg, source_handle);
-                section_base = base;
-                section
-            }
-            Some(seg) => self
-                .find_schema_by_id(res, source_root, source_handle, seg)
-                .map(Val::Obj),
-        };
-        let section = match section {
-            Some(Val::Bool(b)) => {
-                let mut obj = Obj::default();
-                if !b {
-                    let empty = self.graph.new_obj();
-                    obj.set("not", Val::Obj(empty));
-                }
-                Some(Val::Obj(self.graph.add(obj)))
-            }
-            s => s,
-        };
-        let mut section = match section {
-            Some(Val::Obj(obj)) => obj,
-            Some(v) if v.is_truthy() => return,
-            _ => {
-                let message = format!(
-                    "$ref '{}' in '{}' can not be resolved.",
-                    ref_segment.unwrap_or(""),
-                    self.handles[source_handle.0].uri
-                );
-                res.errors.push(to_diagnostic(
-                    message,
-                    ErrorCode::SCHEMA_RESOLVE_ERROR,
-                    None,
-                ));
-                return;
-            }
-        };
-
-        if let Some(inner_ref) = self
-            .graph
-            .get(section, "$ref")
-            .filter(|v| v.is_truthy())
-            .cloned()
-            && (section_base != source_handle || self.has_ref_sibling_keywords(target))
-            && let Some(inner_ref) = inner_ref.as_str()
-        {
-            let (path, fragment) = split_ref(inner_ref);
-            if !path.is_empty() && self.resolve_relative_path.is_some() && !has_scheme(path) {
-                let base = self.handles[section_base.0].uri.clone();
-                let mut new_ref = self.resolve_path(path, &base);
-                if let Some(fragment) = fragment {
-                    new_ref.push('#');
-                    new_ref.push_str(fragment);
-                }
-                let mut copy = self.graph[section].spread();
-                copy.set("$ref", Val::Str(new_ref.into()));
-                section = self.graph.add(copy);
-            }
-        }
-
-        if res.is_pre_201909() {
-            let keys: Vec<String> = self.graph[target]
-                .keys()
-                .filter(|k| !RESERVED_KEYS.contains(k))
-                .map(str::to_owned)
-                .collect();
-            for key in keys {
-                self.graph[target].remove(&key);
-            }
-            self.merge(target, section);
-        } else if isolate_external_resource || self.needs_scope_isolation(res, section, target) {
-            let mut sibling = Obj::default();
-            let mut ref_schema = self.graph[section].spread();
-            if isolate_external_resource {
-                let mut resource_uri = self.handles[section_base.0].uri.clone();
-                let section_id = self
-                    .graph
-                    .get(section, "$id")
-                    .filter(|v| v.is_truthy())
-                    .or_else(|| self.graph.get(section, "id"));
-                if let Some(Val::Str(id)) = section_id
-                    && !id.starts_with('#')
-                {
-                    resource_uri = self.resolve_path(id, &resource_uri);
-                }
-                ref_schema.remove("$id");
-                ref_schema.remove("id");
-                ref_schema.original_id = Some(normalize_id(&resource_uri));
-            }
-            let keys: Vec<String> = self.graph[target]
-                .keys()
-                .filter(|k| !RESERVED_KEYS.contains(k) && !KEEP_ON_WRAPPER_KEYS.contains(k))
-                .map(str::to_owned)
-                .collect();
-            for key in keys {
-                if let Some(v) = self.graph[target].remove(&key) {
-                    sibling.set(&key, v);
-                }
-            }
-            let ref_schema = self.graph.add(ref_schema);
-            let sibling = self.graph.add(sibling);
-            self.graph[target].set(
-                "allOf",
-                Val::Arr(Arc::new(vec![Val::Obj(ref_schema), Val::Obj(sibling)])),
-            );
-        } else {
-            self.merge(target, section);
-        }
-    }
-
-    fn get_external_schema_handle(&mut self, uri: &str, parent: HandleId) -> HandleId {
-        let parent_uri = self.handles[parent.0].uri.clone();
-        let uri = normalize_id(&self.resolve_path(uri, &parent_uri));
-        self.get_or_add_schema_handle(&uri)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn resolve_external_link(
-        &mut self,
-        res: &mut Resolution,
-        node: ObjId,
-        uri: &str,
-        ref_segment: Option<&str>,
-        parent: HandleId,
-        continuation: Option<(ObjId, HandleId)>,
-        followed: &mut HashSet<String>,
-    ) {
-        let referenced = self.get_external_schema_handle(uri, parent);
-        let uri = self.handles[referenced.0].uri.clone();
-        let unresolved = self.unresolved(referenced);
-        self.handles[parent.0].dependencies.insert(uri.clone());
-        // Upstream records only the parent, which is the handle of the nearest `$id`. Then
-        // `on_resource_change(uri)` does not clear a root schema that has an `$id`.
-        self.handles[res.handle.0].dependencies.insert(uri.clone());
-        let already_followed = !followed.insert(uri.clone());
-        if !already_followed && ref_segment.is_some() {
-            let root = &self.graph[unresolved.schema];
-            if let Some(root_ref) = self.graph.get_str(unresolved.schema, "$ref")
-                && root.keys().all(|k| k == "$ref")
-            {
-                let (path, fragment) = split_ref(root_ref);
-                if !path.is_empty() && fragment.is_none() {
-                    let path = path.to_owned();
-                    return self.resolve_external_link(
-                        res,
-                        node,
-                        &path,
-                        ref_segment,
-                        referenced,
-                        continuation,
-                        followed,
-                    );
-                }
-            }
-        }
-        if let Some(error) = unresolved.errors.first() {
-            let message = match ref_segment.filter(|s| !s.is_empty()) {
-                Some(seg) => format!("Problems loading reference '{seg}': {}", error.message),
-                None => error.message.clone(),
-            };
-            res.errors
-                .push(to_diagnostic(message, error.code, Some(&uri)));
-        }
-        if res.embedded_registered_for.insert(uri.clone()) {
-            self.register_embedded_schemas(res, unresolved.schema, &uri);
-        }
-        if self.graph[unresolved.schema].anchor_maps.is_none() {
-            self.collect_dynamic_anchors(res, unresolved.schema);
-        }
-        let isolate = continuation.is_some() && !res.embedded_schema_uris.contains(&uri);
-        self.merge_ref(
-            res,
-            node,
-            unresolved.schema,
-            referenced,
-            ref_segment,
-            isolate,
-        );
-        let maps = self.graph[unresolved.schema].anchor_maps.clone();
-        self.union_anchor_maps(node, maps);
-        let (base, base_handle) = continuation.unwrap_or((unresolved.schema, referenced));
-        self.resolve_refs(res, node, base, base_handle);
-    }
-
-    fn resolve_dynamic_ref(
-        &mut self,
-        res: &mut Resolution,
-        schema: ObjId,
-        new_base: ObjId,
-        new_base_handle: HandleId,
-        current_base_handle: HandleId,
-    ) {
-        let info = self.graph.info_of(schema);
-        let Some(Val::Str(r)) = self.graph[schema].remove("$dynamicRef") else {
-            return;
-        };
-        let (path, fragment) = split_ref(&r);
-        let name = fragment.filter(|f| !f.is_empty() && !f.starts_with('/'));
-        if let Some(name) = name {
-            self.graph.info_mut(info).name = Some(name.to_owned());
-        }
-        if !path.is_empty() {
-            let target = self.graph.new_obj();
-            self.graph.info_mut(info).target = Some(target);
-            let ref_base = if new_base == schema {
-                current_base_handle
-            } else {
-                new_base_handle
-            };
-            self.resolve_external_link(
-                res,
-                target,
-                path,
-                fragment,
-                ref_base,
-                None,
-                &mut HashSet::new(),
-            );
-            return;
-        }
-        let mut target = None;
-        if let Some(name) = name
-            && let Some(scope) = self.graph.info(info).scope
-        {
-            target = self.graph[scope]
-                .anchor_maps
-                .as_ref()
-                .and_then(|m| m.local.get(name).copied());
-        }
-        let target = match target {
-            Some(t) => t,
-            None => {
-                let container = self.graph.new_obj();
-                self.merge_ref(res, container, new_base, new_base_handle, fragment, false);
-                container
-            }
-        };
-        self.graph.info_mut(info).target = Some(target);
-    }
-
-    fn resolve_refs(
-        &mut self,
-        res: &mut Resolution,
-        node: ObjId,
-        parent_schema: ObjId,
-        parent_handle: HandleId,
-    ) {
-        self.traverse_with_base_tracking(
-            res,
-            node,
-            parent_schema,
-            parent_handle,
-            &mut HashSet::new(),
-        );
-    }
-
-    fn traverse_with_base_tracking(
-        &mut self,
-        res: &mut Resolution,
-        schema: ObjId,
-        current_base: ObjId,
-        current_base_handle: HandleId,
-        seen: &mut HashSet<ObjId>,
-    ) {
-        if !seen.insert(schema) {
-            return;
-        }
-        let mut new_base = current_base;
-        let mut new_base_handle = current_base_handle;
-        if let Some(id) = self.base_id(schema) {
-            let base_uri = self.handles[current_base_handle.0].uri.clone();
-            let resolved = normalize_id(&self.resolve_path(&id, &base_uri));
-            new_base = schema;
-            new_base_handle = self.get_or_add_schema_handle(&resolved);
-        }
-
-        let mut seen_refs = HashSet::new();
-        while let Some(r) = self
-            .graph
-            .get(schema, "$ref")
-            .filter(|v| v.is_truthy())
-            .cloned()
-        {
-            let is_pre = res.is_pre_201909();
-            let has_siblings = !is_pre && self.has_ref_sibling_keywords(schema);
-            let preserves_own_base = has_siblings && (new_base == schema || res.draft.is_some());
-            self.graph[schema].remove("$ref");
-            let Val::Str(r) = r else {
-                continue;
-            };
-            let (path, fragment) = split_ref(&r);
-            if !path.is_empty() {
-                let ref_base = if is_pre && new_base == schema {
-                    current_base_handle
-                } else {
-                    new_base_handle
-                };
-                let continuation_handle = if new_base == schema {
-                    current_base_handle
-                } else {
-                    new_base_handle
-                };
-                let continuation = preserves_own_base.then_some((new_base, continuation_handle));
-                self.resolve_external_link(
-                    res,
-                    schema,
-                    path,
-                    fragment,
-                    ref_base,
-                    continuation,
-                    &mut HashSet::new(),
-                );
-                return;
-            } else if seen_refs.insert(r.to_string()) {
-                self.merge_ref(res, schema, new_base, new_base_handle, fragment, false);
-            }
-        }
-
-        if self
-            .graph
-            .get(schema, "$dynamicRef")
-            .is_some_and(Val::is_truthy)
-            && res.allows_dynamic_ref()
-        {
-            self.resolve_dynamic_ref(res, schema, new_base, new_base_handle, current_base_handle);
-        }
-        for child in self.graph.schema_children(schema) {
-            self.traverse_with_base_tracking(res, child, new_base, new_base_handle, seen);
-        }
-    }
-
-    fn collect_anchors(&mut self, res: &mut Resolution, root: ObjId) -> IndexMap<String, ObjId> {
-        let draft = match self.graph.get(root, "$schema").filter(|v| v.is_truthy()) {
-            Some(v) => v.as_str().and_then(get_schema_draft_from_id),
-            None => res.draft,
-        };
-        let mut result = IndexMap::new();
-        let mut seen = HashSet::new();
-        let mut stack = vec![(root, true)];
-        // Depth-first in the same order as the recursive upstream traversal.
-        while let Some((node, is_root)) = stack.pop() {
-            if !seen.insert(node) {
-                continue;
-            }
-            let id = self.schema_id(node);
-            let id = id.as_ref().and_then(Val::as_str);
-            if !is_root && id.is_some_and(|id| !id.starts_with('#')) {
-                continue;
-            }
-            let o = &self.graph[node];
-            let fragment_anchor = if draft.is_none_or(|d| d < SchemaDraft::V2019_09) {
-                id.and_then(|id| id.strip_prefix('#'))
-            } else {
-                None
-            };
-            let dollar_anchor = if draft.is_none_or(|d| d >= SchemaDraft::V2019_09) {
-                o.get("$anchor")
-            } else {
-                None
-            };
-            let dynamic_anchor = if draft.is_none_or(|d| d >= SchemaDraft::V2020_12) {
-                o.get("$dynamicAnchor")
-            } else {
-                None
-            };
-            let first = match fragment_anchor {
-                Some(f) => Some(f.to_owned()),
-                None => dollar_anchor
-                    .filter(|v| v.is_truthy())
-                    .and_then(|v| Some(v.as_str()?.to_owned())),
-            };
-            let second = dynamic_anchor
-                .filter(|v| v.is_truthy())
-                .and_then(|v| Some(v.as_str()?.to_owned()));
-            for anchor in [first, second].into_iter().flatten() {
-                if anchor.is_empty() {
-                    continue;
-                }
-                match result.get(&anchor) {
-                    Some(&existing) if existing != node => res.errors.push(to_diagnostic(
-                        format!("Duplicate anchor declaration: '{anchor}'"),
-                        ErrorCode::SCHEMA_RESOLVE_ERROR,
-                        None,
-                    )),
-                    _ => {
-                        result.insert(anchor, node);
-                    }
-                }
-            }
-            let children = self.graph.schema_children(node);
-            stack.extend(children.into_iter().rev().map(|c| (c, false)));
-        }
-        result
-    }
-
-    fn collect_dynamic_anchors(&mut self, res: &Resolution, root: ObjId) {
-        let draft = match self.graph.get(root, "$schema").filter(|v| v.is_truthy()) {
-            Some(v) => v.as_str().and_then(get_schema_draft_from_id),
-            None => res.draft,
-        };
-        if !draft.is_none_or(|d| d >= SchemaDraft::V2020_12) {
-            return;
-        }
-        let mut seen = HashSet::new();
-        let mut stack = vec![(root, root)];
-        while let Some((node, resource_root)) = stack.pop() {
-            if !seen.insert(node) {
-                continue;
-            }
-            let current_root = if node == root || self.base_id(node).is_some() {
-                self.graph[node].anchor_maps.get_or_insert_default();
-                node
-            } else {
-                resource_root
-            };
-            let o = &self.graph[node];
-            let dynamic_anchor = o
-                .get("$dynamicAnchor")
-                .and_then(Val::as_str)
-                .map(str::to_owned);
-            let anchor = o.get("$anchor").and_then(Val::as_str).map(str::to_owned);
-            let has_dynamic_ref = o.get("$dynamicRef").and_then(Val::as_str).is_some();
-            let maps = self.graph[current_root]
-                .anchor_maps
-                .as_mut()
-                .expect("resource roots have anchor maps");
-            if let Some(name) = dynamic_anchor {
-                maps.dynamic.entry(name.clone()).or_insert(node);
-                maps.local.entry(name).or_insert(node);
-            }
-            if let Some(name) = anchor {
-                maps.local.entry(name).or_insert(node);
-            }
-            if has_dynamic_ref {
-                let info = self.graph.info_of(node);
-                self.graph.info_mut(info).scope = Some(current_root);
-            }
-            let children = self.graph.schema_children(node);
-            stack.extend(children.into_iter().rev().map(|c| (c, current_root)));
-        }
-    }
-
-    fn register_embedded_schemas(&mut self, res: &mut Resolution, root: ObjId, base_uri: &str) {
-        let mut seen = HashSet::new();
-        let mut stack = vec![(root, base_uri.to_owned(), true)];
-        while let Some((node, current_base, is_document_root)) = stack.pop() {
-            if !seen.insert(node) {
-                continue;
-            }
-            let mut new_base = current_base.clone();
-            if let Some(id) = self.base_id(node) {
-                let resolved = normalize_id(&self.resolve_path(&id, &current_base));
-                if !is_document_root {
-                    res.embedded_schema_uris.insert(resolved.clone());
-                }
-                match self.schemas_by_id.get(&resolved).copied() {
-                    None => {
-                        self.add_schema_handle(&resolved, Some(node));
-                    }
-                    Some(existing) if existing != res.handle => {
-                        self.set_schema_content(existing, node)
-                    }
-                    Some(_) => {}
-                }
-                new_base = resolved;
-            }
-            let children = self.graph.schema_children(node);
-            stack.extend(
-                children
-                    .into_iter()
-                    .rev()
-                    .map(|c| (c, new_base.clone(), false)),
-            );
-        }
     }
 
     fn get_schema_from_property(&self, resource: &str, document: &JsonDocument) -> Option<String> {
@@ -1420,7 +699,7 @@ impl JsonSchemaService {
                         b.get(end) == Some(&b':')
                     }
                 };
-                return Some(match &self.resolve_relative_path {
+                return Some(match &self.resolve {
                     Some(resolve) if !has_scheme => resolve(id, resource),
                     _ => id.to_owned(),
                 });
@@ -1430,7 +709,7 @@ impl JsonSchemaService {
     }
 
     fn get_associated_schemas(&self, resource: &str) -> Vec<String> {
-        let mut seen = HashSet::new();
+        let mut seen = std::collections::HashSet::new();
         let mut schemas = Vec::new();
         let normalized = normalize_resource_for_matching(resource);
         for &i in &self.file_pattern_associations {
@@ -1480,8 +759,7 @@ impl JsonSchemaService {
         if let Some(id) = document.and_then(|d| self.get_schema_from_property(resource, d))
             && !id.is_empty()
         {
-            let handle = self.get_or_add_schema_handle(&normalize_id(&id));
-            return Some(self.resolved(handle));
+            return Some(self.resolve(&normalize_id(&id)));
         }
         if let Some((cached, schema)) = &self.cached_schema_for_resource
             && cached == resource
@@ -1489,45 +767,39 @@ impl JsonSchemaService {
             return schema.clone();
         }
         let schemas = self.get_schema_uris_for_resource_impl(resource);
-        let resolved = if schemas.is_empty() {
-            None
-        } else {
-            let handle = self.create_combined_schema(resource, &schemas);
-            Some(self.resolved(handle))
+        let resolved = match schemas.as_slice() {
+            [] => None,
+            [id] => Some(self.resolve(id)),
+            ids => {
+                let id = format!(
+                    "schemaservice://combinedSchema/{}",
+                    encode_uri_component(resource)
+                );
+                let all_of: Vec<Value> = ids
+                    .iter()
+                    .map(|s| serde_json::json!({ "$ref": s }))
+                    .collect();
+                self.set_content(&id, &serde_json::json!({ "allOf": all_of }));
+                Some(self.resolve(&id))
+            }
         };
         self.cached_schema_for_resource = Some((resource.to_owned(), resolved.clone()));
         resolved
     }
 
-    fn create_combined_schema(&mut self, resource: &str, schema_ids: &[String]) -> HandleId {
-        if let [id] = schema_ids {
-            return self.get_or_add_schema_handle(id);
-        }
-        let id = format!(
-            "schemaservice://combinedSchema/{}",
-            encode_uri_component(resource)
-        );
-        let all_of = schema_ids
-            .iter()
-            .map(|s| {
-                let mut r = Obj::default();
-                r.set("$ref", Val::Str(s.as_str().into()));
-                Val::Obj(self.graph.add(r))
-            })
-            .collect();
-        let mut combined = Obj::default();
-        combined.set("allOf", Val::Arr(Arc::new(all_of)));
-        let combined = self.graph.add(combined);
-        self.add_schema_handle(&id, Some(combined))
-    }
-
-    /// Registers an inline schema and resolves it. `id` is the URI to use if the
-    /// schema has no `$id` or `id`; `None` gives a new `schemaservice://untitled/` URI.
+    /// Registers an inline schema and resolves it. `untitled_prefix` and a counter give the
+    /// URI if the schema has no `$id` or `id`.
     pub fn resolve_inline_schema(
         &mut self,
         schema: &Value,
         untitled_prefix: &str,
     ) -> Arc<ResolvedSchema> {
+        let uri = self.register_inline_schema(schema, untitled_prefix);
+        self.run(|s| s.resolve(&uri))
+    }
+
+    /// Registers an inline schema. Returns its normalized URI.
+    pub fn register_inline_schema(&mut self, schema: &Value, untitled_prefix: &str) -> String {
         let id = match schema
             .get("$id")
             .filter(|v| crate::is_truthy(v))
@@ -1546,8 +818,7 @@ impl JsonSchemaService {
             schema: Some(schema.clone()),
             ..SchemaConfiguration::default()
         });
-        let handle = self.schemas_by_id[&normalize_id(&id)];
-        self.resolved(handle)
+        normalize_id(&id)
     }
 
     /// `getMatchingSchemas`. Inverted matches are removed.
@@ -1557,30 +828,33 @@ impl JsonSchemaService {
         document: &JsonDocument,
         schema: Option<&Value>,
     ) -> Option<(Arc<ResolvedSchema>, Vec<ApplicableSchema>)> {
-        let resolved = match schema {
-            Some(schema) => {
-                let id = match schema.get("id").filter(|v| crate::is_truthy(v)) {
-                    Some(Value::String(id)) => id.clone(),
-                    _ => {
-                        let id = format!(
-                            "schemaservice://untitled/matchingSchemas/{}",
-                            self.id_counter
-                        );
-                        self.id_counter += 1;
-                        id
-                    }
-                };
-                let content = self.content_from_json(schema);
-                let handle = self.add_schema_handle(&id, Some(content));
-                self.resolved(handle)
-            }
-            None => self.get_schema_for_resource(resource, Some(document))?,
-        };
-        let matching = document
-            .get_matching_schemas(&resolved.schemas, resolved.root, None, None, None)
-            .into_iter()
-            .filter(|s| !s.inverted)
-            .collect();
-        Some((resolved, matching))
+        let id = schema.map(
+            |schema| match schema.get("id").filter(|v| crate::is_truthy(v)) {
+                Some(Value::String(id)) => normalize_id(id),
+                _ => {
+                    let id = format!(
+                        "schemaservice://untitled/matchingSchemas/{}",
+                        self.id_counter
+                    );
+                    self.id_counter += 1;
+                    id
+                }
+            },
+        );
+        if let (Some(id), Some(schema)) = (&id, schema) {
+            self.set_content(id, schema);
+        }
+        self.run(|s| {
+            let resolved = match &id {
+                Some(id) => s.resolve(id),
+                None => s.get_schema_for_resource(resource, Some(document))?,
+            };
+            let matching = document
+                .get_matching_schemas(&resolved.schemas, resolved.root, None, None, None)
+                .into_iter()
+                .filter(|s| !s.inverted)
+                .collect();
+            Some((resolved, matching))
+        })
     }
 }

@@ -60,22 +60,17 @@ impl LanguageService {
         &mut self.schema_service
     }
 
+    /// Clears all loaded schemas and registers `settings.schemas`.
     pub fn configure(&mut self, settings: &LanguageSettings) {
         self.schemas = settings.schemas.clone();
-        self.reload_schemas();
-        self.validation.configure(
-            settings.validate != Some(false),
-            settings.allow_comments == Some(true),
-        );
-    }
-
-    /// Clears all loaded schemas, as `configure` does. Unlike [`Self::reset_schema`], this
-    /// also frees the schema graph, which only grows.
-    pub fn reload_schemas(&mut self) {
         self.schema_service.reset(&self.contributions);
         for schema in &self.schemas {
             self.schema_service.register_external_schema(schema);
         }
+        self.validation.configure(
+            settings.validate != Some(false),
+            settings.allow_comments == Some(true),
+        );
     }
 
     pub fn reset_schema(&mut self, uri: &str) -> bool {
@@ -91,6 +86,16 @@ impl LanguageService {
     ) -> Vec<Diagnostic> {
         self.validation
             .do_validation(&mut self.schema_service, document, json, settings, schema)
+    }
+
+    pub fn do_syntax_validation(
+        &self,
+        document: &TextDocument,
+        json: &JsonDocument,
+        settings: Option<&DocumentLanguageSettings>,
+    ) -> Vec<Diagnostic> {
+        self.validation
+            .do_syntax_validation(document, json, settings)
     }
 
     /// `getLanguageStatus`: the URIs of the schemas for the document.
@@ -115,8 +120,9 @@ impl LanguageService {
         position: Position,
         json: &JsonDocument,
     ) -> CompletionList {
-        self.completion
-            .do_complete(&mut self.schema_service, document, position, json)
+        let completion = &self.completion;
+        self.schema_service
+            .run(|s| completion.do_complete(s, document, position, json))
     }
 
     pub fn do_hover(
@@ -125,7 +131,8 @@ impl LanguageService {
         position: Position,
         json: &JsonDocument,
     ) -> Option<Hover> {
-        crate::hover::do_hover(&mut self.schema_service, document, position, json)
+        self.schema_service
+            .run(|s| crate::hover::do_hover(s, document, position, json))
     }
 
     pub fn find_document_colors(
@@ -134,6 +141,7 @@ impl LanguageService {
         json: &JsonDocument,
         limit: Option<usize>,
     ) -> Vec<ColorInformation> {
-        crate::colors::find_document_colors(&mut self.schema_service, document, json, limit)
+        self.schema_service
+            .run(|s| crate::colors::find_document_colors(s, document, json, limit))
     }
 }

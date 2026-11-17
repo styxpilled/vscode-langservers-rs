@@ -1,17 +1,28 @@
-//! Port of `jsonSchema.ts`. Schemas are resolved on a [`graph::Graph`] and then
-//! compiled into typed [`JsonSchema`] nodes in a [`Schemas`] arena.
+//! Port of `jsonSchema.ts`. Each schema document is kept as a [`tree::Tree`]. Its nodes
+//! are compiled into typed [`JsonSchema`] nodes on first use, and `$ref` is resolved then.
 
 mod compile;
-pub(crate) mod graph;
+pub(crate) mod doc;
+pub(crate) mod tree;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use indexmap::IndexMap;
 use regress::Regex;
 use serde_json::Value;
 
-pub(crate) use compile::compile;
-pub use compile::compile_json;
+use crate::schema_service::{
+    SchemaDiagnostic, decode_uri_component, has_scheme, normalize_id, split_ref, to_diagnostic,
+};
+use crate::{ErrorCode, SchemaDraft};
+use doc::Doc;
+use tree::{Kind, Node, Tree};
+
+/// Compiles a schema from JSON, without external `$ref`.
+pub fn compile_json(value: &Value) -> (Schemas, SchemaId) {
+    Schemas::from_json(value)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SchemaId(u32);
@@ -146,11 +157,13 @@ pub struct JsonSchema {
     /// The deprecated spelling `allowsTrailingCommas`.
     pub allows_trailing_commas: Option<bool>,
 
-    /// `$originalId`: the id of a schema that was merged into this one.
+    /// The URI of a document root, which starts a resource without an `$id`.
     pub original_id: Option<String>,
-    /// `$dynamicRefInfo`: the initial target and the plain-name fragment.
+    /// `$dynamicRef`: the initial target and the plain-name fragment.
     pub dynamic_ref: Option<Box<(SchemaId, Option<String>)>>,
-    /// `$anchorMaps.dynamic`.
+    /// The enclosing resource root: the document root or the nearest `$id`.
+    pub resource: Option<SchemaId>,
+    /// The `$dynamicAnchor` names of a resource root.
     pub dynamic_anchors: Option<Box<IndexMap<String, SchemaId>>>,
 }
 
@@ -235,26 +248,38 @@ impl JsonSchema {
     }
 }
 
-/// An arena of compiled schemas. Index 0 is [`SchemaId::TRUE`], index 1 is [`SchemaId::FALSE`].
-#[derive(Debug)]
+/// A snapshot of the loaded schema documents. Each schema node is compiled on first use, and
+/// `$ref` is resolved then. A `$ref` to a document that is not loaded gives `true` and is
+/// recorded in [`Schemas::missing`]; the schema service loads it and makes a new snapshot.
 pub struct Schemas {
-    /// Boxed, so that `Vec` growth copies pointers and not nodes. This halves the peak
-    /// memory of a schema load.
-    #[allow(clippy::vec_box)]
-    nodes: Vec<Box<JsonSchema>>,
+    entries: Vec<Entry>,
+    resources: HashMap<String, (usize, Node)>,
+    anchors: HashMap<String, (usize, Node)>,
+    resolve: Option<Arc<ResolveFn>>,
+    true_schema: JsonSchema,
+    false_schema: JsonSchema,
+    issues: Mutex<Issues>,
 }
 
-impl Default for Schemas {
-    fn default() -> Self {
-        Schemas {
-            nodes: vec![
-                Box::default(),
-                Box::new(JsonSchema {
-                    not: Some(SchemaRef::Schema(SchemaId::TRUE)),
-                    ..JsonSchema::default()
-                }),
-            ],
-        }
+pub(crate) type ResolveFn = dyn Fn(&str, &str) -> String + Send + Sync;
+
+struct Entry {
+    doc: Arc<Doc>,
+    base: u32,
+    cache: Box<[OnceLock<Box<JsonSchema>>]>,
+}
+
+#[derive(Default)]
+struct Issues {
+    missing: Vec<String>,
+    errors: Vec<SchemaDiagnostic>,
+}
+
+impl std::fmt::Debug for Schemas {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Schemas")
+            .field("documents", &self.entries.len())
+            .finish()
     }
 }
 
@@ -262,25 +287,210 @@ impl std::ops::Index<SchemaId> for Schemas {
     type Output = JsonSchema;
 
     fn index(&self, id: SchemaId) -> &JsonSchema {
-        &self.nodes[id.0 as usize]
+        match id {
+            SchemaId::TRUE => &self.true_schema,
+            SchemaId::FALSE => &self.false_schema,
+            id => {
+                let (d, n) = self.locate(id);
+                self.entries[d].cache[n as usize]
+                    .get_or_init(|| Box::new(compile::compile(self, d, n)))
+            }
+        }
     }
 }
 
 impl Schemas {
-    fn alloc(&mut self) -> SchemaId {
-        self.nodes.push(Box::default());
-        SchemaId(self.nodes.len() as u32 - 1)
+    /// `docs` are in the order of their base ids. A base id is at least 2.
+    pub(crate) fn new(docs: &[(Arc<Doc>, u32)], resolve: Option<Arc<ResolveFn>>) -> Schemas {
+        let mut resources = HashMap::new();
+        let mut anchors = HashMap::new();
+        let entries = docs
+            .iter()
+            .enumerate()
+            .map(|(d, (doc, base))| {
+                for (uri, n) in &doc.resources {
+                    resources.entry(uri.clone()).or_insert((d, *n));
+                }
+                for (key, n) in &doc.anchors {
+                    anchors.entry(key.clone()).or_insert((d, *n));
+                }
+                Entry {
+                    doc: doc.clone(),
+                    base: *base,
+                    cache: (0..doc.tree.len()).map(|_| OnceLock::new()).collect(),
+                }
+            })
+            .collect();
+        Schemas {
+            entries,
+            resources,
+            anchors,
+            resolve,
+            true_schema: JsonSchema::default(),
+            false_schema: JsonSchema {
+                not: Some(SchemaRef::Schema(SchemaId::TRUE)),
+                ..JsonSchema::default()
+            },
+            issues: Mutex::default(),
+        }
     }
 
-    fn set(&mut self, id: SchemaId, schema: JsonSchema) {
-        *self.nodes[id.0 as usize] = schema;
+    pub(crate) fn id(&self, d: usize, n: Node) -> SchemaId {
+        SchemaId(self.entries[d].base + n)
     }
 
-    pub fn len(&self) -> usize {
-        self.nodes.len()
+    /// The document and node of a schema id above [`SchemaId::FALSE`].
+    pub(crate) fn locate(&self, id: SchemaId) -> (usize, Node) {
+        let d = self.entries.partition_point(|e| e.base <= id.0) - 1;
+        (d, id.0 - self.entries[d].base)
     }
 
-    pub fn is_empty(&self) -> bool {
-        false
+    pub(crate) fn doc(&self, d: usize) -> &Doc {
+        &self.entries[d].doc
+    }
+
+    /// The document and node of a resource URI.
+    pub(crate) fn resource(&self, uri: &str) -> Option<(usize, Node)> {
+        self.resources.get(uri).copied()
+    }
+
+    /// The URIs of documents that a `$ref` needs and that are not loaded.
+    pub fn missing(&self) -> Vec<String> {
+        self.issues.lock().unwrap().missing.clone()
+    }
+
+    /// The `$ref` resolution errors found so far.
+    pub fn errors(&self) -> Vec<SchemaDiagnostic> {
+        self.issues.lock().unwrap().errors.clone()
+    }
+
+    fn note_missing(&self, uri: &str) {
+        let mut issues = self.issues.lock().unwrap();
+        if !issues.missing.iter().any(|m| m == uri) {
+            issues.missing.push(uri.to_owned());
+        }
+    }
+
+    fn note_error(&self, error: SchemaDiagnostic) {
+        let mut issues = self.issues.lock().unwrap();
+        if !issues.errors.contains(&error) {
+            issues.errors.push(error);
+        }
+    }
+
+    fn resolve_path(&self, path: &str, base: &str) -> String {
+        match &self.resolve {
+            Some(resolve) if !has_scheme(path) => resolve(path, base),
+            _ => path.to_owned(),
+        }
+    }
+
+    /// The target of a `$ref` (or `$dynamicRef`) `r` of node `n` of document `d`. Follows
+    /// `$ref` chains. With `lazy`, a chain stops at a node whose target document is not
+    /// loaded: that node loads it when it is compiled, so only a used `$ref` loads a
+    /// document.
+    pub(crate) fn resolve_ref(&self, d: usize, n: Node, r: &str, lazy: bool) -> SchemaRef {
+        let mut current = (d, n, r.to_owned());
+        for _ in 0..32 {
+            let (d, n, r) = current;
+            if lazy && self.resource(&self.ref_uri(d, n, &r).0).is_none() {
+                return SchemaRef::Schema(self.id(d, n));
+            }
+            let Some((d2, n2)) = self.ref_target(d, n, &r) else {
+                return SchemaRef::Bool(true);
+            };
+            match self.doc(d2).tree.kind(n2) {
+                Kind::Obj(..) => match compile::pure_ref(self.doc(d2), n2) {
+                    Some(next) if !self.doc(d2).in_dynamic_scope(n2) => {
+                        current = (d2, n2, next.to_owned());
+                    }
+                    _ => return SchemaRef::Schema(self.id(d2, n2)),
+                },
+                Kind::Bool(b) => return SchemaRef::Bool(*b),
+                _ => return SchemaRef::Bool(true),
+            }
+        }
+        SchemaRef::Bool(true)
+    }
+
+    /// The resource URI and the fragment of a `$ref`.
+    fn ref_uri<'r>(&self, d: usize, n: Node, r: &'r str) -> (String, Option<&'r str>) {
+        let doc = self.doc(d);
+        let pre_201909 = doc.draft.is_some_and(|x| x < SchemaDraft::V2019_09);
+        let base = doc.base(n, pre_201909);
+        let (path, fragment) = split_ref(r);
+        let uri = if path.is_empty() {
+            base.to_owned()
+        } else {
+            normalize_id(&self.resolve_path(path, base))
+        };
+        (uri, fragment)
+    }
+
+    fn ref_target(&self, d: usize, n: Node, r: &str) -> Option<(usize, Node)> {
+        let (uri, fragment) = self.ref_uri(d, n, r);
+        let Some((d2, root)) = self.resource(&uri) else {
+            self.note_missing(&uri);
+            return None;
+        };
+        let target = self.doc(d2);
+        if let Some(error) = target.load_errors.first() {
+            let message = match fragment.filter(|s| !s.is_empty()) {
+                Some(seg) => format!("Problems loading reference '{seg}': {}", error.message),
+                None => error.message.clone(),
+            };
+            self.note_error(to_diagnostic(message, error.code, Some(&target.uri)));
+            return None;
+        }
+        for error in &target.errors {
+            self.note_error(error.clone());
+        }
+        let found = match fragment {
+            None | Some("") => Some((d2, root)),
+            Some(f) if f.starts_with('/') => decode_uri_component(f)
+                .and_then(|p| target.tree.pointer(root, &p))
+                .map(|t| (d2, t)),
+            Some(f) => self.anchors.get(&format!("{uri}#{f}")).copied(),
+        };
+        let found = found.filter(|&(d3, t)| {
+            let tree = &self.doc(d3).tree;
+            tree.is_truthy(t) || matches!(tree.kind(t), Kind::Bool(false))
+        });
+        if found.is_none() {
+            self.note_error(to_diagnostic(
+                format!(
+                    "$ref '{}' in '{uri}' can not be resolved.",
+                    fragment.unwrap_or("")
+                ),
+                ErrorCode::SCHEMA_RESOLVE_ERROR,
+                None,
+            ));
+        }
+        found
+    }
+
+    /// A schema from JSON, without external `$ref`.
+    pub fn from_json(value: &Value) -> (Schemas, SchemaId) {
+        let doc = Doc::new(
+            "schemaservice://json".to_owned(),
+            Tree::from_json(value),
+            Vec::new(),
+            None,
+        );
+        let schemas = Schemas::new(&[(Arc::new(doc), 2)], None);
+        let root = match value {
+            Value::Bool(false) => SchemaRef::Bool(false),
+            Value::Object(_) => schemas.node_ref(0, 0, false),
+            _ => SchemaRef::Bool(true),
+        };
+        (schemas, root.as_schema())
+    }
+
+    /// Node `n` of document `d`, after `$ref` chains. `lazy` as in [`Self::resolve_ref`].
+    pub(crate) fn node_ref(&self, d: usize, n: Node, lazy: bool) -> SchemaRef {
+        match compile::pure_ref(self.doc(d), n) {
+            Some(r) => self.resolve_ref(d, n, r, lazy),
+            None => SchemaRef::Schema(self.id(d, n)),
+        }
     }
 }

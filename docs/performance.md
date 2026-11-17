@@ -217,9 +217,9 @@ Each needs a profile first.
 - JSON parse (96 ms for 33 MB): `index_children`, growth of the node `Vec`.
   Errors must keep their order: duplicate-key diagnostics are emitted during the
   parse.
-- JSON schema load (2.2 MB, Node about 40 ms): key copies in `Obj::set`,
-  `Arc<str>` in `JsonSchema` shared with `Val::Str`. `jsonc::visit` keeps a
-  `path` with one `String` for each property, also when the visitor does not
+- JSON schema load (2.2 MB, Node about 40 ms): one `Box<str>` for each key in
+  `schema/tree.rs` (keys repeat: an interner is possible). `jsonc::visit` keeps
+  a `path` with one `String` for each property, also when the visitor does not
   read it.
 - JSON document symbols: name and detail `String`s, range conversion for each
   node.

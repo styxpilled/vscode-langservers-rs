@@ -28,11 +28,11 @@
   `to_string_unencoded`), `Utils` (`join_path`, `dirname`, `basename`,
   `resolve_path`), `posix` (bundled `path.posix`), `resolve_relative_path`,
   `decode_uri_component`.
-- `crates/lsp-transport`: stdio threads for the servers, and `run_server`,
-  which runs the server loop on a thread with a 256 MiB stack
-  (`experimental.md`, "Deep nesting"). Responses and
-  notifications are serialized directly from the `lsp-types` values (a
-  `serde_json::Value` takes about 8 times the memory of its JSON text).
+- `crates/lsp-transport`: stdio threads for the servers, and `run_server`, which
+  runs the server loop on a thread with a 256 MiB stack (`experimental.md`,
+  "Deep nesting"). Responses and notifications are serialized directly from the
+  `lsp-types` values (a `serde_json::Value` takes about 8 times the memory of
+  its JSON text).
 - `crates/lsp-recorder`: `lsp-recorder` and `lsp-replay` (see `testing.md`).
 
 ## JSON
@@ -60,26 +60,26 @@ upstream. On `experimental` it reads at most `MAX_DEPTH` levels
   pass. `strings.rs` has the JS string and number helpers (`js_number_to_string`
   uses `ryu-js`).
 - Schemas:
-  - `schema/graph.rs`: a JS-like mutable object graph. `$ref`, `$id`, `$anchor`
-    and `$dynamicRef` resolution depends on object identity, aliasing and
-    mutation in place, so typed structs cannot hold the schema during
-    resolution. Objects are in an arena, with JS key order (array index keys
-    first) and hidden fields (`$originalId`, `$dynamicRefInfo`, `$anchorMaps`).
-    `Graph::parse` builds the graph from the `jsonc` visitor.
-  - `schema/mod.rs`, `schema/compile.rs`: after resolution, the reachable
-    objects are compiled into typed `JsonSchema` nodes in a `Schemas` arena
-    (`SchemaId`, `SchemaRef`). Rare keywords are boxed (`limits()`, `vscode()`).
-  - `schema_service.rs`: `JsonSchemaService` (handles, `fileMatch` globs,
-    loading through a synchronous request closure, resolution). Schemas load
-    synchronously; each resolution is one promise chain upstream, so the order
-    of operations is the same.
+  - `schema/tree.rs`: a schema document as a compact read-only JSON tree, built
+    from the `jsonc` visitor. Keys keep the document order.
+  - `schema/doc.rs`: a loaded document and its index, made in one walk at load:
+    the base URI and resource root of each node, the embedded resources
+    (`$id`), the anchors and the dynamic anchors.
+  - `schema/mod.rs`, `schema/compile.rs`: `Schemas` is a snapshot of the loaded
+    documents. A node is compiled into a typed `JsonSchema` on first use
+    (`OnceLock`), and its `$ref` is resolved then (`experimental.md`, "Schema
+    loading"). `SchemaId` is a document base id plus the node index. Rare
+    keywords are boxed (`limits()`, `vscode()`).
+  - `schema_service.rs`: `JsonSchemaService` (`fileMatch` globs, documents
+    loaded through a synchronous request closure, snapshots). `run` runs an
+    operation again after it loads the documents that a `$ref` needed.
   - `validator.rs` (drafts 4, 6, 7, 2019-09, 2020-12), `validation.rs`,
     `vocabularies.rs`, `glob.rs`, `configuration.rs` with `schemas.json`
     (built-in meta-schemas, generated). Regular expressions: `regress`.
 - `completion.rs`, `hover.rs`, `links.rs`, and `language_service.rs`
   (`LanguageService`: one schema service, the built-in contributions,
-  `configure`, the features that use schemas). `configure` builds a new schema
-  service, so the old graph is freed.
+  `configure`, the features that use schemas). `configure` removes all loaded
+  schemas.
 
 ### `crates/json-language-server`
 
@@ -88,17 +88,17 @@ upstream. On `experimental` it reads at most `MAX_DEPTH` levels
   delay) or pull diagnostics, result limits, dynamic formatter registration,
   `runSafe` (a panic gives the error value and a log message).
 - `schema_request.rs`: schema content through `file:` (read inline), HTTP
-  (`ureq` on a worker thread, with the `request-light` messages) and
+  (`ureq` on a worker thread, with the `request-light` messages and a disk
+  cache, `experimental.md`) and
   `vscode/content` (request to the client), as `handledSchemaProtocols` selects.
 - Deferred requests: a request for schema content that is not loaded starts the
   fetch and fails. The server discards the result, resets the schema, and runs
   the request or validation again when the content arrives. `$/cancelRequest`
-  removes a waiting request.
-- Schema reload: a fetch, or a `json/schemaContent` or file change that clears a
-  loaded schema, sets `schemas_stale`. The next `with_schemas` calls
-  `LanguageService::reload_schemas` (the reset of `configure`, with the cached
-  schema texts). This stops the graph from growing with each level of external
-  `$ref`. Compiled `fileMatch` globs are cached across resets.
+  removes a waiting request. A pull diagnostic does not wait (`experimental.md`,
+  "Schema prefetch").
+- Schema reload: a `json/schemaContent` or file change removes the loaded
+  document of that URI only; the documents that reference it resolve the
+  `$ref` again. Compiled `fileMatch` globs are cached across resets.
 - Parsed documents are cached for each open document.
 
 ## CSS
@@ -143,10 +143,9 @@ upstream. On `experimental` it reads at most `MAX_DEPTH` levels
 - `services/`: `lint.rs`, `lint_rules.rs`, `lint_util.rs`, `validation.rs`,
   `selector_printing.rs`, `hover.rs`, `completion.rs` (SCSS and Less overrides
   match on the dialect; `CompletionParticipant`), `navigation.rs`,
-  `code_actions.rs`,
-  `folding.rs`, `selection_range.rs`, `links.rs` (`LinkResolver`,
-  `FileSystemProvider`, `DocumentContext`), `path_completion.rs`,
-  `formatter.rs`.
+  `code_actions.rs`, `folding.rs`, `selection_range.rs`, `links.rs`
+  (`LinkResolver`, `FileSystemProvider`, `DocumentContext`),
+  `path_completion.rs`, `formatter.rs`.
 - `beautify.rs`: port of `beautify-css.js` (js-beautify 2.0.3). Tokens are
   slices of the source text. No wrap code: upstream never sets a wrap point.
 - The service is synchronous. Where upstream rejects a promise, the Rust

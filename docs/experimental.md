@@ -24,22 +24,21 @@ Upstream parsers and tree walks are recursive. Node throws `RangeError` at about
     deeper array or object is empty and covers the text to its closing bracket.
     Error "Nesting too deep" (code `0x211`; `jsonc`:
     `ParseErrorCode::NestingTooDeep`).
-  - CSS (`parser::MAX_DEPTH`): a recursion guard (`Parser::nested`) on the
-    parse functions where each recursion passes: declarations (blocks),
-    expressions (parentheses, function arguments, interpolations), selectors
-    (pseudo-class arguments), boolean expressions, media and supports
-    conditions, SCSS list elements. The links of a binary expression chain and
-    of an SCSS `@else if` chain count too. At the limit the function gives the
-    error `css-nestingtoodeep`, skips to the closing bracket of the enclosing
-    group, and returns nothing; the error recovery of the caller follows. A
-    binary chain stops; the rest reads as more terms (`+1` is a term with a
-    sign). The selector hover tree nests at each combinator; it stops at the
-    limit.
+  - CSS (`parser::MAX_DEPTH`): a recursion guard (`Parser::nested`) on the parse
+    functions where each recursion passes: declarations (blocks), expressions
+    (parentheses, function arguments, interpolations), selectors (pseudo-class
+    arguments), boolean expressions, media and supports conditions, SCSS list
+    elements. The links of a binary expression chain and of an SCSS `@else if`
+    chain count too. At the limit the function gives the error
+    `css-nestingtoodeep`, skips to the closing bracket of the enclosing group,
+    and returns nothing; the error recovery of the caller follows. A binary
+    chain stops; the rest reads as more terms (`+1` is a term with a sign). The
+    selector hover tree nests at each combinator; it stops at the limit.
   - CSS skips in the deep part. Restores make the parser come back to the
     skipped text from each outer level. So at the first skip, one scan builds
-    the end of each bracket group, and a skip jumps over each inner group;
-    when the enclosing group is not closed, the text ends for the parser at the
-    skip. Without this, 8000 levels of closed `:not(` took 1.1 s (now 6 ms).
+    the end of each bracket group, and a skip jumps over each inner group; when
+    the enclosing group is not closed, the text ends for the parser at the skip.
+    Without this, 8000 levels of closed `:not(` took 1.1 s (now 6 ms).
   - CSS cost on usual documents: the guard is a counter at each call of these
     functions, not at each token. A first version counted the brackets at each
     token: parse 4% slower on bootstrap, so it was replaced.
@@ -48,18 +47,17 @@ Upstream parsers and tree walks are recursive. Node throws `RangeError` at about
     the HTML mode has no parse diagnostics.
 - Effect: all features except formatting answer on 100000 levels of 64 generated
   documents (each nesting construct of the three servers, open and closed;
-  `scripts/deep-nesting.mjs`), also with a 4 MiB stack: 256 MiB is a margin of 64 times. The slowest take 2
-  to 4 s (600 KB of text with up to 100000 diagnostics) and grow linearly. Formatting is not limited: its output
-  grows as the square of the depth (indentation), as upstream. `tests/stdio.rs`
-  of each server (`deep_nesting`), `jsonc` `nesting_limit`, HTML
-  `nesting_limit`.
-- Nested symbols (`documentSymbol` as `DocumentSymbol`, all three servers):
-  a client that reads JSON with the default `serde_json` recursion limit (128
-  levels) cannot read a response with symbols 62 levels deep, and loses the
-  full response. The symbols below `lsp_transport::MAX_SYMBOL_DEPTH` (50)
-  become children of their ancestor at that depth, in document order. No
-  symbol is lost. `lsp-transport` `symbol_depth`; `tests/stdio.rs` of each
-  server.
+  `scripts/deep-nesting.mjs`), also with a 4 MiB stack: 256 MiB is a margin of
+  64 times. The slowest take 2 to 4 s (600 KB of text with up to 100000
+  diagnostics) and grow linearly. Formatting is not limited: its output grows as
+  the square of the depth (indentation), as upstream. `tests/stdio.rs` of each
+  server (`deep_nesting`), `jsonc` `nesting_limit`, HTML `nesting_limit`.
+- Nested symbols (`documentSymbol` as `DocumentSymbol`, all three servers): a
+  client that reads JSON with the default `serde_json` recursion limit (128
+  levels) cannot read a response with symbols 62 levels deep, and loses the full
+  response. The symbols below `lsp_transport::MAX_SYMBOL_DEPTH` (50) become
+  children of their ancestor at that depth, in document order. No symbol is
+  lost. `lsp-transport` `symbol_depth`; `tests/stdio.rs` of each server.
 - Not limited: the JavaScript mode (tsrs, one more document). No overflow up to
   6000 levels, but its time grows as the cube of the depth (3000 levels: 1.9 s,
   6000: 14.5 s, 12000: more than 60 s).
@@ -88,9 +86,9 @@ list is about 400 KB, and 73% of it is documentation. When the client declares
 support (`completionList.itemDefaults`, `completionItem.resolveSupport`), the
 CSS and HTML servers send smaller lists (`lsp_transport::completion`):
 
-- `itemDefaults.editRange`: the range of the service (CSS), or the most
-  common item range (HTML). An item with this range has `textEditText` in place
-  of `textEdit`, and no text when the text is the label.
+- `itemDefaults.editRange`: the range of the service (CSS), or the most common
+  item range (HTML). An item with this range has `textEditText` in place of
+  `textEdit`, and no text when the text is the label.
 - `itemDefaults.insertTextFormat`: snippet when most items are snippets; the
   other items give their format.
 - `documentation`, `detail` and `command` come with `completionItem/resolve`.
@@ -103,8 +101,8 @@ CSS and HTML servers send smaller lists (`lsp_transport::completion`):
 Script items (JavaScript mode) do not change. `lsp-transport` tests,
 `tests/stdio.rs` (`compact_completion`) of both servers. Effect on the Zed
 sessions: CSS 96 completions 38.2 MB against 4.2 MB (average 398 KB against 44
-KB, largest 1157 KB against 119 KB), 317 ms against 101 ms in `lsp-replay`;
-HTML 121 completions 2.40 MB against 0.13 MB.
+KB, largest 1157 KB against 119 KB), 317 ms against 101 ms in `lsp-replay`; HTML
+121 completions 2.40 MB against 0.13 MB.
 
 Not done: serialization of constant item lists once. A CSS completion now takes
 about 1 ms with the transfer.
@@ -121,9 +119,9 @@ and `parse_module_member` failed after more than two tokens, and fails at once
 there again. The result of these functions depends only on the position. Most
 calls fail on the first or second token: they do not go into the set, and the
 set is empty in usual documents (a first version kept each failure: parse 22%
-slower on bootstrap). Effect: 30 levels in 10 ms, 1000
-levels in about 0.1 s. Parse results do not change: the parser fixtures, the
-sweeps and the replays pass. `tests/stdio.rs` (`deep_nesting`).
+slower on bootstrap). Effect: 30 levels in 10 ms, 1000 levels in about 0.1 s.
+Parse results do not change: the parser fixtures, the sweeps and the replays
+pass. `tests/stdio.rs` (`deep_nesting`).
 
 ## CSS completion and language facts
 
@@ -288,17 +286,16 @@ The HTML server uses the same helpers for its formatter settings.
 
 ## HTML server
 
-- Document symbols. Upstream always sends `SymbolInformation`, each with its
-  own `Uri`. When the client has `hierarchicalDocumentSymbolSupport` (Zed has
-  it), the branch sends `DocumentSymbol`: the HTML tree
-  (`findDocumentSymbols2`), the CSS tree (the virtual `__` rule of a style
-  attribute is replaced by its children), and the script symbols without
-  children. The modes come in the same order as before. `tests/stdio.rs`
-  (`hierarchical_symbols`). Effect on `large.html` (`html-symbols.jsonl`):
-  response 13.9 MB against 16.4 MB, server time (symbols and serialization) 36
-  to 40 ms against 40 to 48 ms. The round trip in `lsp-replay` is longer (230
-  to 280 ms against 195 to 245 ms): the client parses the nested JSON more
-  slowly. Not measured in Zed.
+- Document symbols. Upstream always sends `SymbolInformation`, each with its own
+  `Uri`. When the client has `hierarchicalDocumentSymbolSupport` (Zed has it),
+  the branch sends `DocumentSymbol`: the HTML tree (`findDocumentSymbols2`), the
+  CSS tree (the virtual `__` rule of a style attribute is replaced by its
+  children), and the script symbols without children. The modes come in the same
+  order as before. `tests/stdio.rs` (`hierarchical_symbols`). Effect on
+  `large.html` (`html-symbols.jsonl`): response 13.9 MB against 16.4 MB, server
+  time (symbols and serialization) 36 to 40 ms against 40 to 48 ms. The round
+  trip in `lsp-replay` is longer (230 to 280 ms against 195 to 245 ms): the
+  client parses the nested JSON more slowly. Not measured in Zed.
 - Failed settings requests. As in the CSS server: upstream caches a rejected
   `workspace/configuration` request (or a `null` result) until the next
   `didChangeConfiguration`, and completion, hover, formatting and diagnostics
@@ -325,3 +322,94 @@ The HTML server uses the same helpers for its formatter settings.
   The format sweep skips the texts with a character outside the BMP (68 of 15406
   results; 19 of them differ). Effect on `html-perf.jsonl` (ASCII): formatting
   60 to 66 ms against 60 to 61 ms, the same within noise.
+
+## Schema loading
+
+Upstream loads a schema and each schema that it references, resolves `$ref` by
+merging the target into the referencing object on a JS object graph, and keeps
+the merged schema. The port did the same on `schema/graph.rs` and then compiled
+the whole graph.
+
+The branch keeps each schema document as a read-only tree (`schema/tree.rs`)
+with an index of base URIs, embedded `$id` resources and anchors, made at load
+(`schema/doc.rs`). A schema node is compiled on first use, and its `$ref` is
+resolved then:
+
+- A `$ref` without sibling keywords, or any `$ref` before draft 2019-09, points
+  to its target. A chain stops at a node whose resource has a `$dynamicAnchor`
+  or `$recursiveAnchor`, so that the validation enters that resource.
+- A `$ref` with sibling keywords is one more `allOf` member, as in draft
+  2019-09. Two forms keep the upstream merge result: with only annotation
+  siblings (`description`, `default`, ...) the node is the target with the
+  annotations that the target does not have (the Zed settings schema has 24);
+  with `additionalProperties`, the properties of the target count as its own (VS
+  Code settings schemas).
+- A document loads when a used `$ref` needs it. The operation then runs again
+  (`JsonSchemaService::run`). A `$ref` that a feature does not reach loads
+  nothing; the Zed settings schema references 58 `zed://schemas/settings/lsp/`
+  documents.
+- `json/schemaContent` and a file change reload only that document.
+- Object keys keep the document order (no JS key order).
+
+Differences: a schema error is found only when a feature reaches its `$ref`. An
+`$id` embedded in a document that only an unused `$ref` loads is not found. The
+"can not be resolved" error names the document of the anchor. Upstream trace
+tests: 3 of 233 skipped for this (`tests/upstream_trace.rs`, `DIFFERENT`); the
+JSON-Schema-Test-Suite passes (4950 cases). `tests/schema_refs.rs`.
+
+Effect, `schema_bench`: Zed settings schema (557 KB) load and validation 13.5
+against 5.4 ms, heap 9.3 against 3.3 MB. A generated 2.2 MB schema: validation
+45 against 21 ms, heap 27 against 11 MB; the first completion 23 against 43 ms
+(it now compiles the 19800 property schemas). The 54 JSON sessions: all requests
+8.7 against 4.4 s (`documentColor`, which waits for the loads, 6.7 against 2.6
+s), `zed://` content requests 2152 against 80, the sum of peak memory 1412
+against 1046 MB. The responses are the same as before, except four
+`settings.json` and `package.json` diagnostics, which now equal Node's.
+
+## JSON server
+
+- Equal configuration. Zed sends `workspace/didChangeConfiguration` again with
+  the same settings (103 of 142 notifications in 39 sessions). Upstream applies
+  each one: it registers all schema associations again (1468 in Zed), drops all
+  loaded schemas and sends `workspace/diagnostic/refresh`, so the next
+  diagnostic loads and compiles the schema again (25 to 31 ms for the Zed
+  settings schema). The branch ignores settings that are equal to the last ones.
+  `tests/stdio.rs` (`equal_configuration`). Effect on `session-1794684530299`:
+  diagnostics 390 ms against 102 ms (13 against 1 above 10 ms), 14 fewer
+  refreshes, the same responses. All 49 JSON sessions: diagnostics 10.2 s
+  against 7.8 s, 171 against 280 refreshes; the replays differ only in the
+  number of refreshes.
+- Schema prefetch. Upstream loads the schema at the first request that needs it,
+  and a pull diagnostic waits for the load (900 ms for an HTTP schema). The
+  branch queues each document at `didOpen`, at a configuration change and when a
+  loaded schema changes. When no message waits, it loads and compiles the schema
+  of the next queued document. A pull diagnostic does not wait for schema
+  content: it gets the syntax errors without comment and trailing comma
+  diagnostics (a schema can allow them). When the schema is loaded and compiled,
+  `workspace/diagnostic/refresh` follows. Push diagnostics and the other
+  requests still wait for the content. The compile is on the main thread.
+  `tests/stdio.rs` (`pull_diagnostics_without_schema`). Effect on the 54 JSON
+  sessions: diagnostics 8.8 s against 1.7 s (above 100 ms: 9 against 2; max 1502
+  against 160 ms, the parse of a 26 MB document). The replay sends the next
+  request at once, so the wait moves to the next request that needs the schema:
+  `documentColor` 21 ms against 7.7 s, all requests 9.0 s against 9.6 s. In Zed
+  a waiting request does not stop other requests. The replays differ in the
+  first diagnostic of a document whose schema is not loaded, and in one more
+  refresh for each such load.
+- HTTP schema cache. Upstream (the server, as Zed lets it handle `http` and
+  `https`) downloads each HTTP schema again at each start: about 900 ms for
+  `json.schemastore.org` with its redirect, and nothing without a network. The
+  VS Code client has a cache, Zed has none. The branch writes each 2xx response
+  with its `ETag` to a cache folder (`%LOCALAPPDATA%`, `~/Library/Caches` or
+  `$XDG_CACHE_HOME` / `~/.cache`, then `vscode-langservers-rs/json-schemas`;
+  `JSON_SCHEMA_CACHE` sets the folder, an empty value turns the cache off).
+  A load with a cached copy reads the file inline and uses it. A worker thread
+  then checks the copy with `If-None-Match`: on `304` or a network error the
+  copy stays; changed content replaces the cache and reloads the schema as
+  `json/schemaContent` does, with a refresh. After a change on the server, the
+  requests of the first second use the old copy. `tests/stdio.rs`
+  (`http_schema_cache`). Effect on the 54 JSON sessions (one HTTP schema, in 3
+  sessions): all requests 4.5 s with no cache, 2.7 s at the first load into an
+  empty cache, 1.9 s with the cached copy; `documentColor` 2.7 s against 0.25
+  s; max request 829 against 170 ms. With the cached copy, the replays differ
+  only in one fewer refresh in each of the 3 sessions.

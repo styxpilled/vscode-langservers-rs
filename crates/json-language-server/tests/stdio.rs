@@ -3,6 +3,7 @@
 use std::io::{BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use lsp_server::{Message, Notification, Request, RequestId, Response};
@@ -17,8 +18,13 @@ struct Client {
 
 impl Client {
     fn start(capabilities: Value, options: Value) -> Client {
+        Client::start_with_cache(capabilities, options, "")
+    }
+
+    fn start_with_cache(capabilities: Value, options: Value, cache: &str) -> Client {
         let mut child = Command::new(env!("CARGO_BIN_EXE_vscode-json-language-server"))
             .arg("--stdio")
+            .env("JSON_SCHEMA_CACHE", cache)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -263,6 +269,45 @@ fn pull_diagnostics() {
     assert_eq!(client.exit(), 0);
 }
 
+/// `docs/experimental.md`: the schema load starts at `didOpen`, and a pull does not wait
+/// for it. A refresh follows when the schema is ready.
+#[test]
+fn pull_diagnostics_without_schema() {
+    let capabilities = json!({ "textDocument": { "diagnostic": {} } });
+    let mut client = Client::start(capabilities, json!({}));
+    client.notify(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": { "json": {
+            "validate": { "enable": true },
+            "schemas": [{ "fileMatch": ["remote.json"], "url": "zed://schemas/remote" }]
+        } } }),
+    );
+    client.server_request("workspace/diagnostic/refresh");
+    // The schema can allow trailing commas, so the first answer has only syntax errors.
+    client.open("file:///remote.json", "json", "{ \"b\": 1, } x");
+    let content = client.server_request("vscode/content");
+    let document = json!({ "textDocument": { "uri": "file:///remote.json" } });
+    let report = client.request("textDocument/diagnostic", document.clone());
+    assert_eq!(
+        messages(report["items"].as_array().unwrap()),
+        ["End of file expected."]
+    );
+
+    let schema = json!({ "properties": { "b": { "type": "string" } } });
+    client.send(Response::new_ok(content.id, schema.to_string()));
+    client.server_request("workspace/diagnostic/refresh");
+    let report = client.request("textDocument/diagnostic", document);
+    assert_eq!(
+        messages(report["items"].as_array().unwrap()),
+        [
+            "Incorrect type. Expected \"string\".",
+            "Trailing comma",
+            "End of file expected."
+        ]
+    );
+    assert_eq!(client.exit(), 0);
+}
+
 #[test]
 fn exit_without_shutdown() {
     let mut client = Client::start(json!({}), json!({}));
@@ -270,43 +315,60 @@ fn exit_without_shutdown() {
     assert_eq!(client.child.wait().unwrap().code(), Some(1));
 }
 
-/// Serves `/ok.json` and gives 404 with an empty body for other paths.
-fn http_server() -> u16 {
-    use std::io::{BufRead, Write};
+const BOOLEAN_SCHEMA: &str = r#"{ "properties": { "c": { "type": "boolean" } } }"#;
+
+/// (`ETag`, body)
+type Schema = Arc<Mutex<(&'static str, &'static str)>>;
+
+/// Serves `schema` at `/ok.json`, with 304 for a matching `If-None-Match`, and 404 with an
+/// empty body for other paths. Returns the port and the `If-None-Match` of each request.
+fn http_server(schema: Schema) -> (u16, Arc<Mutex<Vec<Option<String>>>>) {
+    use std::io::BufRead;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let log = requests.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let mut stream = stream.unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut request_line = String::new();
             reader.read_line(&mut request_line).unwrap();
+            let mut if_none_match = None;
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 if line.trim().is_empty() {
                     break;
                 }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("if-none-match")
+                {
+                    if_none_match = Some(value.trim().to_owned());
+                }
             }
-            let body = r#"{ "properties": { "c": { "type": "boolean" } } }"#;
-            let response = if request_line.contains("/ok.json") {
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-            } else {
+            let (etag, body) = *schema.lock().unwrap();
+            let response = if !request_line.contains("/ok.json") {
                 "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     .to_owned()
+            } else if if_none_match.as_deref() == Some(etag) {
+                "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".to_owned()
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\nETag: {etag}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
             };
+            log.lock().unwrap().push(if_none_match);
             stream.write_all(response.as_bytes()).unwrap();
         }
     });
-    port
+    (port, requests)
 }
 
 #[test]
 fn http_schemas() {
-    let port = http_server();
+    let (port, _) = http_server(Arc::new(Mutex::new(("\"v1\"", BOOLEAN_SCHEMA))));
     let mut client = Client::start(json!({}), json!({}));
     client.notify(
         "workspace/didChangeConfiguration",
@@ -330,6 +392,77 @@ fn http_schemas() {
             "Unable to load schema from 'http://127.0.0.1:{port}/missing.json': Not Found. The requested location could not be found."
         )]
     );
+    assert_eq!(client.exit(), 0);
+}
+
+/// `docs/experimental.md`: the server uses the cached copy of an HTTP schema, then checks it
+/// with `If-None-Match`.
+#[test]
+fn http_schema_cache() {
+    let string = r#"{ "properties": { "c": { "type": "string" } } }"#;
+    let schema = Arc::new(Mutex::new(("\"v1\"", BOOLEAN_SCHEMA)));
+    let (port, requests) = http_server(schema.clone());
+    let cache = std::env::temp_dir().join(format!("json-schema-cache-{port}"));
+    let _ = std::fs::remove_dir_all(&cache);
+    let boolean_error = "Incorrect type. Expected \"boolean\".";
+    let string_error = "Incorrect type. Expected \"string\".";
+    // The diagnostics of the cached copy can come before those of the changed schema.
+    let session = |expected: &str| {
+        let mut client = Client::start_with_cache(json!({}), json!({}), cache.to_str().unwrap());
+        client.notify(
+            "workspace/didChangeConfiguration",
+            json!({ "settings": { "json": {
+                "validate": { "enable": true },
+                "schemas": [{ "fileMatch": ["c.json"], "url": format!("http://127.0.0.1:{port}/ok.json") }]
+            } } }),
+        );
+        client.open("file:///c.json", "json", "{ \"c\": 1 }");
+        loop {
+            let diagnostics = client.diagnostics("file:///c.json");
+            if messages(&diagnostics) == [expected] {
+                break;
+            }
+            assert_eq!(messages(&diagnostics), [boolean_error]);
+        }
+        assert_eq!(client.exit(), 0);
+    };
+
+    session(boolean_error);
+    session(boolean_error);
+    *schema.lock().unwrap() = ("\"v2\"", string);
+    session(string_error);
+    session(string_error);
+    assert_eq!(
+        *requests.lock().unwrap(),
+        [
+            None,
+            Some("\"v1\"".to_owned()),
+            Some("\"v1\"".to_owned()),
+            Some("\"v2\"".to_owned())
+        ]
+    );
+    std::fs::remove_dir_all(&cache).unwrap();
+}
+
+/// `docs/experimental.md`: a configuration equal to the last one changes nothing
+/// and sends no refresh.
+#[test]
+fn equal_configuration() {
+    let capabilities = json!({ "textDocument": { "diagnostic": {} } });
+    let mut client = Client::start(capabilities, json!({}));
+    let settings =
+        |enable: bool| json!({ "settings": { "json": { "validate": { "enable": enable } } } });
+    client.notify("workspace/didChangeConfiguration", settings(true));
+    client.server_request("workspace/diagnostic/refresh");
+    client.notify("workspace/didChangeConfiguration", settings(true));
+    client.open("file:///a.json", "json", "{");
+    let document = json!({ "textDocument": { "uri": "file:///a.json" } });
+    let report = client.request("textDocument/diagnostic", document.clone());
+    assert_eq!(report["items"].as_array().unwrap().len(), 1);
+    client.notify("workspace/didChangeConfiguration", settings(false));
+    client.server_request("workspace/diagnostic/refresh");
+    let report = client.request("textDocument/diagnostic", document);
+    assert_eq!(report["items"], json!([]));
     assert_eq!(client.exit(), 0);
 }
 

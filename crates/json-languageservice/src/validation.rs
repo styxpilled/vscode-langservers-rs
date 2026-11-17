@@ -68,15 +68,28 @@ impl JsonValidation {
         if !self.validation_enabled {
             return Vec::new();
         }
-        let resolved = match schema {
-            Some(schema) => {
-                Some(service.resolve_inline_schema(schema, "schemaservice://untitled/"))
-            }
-            None => {
-                service.get_schema_for_resource(text_document.uri().as_str(), Some(json_document))
-            }
-        };
-        self.get_diagnostics(text_document, json_document, settings, resolved.as_deref())
+        let schema = schema.map(|s| service.register_inline_schema(s, "schemaservice://untitled/"));
+        service.run(|service| {
+            let resolved = match &schema {
+                Some(uri) => Some(service.resolve(uri)),
+                None => service
+                    .get_schema_for_resource(text_document.uri().as_str(), Some(json_document)),
+            };
+            self.get_diagnostics(text_document, json_document, settings, resolved.as_deref())
+        })
+    }
+
+    /// The diagnostics without a schema: syntax, comments and trailing commas.
+    pub fn do_syntax_validation(
+        &self,
+        text_document: &TextDocument,
+        json_document: &JsonDocument,
+        settings: Option<&DocumentLanguageSettings>,
+    ) -> Vec<Diagnostic> {
+        if !self.validation_enabled {
+            return Vec::new();
+        }
+        self.get_diagnostics(text_document, json_document, settings, None)
     }
 
     fn get_diagnostics(
@@ -147,19 +160,20 @@ impl JsonValidation {
             if let Some(error) = schema.errors.first() {
                 add_schema_problem(error);
             } else if let Some(severity) = schema_validation {
-                for warning in &schema.warnings {
-                    add_schema_problem(warning);
-                }
-                if let Some(errors) = json_document.validate(
+                let errors = json_document.validate(
                     text_document,
                     &schema.schemas,
                     schema.root,
                     severity,
                     settings.schema_draft,
                     schema.active_vocabularies.as_ref(),
-                ) {
-                    errors.into_iter().for_each(&mut add);
+                );
+                // Known only after the validation: it resolves the `$ref` that it uses.
+                let ref_errors = schema.schemas.errors();
+                for warning in schema.warnings.iter().chain(ref_errors.first()) {
+                    add_schema_problem(warning);
                 }
+                errors.into_iter().flatten().for_each(&mut add);
             }
             if allows(&schema.schemas, schema.root, &|s| s.allow_comments) == Some(true) {
                 comment_severity = None;

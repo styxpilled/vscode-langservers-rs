@@ -50,6 +50,9 @@ fn main() {
     let uri = url::Url::from_file_path(std::fs::canonicalize(&path).unwrap()).unwrap();
     let mut ls = LanguageService::new(LanguageServiceParams {
         schema_request_service: Some(Box::new(|uri| {
+            if !uri.starts_with("file:") {
+                return Ok("{}".to_owned());
+            }
             let path = url::Url::parse(uri).unwrap().to_file_path().unwrap();
             std::fs::read_to_string(path).map_err(|e| SchemaRequestError {
                 message: e.to_string(),

@@ -3,6 +3,7 @@
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, Sender, at, never, select};
@@ -29,7 +30,8 @@ use serde_json::{Value, json};
 use vscode_uri::resolve_relative_path;
 
 use crate::schema_request::{
-    FetchResult, HttpSettings, SchemaStore, Source, fetch_http, http_agent,
+    Cached, FetchResult, HttpResult, HttpSettings, SchemaStore, Source, cache_dir, fetch_http,
+    http_agent, write_cache,
 };
 use lsp_transport::{DEFAULT_COLOR_LIMIT, DEFAULT_RESULT_LIMIT, Writer};
 
@@ -94,6 +96,7 @@ struct Capabilities {
 enum Job {
     Request(Request),
     Validate(Uri),
+    Prefetch(Uri, bool),
 }
 
 /// An operation that waits for schema content.
@@ -120,19 +123,23 @@ pub struct Server {
     inbox: VecDeque<Message>,
     ls: LanguageService,
     store: SchemaStore,
-    fetched_tx: Sender<(String, FetchResult)>,
-    fetched_rx: Receiver<(String, FetchResult)>,
+    /// The bool is true for a schema that changed after the server used its cached copy.
+    fetched_tx: Sender<(String, FetchResult, bool)>,
+    fetched_rx: Receiver<(String, FetchResult, bool)>,
+    cache_dir: Option<PathBuf>,
     http: HttpSettings,
     agent: ureq::Agent,
     documents: HashMap<Uri, Document>,
     capabilities: Capabilities,
     settings: Settings,
+    last_settings: Option<Value>,
     formatter_registered: bool,
-    /// Set when schema content changes. The next schema use reloads all schemas, which
-    /// frees the old schema graph.
-    schemas_stale: bool,
     pending_validations: HashMap<Uri, Instant>,
     deferred: Vec<Deferred>,
+    /// Documents whose schema is loaded and compiled when no message waits. With the flag,
+    /// a refresh follows.
+    prefetch: VecDeque<(Uri, bool)>,
+    refresh_after_prefetch: bool,
     outgoing: HashMap<RequestId, Outgoing>,
     next_id: i32,
     shutdown: bool,
@@ -222,8 +229,35 @@ fn validate(
     if document.text().is_empty() {
         return Vec::new();
     }
+    ls.do_validation(
+        document,
+        json,
+        Some(&document_settings(settings, document)),
+        None,
+    )
+}
+
+fn validate_syntax(
+    ls: &LanguageService,
+    settings: &Settings,
+    document: &TextDocument,
+    json: &JsonDocument,
+) -> Vec<Diagnostic> {
+    if document.text().is_empty() {
+        return Vec::new();
+    }
+    // A schema can allow comments and trailing commas.
+    let settings = DocumentLanguageSettings {
+        comments: Some(SeverityLevel::Ignore),
+        trailing_commas: Some(SeverityLevel::Ignore),
+        ..document_settings(settings, document)
+    };
+    ls.do_syntax_validation(document, json, Some(&settings))
+}
+
+fn document_settings(settings: &Settings, document: &TextDocument) -> DocumentLanguageSettings {
     let jsonc = document.language_id() == "jsonc";
-    let document_settings = DocumentLanguageSettings {
+    DocumentLanguageSettings {
         comments: settings.comments.or(Some(if jsonc {
             SeverityLevel::Ignore
         } else {
@@ -237,8 +271,7 @@ fn validate(
         schema_validation: settings.schema_validation,
         schema_request: settings.schema_request,
         schema_draft: None,
-    };
-    ls.do_validation(document, json, Some(&document_settings), None)
+    }
 }
 
 impl Server {
@@ -252,7 +285,8 @@ impl Server {
         let caps = params.get("capabilities").unwrap_or(&empty);
         let handled_protocols = string_array(options.get("handledSchemaProtocols"))
             .unwrap_or_else(|| vec!["https".into(), "http".into(), "file".into()]);
-        let store = SchemaStore::new(&handled_protocols);
+        let cache_dir = cache_dir();
+        let store = SchemaStore::new(&handled_protocols, cache_dir.clone());
         let ls = LanguageService::new(LanguageServiceParams {
             schema_request_service: Some(store.request_service()),
             workspace_context: Some(Box::new(resolve_relative_path)),
@@ -328,6 +362,7 @@ impl Server {
             store,
             fetched_tx,
             fetched_rx,
+            cache_dir,
             agent: http_agent(&http),
             http,
             documents: HashMap::new(),
@@ -341,10 +376,12 @@ impl Server {
                 jsonc_color_limit: Some(DEFAULT_COLOR_LIMIT),
                 ..Default::default()
             },
+            last_settings: None,
             formatter_registered: false,
-            schemas_stale: false,
             pending_validations: HashMap::new(),
             deferred: Vec::new(),
+            prefetch: VecDeque::new(),
+            refresh_after_prefetch: false,
             outgoing: HashMap::new(),
             next_id: 0,
             shutdown: false,
@@ -358,6 +395,13 @@ impl Server {
             let message = match self.inbox.pop_front() {
                 Some(message) => message,
                 None => {
+                    if !self.prefetch.is_empty()
+                        && self.receiver.is_empty()
+                        && self.fetched_rx.is_empty()
+                    {
+                        self.prefetch_next();
+                        continue;
+                    }
                     let receiver = self.receiver.clone();
                     let fetched = self.fetched_rx.clone();
                     let timer = match self.pending_validations.values().min() {
@@ -370,8 +414,12 @@ impl Server {
                             Err(_) => return self.shutdown,
                         },
                         recv(fetched) -> result => {
-                            if let Ok((uri, result)) = result {
-                                self.on_fetched(uri, result);
+                            if let Ok((uri, result, changed)) = result {
+                                if changed {
+                                    self.on_changed(uri, result);
+                                } else {
+                                    self.on_fetched(uri, result);
+                                }
                             }
                             continue;
                         }
@@ -441,9 +489,6 @@ impl Server {
         &mut self,
         f: impl FnOnce(&mut Self) -> T,
     ) -> Result<Result<T, HashSet<String>>, String> {
-        if std::mem::take(&mut self.schemas_stale) {
-            self.ls.reload_schemas();
-        }
         self.store.begin();
         let result = catch_unwind(AssertUnwindSafe(|| f(self)));
         let (missing, to_start) = self.store.end();
@@ -463,13 +508,36 @@ impl Server {
 
     fn start_fetch(&mut self, uri: String, source: Source) {
         match source {
-            Source::Http => {
+            Source::Http(cached) => {
                 let agent = self.agent.clone();
                 let proxy = self.http.proxy.as_deref().is_some_and(|p| !p.is_empty());
                 let tx = self.fetched_tx.clone();
+                let cache = self.cache_dir.clone();
                 std::thread::spawn(move || {
-                    let result = fetch_http(&agent, &uri, proxy);
-                    let _ = tx.send((uri, result));
+                    let etag = cached.as_ref().map(|c| c.etag.as_str());
+                    let result = match fetch_http(&agent, &uri, proxy, etag) {
+                        HttpResult::Ok(content, etag) => {
+                            let fresh = Cached {
+                                etag: etag.unwrap_or_default(),
+                                content,
+                            };
+                            let same = cached.as_ref().is_some_and(|c| {
+                                c.content == fresh.content && c.etag == fresh.etag
+                            });
+                            if let Some(dir) = cache.as_deref().filter(|_| !same) {
+                                write_cache(dir, &uri, &fresh);
+                            }
+                            if cached.as_ref().is_some_and(|c| c.content == fresh.content) {
+                                return;
+                            }
+                            Ok(fresh.content)
+                        }
+                        // A cached copy stays in use when the check fails.
+                        _ if cached.is_some() => return,
+                        HttpResult::Fetched(result) => result,
+                        HttpResult::NotModified => unreachable!(),
+                    };
+                    let _ = tx.send((uri, result, cached.is_some()));
                 });
             }
             Source::Client => {
@@ -479,11 +547,17 @@ impl Server {
         }
     }
 
+    /// Content that replaces the cached copy, as with `json/schemaContent`.
+    fn on_changed(&mut self, uri: String, result: FetchResult) {
+        let reset = self.reset_schemas(&[&uri]);
+        self.store.loaded(uri, result);
+        if reset {
+            self.request_refresh();
+        }
+    }
+
     fn on_fetched(&mut self, uri: String, result: FetchResult) {
         self.store.loaded(uri.clone(), result);
-        // `reset_schema` would load the dependent schemas again into the graph and keep the
-        // old copies.
-        self.schemas_stale = true;
         let mut ready = Vec::new();
         for deferred in std::mem::take(&mut self.deferred) {
             let mut deferred = deferred;
@@ -498,7 +572,49 @@ impl Server {
             match job {
                 Job::Request(request) => self.dispatch(request),
                 Job::Validate(uri) => self.validate_and_publish(uri),
+                Job::Prefetch(uri, refresh) => self.queue_prefetch(uri, refresh),
             }
+        }
+    }
+
+    fn queue_prefetch(&mut self, uri: Uri, refresh: bool) {
+        match self.prefetch.iter_mut().find(|(u, _)| *u == uri) {
+            Some((_, r)) => *r |= refresh,
+            None => self.prefetch.push_back((uri, refresh)),
+        }
+    }
+
+    fn prefetch_all(&mut self) {
+        let uris: Vec<Uri> = self.documents.keys().cloned().collect();
+        for uri in uris {
+            self.queue_prefetch(uri, false);
+        }
+    }
+
+    /// Loads and compiles the schema of the next queued document.
+    fn prefetch_next(&mut self) {
+        let Some((uri, refresh)) = self.prefetch.pop_front() else {
+            return;
+        };
+        let result = self.with_schemas(|s| {
+            if let Some(document) = s.documents.get(&uri) {
+                s.ls.schema_service()
+                    .get_schema_for_resource(uri.as_str(), Some(document.json()));
+            }
+        });
+        match result {
+            Ok(Ok(())) => self.refresh_after_prefetch |= refresh,
+            Ok(Err(waiting)) => self.defer_prefetch(uri, refresh, waiting),
+            Err(message) => {
+                self.refresh_after_prefetch |= refresh;
+                self.log_error(&format!(
+                    "Error while loading the schema for {}: {message}",
+                    uri.as_str()
+                ));
+            }
+        }
+        if self.prefetch.is_empty() && std::mem::take(&mut self.refresh_after_prefetch) {
+            self.request_refresh();
         }
     }
 
@@ -640,6 +756,9 @@ impl Server {
         };
         match self.with_schemas(|s| f(s, params)) {
             Ok(Ok(result)) => self.writer.response(request.id, &result),
+            Ok(Err(waiting)) if request.method == "textDocument/diagnostic" => {
+                self.diagnostics_without_schema(request, waiting)
+            }
             Ok(Err(waiting)) => self.deferred.push(Deferred {
                 waiting,
                 job: Job::Request(request),
@@ -653,6 +772,48 @@ impl Server {
                 self.log_error(&format!("Error while {action} for {uri}: {message}"));
                 self.send(Response::new_ok(request.id, error_value));
             }
+        }
+    }
+
+    /// A pull does not wait for schema content: it gets the syntax diagnostics, and a refresh
+    /// follows when the schema is loaded and compiled.
+    fn diagnostics_without_schema(&mut self, request: Request, waiting: HashSet<String>) {
+        let uri = request
+            .params
+            .pointer("/textDocument/uri")
+            .and_then(Value::as_str)
+            .and_then(|u| u.parse::<Uri>().ok());
+        let items = match uri.as_ref().and_then(|u| self.documents.get(u)) {
+            Some(d) => validate_syntax(&self.ls, &self.settings, &d.text, d.json()),
+            None => Vec::new(),
+        };
+        let report = FullDiagnosticReport {
+            kind: "full",
+            items,
+        };
+        self.writer.response(request.id, &report);
+        if let Some(uri) = uri {
+            self.defer_prefetch(uri, true, waiting);
+        }
+    }
+
+    fn defer_prefetch(&mut self, uri: Uri, refresh: bool, waiting: HashSet<String>) {
+        let existing = self
+            .deferred
+            .iter_mut()
+            .find(|d| matches!(&d.job, Job::Prefetch(u, _) if *u == uri));
+        match existing {
+            Some(Deferred {
+                waiting: w,
+                job: Job::Prefetch(_, r),
+            }) => {
+                w.extend(waiting);
+                *r |= refresh;
+            }
+            _ => self.deferred.push(Deferred {
+                waiting,
+                job: Job::Prefetch(uri, refresh),
+            }),
         }
     }
 
@@ -676,6 +837,7 @@ impl Server {
                 let text =
                     TextDocument::new(item.uri.clone(), item.language_id, item.version, item.text);
                 self.documents.insert(item.uri.clone(), Document::new(text));
+                self.queue_prefetch(item.uri.clone(), false);
                 self.trigger_validation(item.uri);
             }
             "textDocument/didChange" => {
@@ -694,8 +856,10 @@ impl Server {
                 let p: DidCloseTextDocumentParams = serde_json::from_value(params)?;
                 let uri = p.text_document.uri;
                 self.documents.remove(&uri);
-                self.deferred
-                    .retain(|d| !matches!(&d.job, Job::Validate(u) if *u == uri));
+                self.deferred.retain(
+                    |d| !matches!(&d.job, Job::Validate(u) | Job::Prefetch(u, _) if *u == uri),
+                );
+                self.prefetch.retain(|(u, _)| *u != uri);
                 if !self.capabilities.pull_diagnostics {
                     self.pending_validations.remove(&uri);
                     self.publish(uri, Vec::new());
@@ -705,6 +869,7 @@ impl Server {
             "json/schemaAssociations" => {
                 self.settings.associations = Some(params);
                 self.update_configuration(Vec::new());
+                self.prefetch_all();
             }
             "json/schemaContent" => {
                 let uris = match params {
@@ -746,11 +911,17 @@ impl Server {
                 needs_revalidation = true;
             }
         }
-        self.schemas_stale |= needs_revalidation;
+        if needs_revalidation {
+            self.prefetch_all();
+        }
         needs_revalidation
     }
 
     fn on_configuration(&mut self, settings: &Value) {
+        if self.last_settings.as_ref() == Some(settings) {
+            return;
+        }
+        self.last_settings = Some(settings.clone());
         let http = HttpSettings {
             proxy: settings
                 .pointer("/http/proxy")
@@ -771,6 +942,7 @@ impl Server {
         self.settings.schema_request = severity(get("/validate/schemaRequest"));
         self.settings.keep_lines = truthy(get("/keepLines/enable"));
         self.update_configuration(Vec::new());
+        self.prefetch_all();
 
         let folding = self.capabilities.folding_range_limit;
         self.settings.result_limit = limit(get("/resultLimit"), Some(DEFAULT_RESULT_LIMIT));
