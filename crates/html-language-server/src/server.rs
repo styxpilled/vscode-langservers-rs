@@ -2,6 +2,7 @@
 //! `utils/validation.ts`, with the tag auto insertion of Zed's fork
 //! (`zed-industries/vscode`, branch `html-tags-as-workspace-edits`).
 
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
@@ -16,11 +17,12 @@ use css_languageservice::services::links::DocumentLink;
 use css_languageservice::services::navigation::ColorInformation;
 use html_languageservice::{HtmlDataProvider, LanguageService};
 use lsp_server::{ErrorCode, Message, Notification, Request, RequestId, Response};
-use lsp_transport::Writer;
+use lsp_transport::completion::{CompletionSupport, ResolveStore};
+use lsp_transport::{DEFAULT_RESULT_LIMIT, Writer};
 use lsp_types::{
     ClientCapabilities, Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, FoldingRange, Position, Range, SelectionRange, SymbolInformation,
-    TextDocumentIdentifier, TextEdit, Uri,
+    DidOpenTextDocumentParams, DocumentSymbolResponse, FoldingRange, Position, Range,
+    SelectionRange, TextDocumentIdentifier, TextEdit, Uri,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -29,7 +31,7 @@ use serde_json::{Value, json};
 use text_document::TextDocument;
 
 use crate::context::WorkspaceContext;
-use crate::modes::{Document, LanguageModes, Mode};
+use crate::modes::{Completions, Document, LanguageModes, Mode};
 
 const VALIDATION_DELAY: Duration = Duration::from_millis(500);
 
@@ -124,6 +126,8 @@ struct Capabilities {
     folding_range_limit: Option<usize>,
     formatter_edit_limit: Option<usize>,
     pull_diagnostics: bool,
+    hierarchical_document_symbols: bool,
+    completion: CompletionSupport,
 }
 
 /// The paths of a `fetchHTMLDataProviders` call and their providers.
@@ -139,6 +143,7 @@ pub struct Server {
     capabilities: Capabilities,
     workspace_folders: Vec<String>,
     modes: LanguageModes,
+    resolve: RefCell<ResolveStore>,
     /// `globalSettings`: the `settings` of the last
     /// `workspace/didChangeConfiguration`, `{}` before.
     global: Value,
@@ -291,11 +296,17 @@ impl Server {
                 caps,
                 "workspace.workspaceEdit.snippetEditSupport",
             )),
-            folding_range_limit: limit(capability(caps, "textDocument.foldingRange.rangeLimit")),
+            folding_range_limit: limit(capability(caps, "textDocument.foldingRange.rangeLimit"))
+                .or(Some(DEFAULT_RESULT_LIMIT)),
             formatter_edit_limit: limit(
                 options.pointer("/customCapabilities/rangeFormatting/editLimit"),
             ),
             pull_diagnostics: capability(caps, "textDocument.diagnostic").is_some(),
+            completion: CompletionSupport::from_capabilities(caps),
+            hierarchical_document_symbols: capability(
+                caps,
+                "textDocument.documentSymbol.hierarchicalDocumentSymbolSupport",
+            ) == Some(&Value::Bool(true)),
         };
         let provide_formatter = provide_formatter == Some(&Value::Bool(true));
         let mut result = json!({
@@ -343,6 +354,7 @@ impl Server {
             capabilities,
             workspace_folders,
             modes,
+            resolve: RefCell::default(),
             global: json!({}),
             documents: HashMap::new(),
             document_settings: HashMap::new(),
@@ -1165,8 +1177,23 @@ impl Server {
         };
         let settings = scoped.unwrap_or(&self.global);
         let context = self.context(document);
-        self.modes
-            .complete(mode, document, position, &context, Some(settings))
+        match self
+            .modes
+            .complete(mode, document, position, &context, Some(settings))?
+        {
+            Completions::List {
+                is_incomplete,
+                items,
+                edit_range,
+            } => raw(&self.resolve.borrow_mut().compact(
+                self.capabilities.completion,
+                is_incomplete,
+                items,
+                edit_range,
+            )),
+            #[cfg(feature = "javascript")]
+            Completions::Raw(list) => Ok(list),
+        }
     }
 
     fn hover(
@@ -1184,7 +1211,11 @@ impl Server {
 
     /// `onCompletionResolve`: an error gives the item.
     fn resolve(&mut self, request: Request) {
-        let item = request.params;
+        let mut item = request.params;
+        if item.get("data").is_some_and(Value::is_array) {
+            self.resolve.borrow().resolve(&mut item);
+            return self.send(Response::new_ok(request.id, item));
+        }
         let data = item.get("data").filter(|d| {
             d.get("languageId").is_some_and(Value::is_string)
                 && d.get("uri").is_some_and(Value::is_string)
@@ -1303,15 +1334,24 @@ impl Server {
         Ok(links)
     }
 
-    fn document_symbols(&mut self, p: DocumentParams) -> Result<Vec<SymbolInformation>, String> {
+    fn document_symbols(&mut self, p: DocumentParams) -> Result<DocumentSymbolResponse, String> {
         let Some(document) = self.document(&p.text_document.uri) else {
-            return Ok(Vec::new());
+            return Ok(DocumentSymbolResponse::Flat(Vec::new()));
         };
+        let modes = self.modes.modes_in_document(&document);
+        if self.capabilities.hierarchical_document_symbols {
+            let mut symbols = Vec::new();
+            for mode in modes {
+                symbols.extend(self.modes.document_symbols_nested(mode, &document)?);
+            }
+            lsp_transport::cap_symbol_depth(&mut symbols);
+            return Ok(DocumentSymbolResponse::Nested(symbols));
+        }
         let mut symbols = Vec::new();
-        for mode in self.modes.modes_in_document(&document) {
+        for mode in modes {
             symbols.extend(self.modes.document_symbols(mode, &document)?);
         }
-        Ok(symbols)
+        Ok(DocumentSymbolResponse::Flat(symbols))
     }
 
     fn document_colors(&mut self, p: DocumentParams) -> Result<Vec<ColorInformation>, String> {

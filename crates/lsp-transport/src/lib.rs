@@ -8,8 +8,11 @@ use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use lsp_server::{ErrorCode, Message, RequestId, Response};
+use lsp_types::DocumentSymbol;
 use serde::Serialize;
 use serde_json::Value;
+
+pub mod completion;
 
 #[derive(Clone)]
 pub struct Writer(Sender<Vec<u8>>);
@@ -145,4 +148,102 @@ pub fn initialize_start(
         }
     }
     None
+}
+
+/// Limit of symbols and folding ranges when the client gives none, as the
+/// VS Code defaults (`json.maxItemsComputed`, `editor.foldingMaximumRegions`).
+pub const DEFAULT_RESULT_LIMIT: usize = 5000;
+
+/// Limit of colors when the client gives none (`editor.colorDecoratorsLimit`).
+pub const DEFAULT_COLOR_LIMIT: usize = 500;
+
+/// Deepest level of a nested symbol. A client with the default `serde_json`
+/// recursion limit (128) cannot read a response with symbols 62 levels deep.
+pub const MAX_SYMBOL_DEPTH: usize = 50;
+
+/// Moves the symbols below `MAX_SYMBOL_DEPTH` into the children of their
+/// ancestor at that depth, in document order.
+pub fn cap_symbol_depth(symbols: &mut [DocumentSymbol]) {
+    fn cap(symbols: &mut [DocumentSymbol], depth: usize) {
+        for symbol in symbols {
+            let Some(children) = &mut symbol.children else {
+                continue;
+            };
+            if depth + 1 < MAX_SYMBOL_DEPTH {
+                cap(children, depth + 1);
+            } else if children.iter().any(|c| c.children.is_some()) {
+                let mut flat = Vec::new();
+                let mut stack: Vec<_> = std::mem::take(children).into_iter().rev().collect();
+                while let Some(mut s) = stack.pop() {
+                    stack.extend(s.children.take().into_iter().flatten().rev());
+                    flat.push(s);
+                }
+                *children = flat;
+            }
+        }
+    }
+    cap(symbols, 1);
+}
+
+#[cfg(test)]
+mod tests {
+    use lsp_types::{Range, SymbolKind};
+
+    use super::*;
+
+    fn symbol(name: String, children: Option<Vec<DocumentSymbol>>) -> DocumentSymbol {
+        #[allow(deprecated)]
+        DocumentSymbol {
+            name,
+            detail: None,
+            kind: SymbolKind::FIELD,
+            tags: None,
+            deprecated: None,
+            range: Range::default(),
+            selection_range: Range::default(),
+            children,
+        }
+    }
+
+    fn depth(symbols: &[DocumentSymbol]) -> usize {
+        symbols
+            .iter()
+            .map(|s| 1 + s.children.as_deref().map_or(0, depth))
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn names(symbols: &[DocumentSymbol], out: &mut Vec<String>) {
+        for s in symbols {
+            out.push(s.name.clone());
+            names(s.children.as_deref().unwrap_or_default(), out);
+        }
+    }
+
+    #[test]
+    fn symbol_depth() {
+        // A chain of 100 symbols, each with a leaf sibling after its child.
+        let mut chain = None;
+        for i in (0..100).rev() {
+            let leaf = symbol(format!("leaf{i}"), None);
+            let children = match chain {
+                Some(c) => vec![c, leaf],
+                None => vec![leaf],
+            };
+            chain = Some(symbol(i.to_string(), Some(children)));
+        }
+        let mut symbols = vec![chain.unwrap()];
+        let mut before = Vec::new();
+        names(&symbols, &mut before);
+        cap_symbol_depth(&mut symbols);
+        let mut after = Vec::new();
+        names(&symbols, &mut after);
+        assert_eq!(depth(&symbols), MAX_SYMBOL_DEPTH);
+        assert_eq!(before, after);
+
+        let mut shallow = symbols[0].children.clone().unwrap();
+        let copy = shallow.clone();
+        cap_symbol_depth(&mut shallow);
+        assert_eq!(shallow, copy);
+    }
 }

@@ -463,7 +463,7 @@ fn completions(value: &str, uri: &str, folders: Option<&[String]>) -> (String, V
     let list = modes
         .complete(mode, &document, position, &context, Some(&settings))
         .unwrap();
-    let list: Value = serde_json::from_str(list.get()).unwrap();
+    let list = list.into_value();
     (value, list["items"].as_array().unwrap().clone())
 }
 
@@ -1694,7 +1694,7 @@ constructor Greeter(name: any): Greeter
         let list = modes()
             .complete(JS, &document, position, &context, None)
             .unwrap();
-        let list: Value = serde_json::from_str(list.get()).unwrap();
+        let list = list.into_value();
         let labels: Vec<_> = list["items"]
             .as_array()
             .unwrap()

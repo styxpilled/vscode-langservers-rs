@@ -53,12 +53,61 @@ Upstream parsers and tree walks are recursive. Node throws `RangeError` at about
   grows as the square of the depth (indentation), as upstream. `tests/stdio.rs`
   of each server (`deep_nesting`), `jsonc` `nesting_limit`, HTML
   `nesting_limit`.
+- Nested symbols (`documentSymbol` as `DocumentSymbol`, all three servers):
+  a client that reads JSON with the default `serde_json` recursion limit (128
+  levels) cannot read a response with symbols 62 levels deep, and loses the
+  full response. The symbols below `lsp_transport::MAX_SYMBOL_DEPTH` (50)
+  become children of their ancestor at that depth, in document order. No
+  symbol is lost. `lsp-transport` `symbol_depth`; `tests/stdio.rs` of each
+  server.
 - Not limited: the JavaScript mode (tsrs, one more document). No overflow up to
   6000 levels, but its time grows as the cube of the depth (3000 levels: 1.9 s,
   6000: 14.5 s, 12000: more than 60 s).
 - Clients: `serde_json` reads 128 levels by default, so the test clients cannot
   read a nested result (hierarchical symbols, selection ranges) deeper than
   that. Upstream gives the same results. Not checked in Zed.
+
+## Result limits
+
+Upstream servers limit results only when the client gives a limit. The VS Code
+client gives 5000 symbols (`json.maxItemsComputed`), 5000 folding ranges
+(`editor.foldingMaximumRegions`) and 500 colors (`editor.colorDecoratorsLimit`).
+Zed gives none. The branch uses these values when the client gives none
+(`lsp_transport::DEFAULT_RESULT_LIMIT`, `DEFAULT_COLOR_LIMIT`): folding ranges
+in all three servers; symbols and colors in the JSON server, as only its
+upstream has these settings. Zed shows no notice when a result is cut.
+`tests/stdio.rs` of each server (`default_limits`, `default_folding_limit`).
+Effect on `perf.jsonl` (33 MB): JSON `documentSymbol` 2540 ms against 35 ms,
+`foldingRange` 91 ms against 55 ms, peak memory 636 MB against 315 MB.
+
+## Completion lists
+
+Upstream sends each completion item complete: `textEdit` with the range,
+`insertTextFormat`, `documentation` and the retrigger `command`. A CSS property
+list is about 400 KB, and 73% of it is documentation. When the client declares
+support (`completionList.itemDefaults`, `completionItem.resolveSupport`), the
+CSS and HTML servers send smaller lists (`lsp_transport::completion`):
+
+- `itemDefaults.editRange`: the range of the service (CSS), or the most
+  common item range (HTML). An item with this range has `textEditText` in place
+  of `textEdit`, and no text when the text is the label.
+- `itemDefaults.insertTextFormat`: snippet when most items are snippets; the
+  other items give their format.
+- `documentation`, `detail` and `command` come with `completionItem/resolve`.
+  The server keeps them for the last list; `data` is `[generation, index]`. A
+  resolve for an older list gives the item unchanged. Zed resolves the selected
+  and the visible items. Zed does not run the retrigger command (it runs only
+  the commands of `executeCommandProvider`).
+- Empty `tags` are left out.
+
+Script items (JavaScript mode) do not change. `lsp-transport` tests,
+`tests/stdio.rs` (`compact_completion`) of both servers. Effect on the Zed
+sessions: CSS 96 completions 38.2 MB against 4.2 MB (average 398 KB against 44
+KB, largest 1157 KB against 119 KB), 317 ms against 101 ms in `lsp-replay`;
+HTML 121 completions 2.40 MB against 0.13 MB.
+
+Not done: serialization of constant item lists once. A CSS completion now takes
+about 1 ms with the transfer.
 
 ## CSS parse time
 
@@ -239,6 +288,17 @@ The HTML server uses the same helpers for its formatter settings.
 
 ## HTML server
 
+- Document symbols. Upstream always sends `SymbolInformation`, each with its
+  own `Uri`. When the client has `hierarchicalDocumentSymbolSupport` (Zed has
+  it), the branch sends `DocumentSymbol`: the HTML tree
+  (`findDocumentSymbols2`), the CSS tree (the virtual `__` rule of a style
+  attribute is replaced by its children), and the script symbols without
+  children. The modes come in the same order as before. `tests/stdio.rs`
+  (`hierarchical_symbols`). Effect on `large.html` (`html-symbols.jsonl`):
+  response 13.9 MB against 16.4 MB, server time (symbols and serialization) 36
+  to 40 ms against 40 to 48 ms. The round trip in `lsp-replay` is longer (230
+  to 280 ms against 195 to 245 ms): the client parses the nested JSON more
+  slowly. Not measured in Zed.
 - Failed settings requests. As in the CSS server: upstream caches a rejected
   `workspace/configuration` request (or a `null` result) until the next
   `didChangeConfiguration`, and completion, hover, formatting and diagnostics

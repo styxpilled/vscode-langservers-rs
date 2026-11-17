@@ -1,6 +1,6 @@
 //! Port of `cssServer.ts`, `customData.ts`, `utils/runner.ts` and `utils/validation.ts`.
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
@@ -12,7 +12,7 @@ use css_languageservice::language_facts::CssDataManager;
 use css_languageservice::language_facts::colors::Color;
 use css_languageservice::parser::{Dialect, Stylesheet, parse_stylesheet};
 use css_languageservice::services::code_actions::do_code_actions2;
-use css_languageservice::services::completion::{Completion, CompletionList};
+use css_languageservice::services::completion::Completion;
 use css_languageservice::services::folding::get_folding_ranges;
 use css_languageservice::services::formatter::format;
 use css_languageservice::services::hover::do_hover;
@@ -24,7 +24,8 @@ use css_languageservice::services::navigation::{
 use css_languageservice::services::selection_range::get_selection_ranges;
 use css_languageservice::services::validation::do_validation;
 use lsp_server::{ErrorCode, Message, Notification, Request, RequestId, Response};
-use lsp_transport::Writer;
+use lsp_transport::completion::{CompactList, CompletionSupport, ResolveStore};
+use lsp_transport::{DEFAULT_RESULT_LIMIT, Writer};
 use lsp_types::{
     CodeAction, CodeActionParams, ColorPresentation, CompletionParams, Diagnostic,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
@@ -104,6 +105,7 @@ struct Capabilities {
     pull_diagnostics: bool,
     hover_markdown: bool,
     completion_markdown: bool,
+    completion: CompletionSupport,
 }
 
 pub struct Server {
@@ -114,6 +116,7 @@ pub struct Server {
     workspace_folders: Vec<String>,
     request_service: RequestService,
     data: CssDataManager,
+    resolve: RefCell<ResolveStore>,
     /// The `settings` of the last `workspace/didChangeConfiguration`. The language services
     /// read their `configure` settings from it.
     configured: Value,
@@ -199,7 +202,8 @@ impl Server {
         ));
         let capabilities = Capabilities {
             scoped_settings: truthy(capability(caps, "workspace.configuration")),
-            folding_range_limit: limit(capability(caps, "textDocument.foldingRange.rangeLimit")),
+            folding_range_limit: limit(capability(caps, "textDocument.foldingRange.rangeLimit"))
+                .or(Some(DEFAULT_RESULT_LIMIT)),
             formatter_edit_limit: limit(
                 options.pointer("/customCapabilities/rangeFormatting/editLimit"),
             ),
@@ -209,6 +213,7 @@ impl Server {
                 caps,
                 "textDocument.completion.completionItem.documentationFormat",
             )),
+            completion: CompletionSupport::from_capabilities(caps),
         };
         let provide_formatter = options.get("provideFormatter") == Some(&Value::Bool(true));
         let mut result = json!({
@@ -240,7 +245,7 @@ impl Server {
         });
         if snippet_support {
             result["capabilities"]["completionProvider"] = json!({
-                "resolveProvider": false,
+                "resolveProvider": capabilities.completion.resolves(),
                 "triggerCharacters": ["/", "-", ":"]
             });
         }
@@ -252,6 +257,7 @@ impl Server {
             workspace_folders,
             request_service: RequestService { handled_schemas },
             data: CssDataManager::new(true, &[]),
+            resolve: RefCell::default(),
             configured: Value::Null,
             documents: HashMap::new(),
             document_settings: HashMap::new(),
@@ -456,6 +462,11 @@ impl Server {
         let empty = || json!([]);
         match request.method.as_str() {
             "textDocument/completion" | "textDocument/hover" => self.needs_settings(request),
+            "completionItem/resolve" => {
+                let mut item = request.params;
+                self.resolve.borrow().resolve(&mut item);
+                self.send(Response::new_ok(request.id, item));
+            }
             "textDocument/diagnostic" if self.capabilities.pull_diagnostics => {
                 self.needs_settings(request)
             }
@@ -818,7 +829,7 @@ impl Server {
         p: CompletionParams,
         document: &Document,
         scoped: Option<&Value>,
-    ) -> Option<CompletionList> {
+    ) -> Option<CompactList> {
         let settings = get(scoped, "completion")
             .or_else(|| get(self.configured(&document.text), "completion"));
         let stylesheet = self.stylesheet(document);
@@ -831,7 +842,7 @@ impl Server {
             data: &self.data,
             markdown: self.capabilities.completion_markdown,
         };
-        completion.do_complete2(
+        let list = completion.do_complete2(
             &document.text,
             p.text_document_position.position,
             stylesheet,
@@ -839,7 +850,13 @@ impl Server {
             Some(&self.request_service),
             completion_settings(settings).as_ref(),
             &mut [],
-        )
+        )?;
+        Some(self.resolve.borrow_mut().compact(
+            self.capabilities.completion,
+            list.is_incomplete,
+            list.items,
+            list.item_defaults.map(|d| d.edit_range),
+        ))
     }
 
     fn hover(&self, p: HoverParams, document: &Document, scoped: Option<&Value>) -> Option<Hover> {
@@ -862,10 +879,9 @@ impl Server {
             return Ok(Vec::new());
         };
         self.dialect(&document.text);
-        Ok(find_document_symbols(
-            &document.text,
-            self.stylesheet(&document),
-        ))
+        let mut symbols = find_document_symbols(&document.text, self.stylesheet(&document));
+        lsp_transport::cap_symbol_depth(&mut symbols);
+        Ok(symbols)
     }
 
     fn definition(&mut self, p: GotoDefinitionParams) -> Result<Option<Location>, String> {

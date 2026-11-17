@@ -21,11 +21,12 @@ use html_languageservice::services::{
 };
 use html_languageservice::{HtmlDocument, LanguageService};
 use lsp_types::{
-    ColorPresentation, Diagnostic, DocumentHighlight, FoldingRange, Hover, Location, Position,
-    Range, SelectionRange, SymbolInformation, TextEdit, WorkspaceEdit,
+    ColorPresentation, CompletionItem, Diagnostic, DocumentHighlight, DocumentSymbol, FoldingRange,
+    Hover, Location, Position, Range, SelectionRange, SymbolInformation, TextEdit, WorkspaceEdit,
 };
 use serde_json::Value;
-use serde_json::value::{RawValue, to_raw_value};
+#[cfg(feature = "javascript")]
+use serde_json::value::RawValue;
 use text_document::TextDocument;
 
 use crate::context::WorkspaceContext;
@@ -35,6 +36,40 @@ use crate::javascript::{Script, Scripts};
 use crate::settings::{
     completion_configuration, format_configuration, format_settings, hover_settings,
 };
+
+pub enum Completions {
+    List {
+        is_incomplete: bool,
+        items: Vec<CompletionItem>,
+        /// The `itemDefaults.editRange` of the service.
+        edit_range: Option<Range>,
+    },
+    /// The script modes, whose items resolve through the script service.
+    #[cfg(feature = "javascript")]
+    Raw(Box<RawValue>),
+}
+
+#[cfg(test)]
+impl Completions {
+    /// The list as upstream sends it.
+    pub fn into_value(self) -> Value {
+        match self {
+            Completions::List {
+                is_incomplete,
+                items,
+                edit_range,
+            } => {
+                let mut list = serde_json::json!({ "isIncomplete": is_incomplete, "items": items });
+                if let Some(range) = edit_range {
+                    list["itemDefaults"] = serde_json::json!({ "editRange": range });
+                }
+                list
+            }
+            #[cfg(feature = "javascript")]
+            Completions::Raw(list) => serde_json::from_str(list.get()).unwrap(),
+        }
+    }
+}
 
 /// An open document with the models that `LanguageModelCache` keeps.
 pub struct Document {
@@ -258,7 +293,7 @@ impl LanguageModes {
         position: Position,
         context: &WorkspaceContext,
         settings: Settings,
-    ) -> Result<Box<RawValue>, String> {
+    ) -> Result<Completions, String> {
         let list = match mode {
             Mode::Html => {
                 let options = completion_configuration(get(settings, "html"), true);
@@ -271,7 +306,11 @@ impl LanguageModes {
                     Some(&options),
                     &mut [],
                 );
-                Some(to_raw_value(&list).unwrap())
+                Some(Completions::List {
+                    is_incomplete: list.is_incomplete,
+                    items: list.items,
+                    edit_range: None,
+                })
             }
             Mode::Css => {
                 let (embedded, stylesheet) = document.css();
@@ -290,12 +329,18 @@ impl LanguageModes {
                         completion_settings(get(get(settings, "css"), "completion")).as_ref(),
                         &mut [],
                     )
-                    .map(|list| to_raw_value(&list).unwrap())
+                    .map(|list| Completions::List {
+                        is_incomplete: list.is_incomplete,
+                        items: list.items,
+                        edit_range: list.item_defaults.map(|d| d.edit_range),
+                    })
             }
             #[cfg(feature = "javascript")]
             Mode::Script(script) => {
                 let (mode, js) = self.script(script, document);
-                return mode.complete(js, document.text.uri().as_str(), position);
+                return mode
+                    .complete(js, document.text.uri().as_str(), position)
+                    .map(Completions::Raw);
             }
         };
         list.ok_or_else(|| "Range.create rejects a negative character".to_owned())
@@ -444,6 +489,50 @@ impl LanguageModes {
                 let symbols = mode.document_symbols(js, document.text.uri().as_str())?;
                 from_json(Value::Array(symbols))?
             }
+        })
+    }
+
+    pub fn document_symbols_nested(
+        &self,
+        mode: Mode,
+        document: &Document,
+    ) -> Result<Vec<DocumentSymbol>, String> {
+        Ok(match mode {
+            Mode::Html => html_navigation::find_document_symbols2(
+                &document.text,
+                self.html_document(document),
+            ),
+            Mode::Css => {
+                let (embedded, stylesheet) = document.css();
+                navigation::find_document_symbols(embedded, stylesheet)
+                    .into_iter()
+                    .flat_map(|s| {
+                        if s.name == CSS_STYLE_RULE {
+                            s.children.unwrap_or_default()
+                        } else {
+                            vec![s]
+                        }
+                    })
+                    .collect()
+            }
+            #[cfg(feature = "javascript")]
+            Mode::Script(_) => self
+                .document_symbols(mode, document)?
+                .into_iter()
+                .map(|s| {
+                    #[allow(deprecated)]
+                    DocumentSymbol {
+                        name: s.name,
+                        detail: None,
+                        kind: s.kind,
+                        tags: s.tags,
+                        deprecated: None,
+                        range: s.location.range,
+                        selection_range: s.location.range,
+                        children: None,
+                    }
+                })
+                .collect(),
         })
     }
 

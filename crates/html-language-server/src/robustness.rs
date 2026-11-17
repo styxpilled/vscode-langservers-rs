@@ -109,7 +109,7 @@ fn run_all(modes: &LanguageModes, text: &str) {
         if (i % 3 == 0 || mode == Mode::Html)
             && let Ok(list) = modes.complete(mode, &document, position, &context, settings)
         {
-            let list: serde_json::Value = serde_json::from_str(list.get()).unwrap();
+            let list = list.into_value();
             if let Some(item) = list["items"].get(0) {
                 let _ = modes.resolve(&document, item.clone());
             }

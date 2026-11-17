@@ -142,6 +142,55 @@ fn scoped_settings() {
     assert_eq!(client.exit(), 0);
 }
 
+/// `docs/experimental.md`: `DocumentSymbol` when the client supports it. A style
+/// attribute gives no `__` symbol.
+#[test]
+fn hierarchical_symbols() {
+    let capabilities = json!({
+        "textDocument": { "documentSymbol": { "hierarchicalDocumentSymbolSupport": true } }
+    });
+    let mut client = Client::start(capabilities);
+    let text = "<div><p style=\"color: red\"></p></div><style>.a { .b {} }</style>";
+    client.notify(
+        "textDocument/didOpen",
+        json!({ "textDocument": { "uri": URI, "languageId": "html", "version": 1, "text": text } }),
+    );
+    let document = json!({ "textDocument": { "uri": URI } });
+    let symbols = client.request("textDocument/documentSymbol", document.clone());
+    let names = |symbols: &Value| -> Vec<String> {
+        symbols
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(names(&symbols), [".a", "div", "style"]);
+    assert_eq!(names(&symbols[0]["children"]), [".b"]);
+    assert_eq!(names(&symbols[1]["children"]), ["p"]);
+    assert!(symbols[0].get("location").is_none());
+
+    // The client reads at most 128 levels of JSON.
+    let text = "<div>".repeat(200);
+    client.notify(
+        "textDocument/didChange",
+        json!({ "textDocument": { "uri": URI, "version": 2 }, "contentChanges": [{ "text": text }] }),
+    );
+    let symbols = client.request("textDocument/documentSymbol", document);
+    assert_eq!(symbol_tree(&symbols), (50, 200));
+    assert_eq!(client.exit(), 0);
+}
+
+/// Depth and count of nested symbols.
+fn symbol_tree(symbols: &Value) -> (usize, usize) {
+    symbols.as_array().map_or((0, 0), |symbols| {
+        symbols.iter().fold((0, 0), |(depth, count), s| {
+            let (d, c) = symbol_tree(&s["children"]);
+            (depth.max(d + 1), count + c + 1)
+        })
+    })
+}
+
 /// `docs/experimental.md`: at `MAX_DEPTH`, a start tag closes the deepest open
 /// element, so deep nesting does not overflow the stack.
 #[test]
@@ -156,5 +205,63 @@ fn deep_nesting() {
     let document = json!({ "textDocument": { "uri": URI } });
     let symbols = client.request("textDocument/documentSymbol", document);
     assert_eq!(symbols.as_array().unwrap().len(), depth);
+    assert_eq!(client.exit(), 0);
+}
+
+/// `docs/experimental.md`: without `rangeLimit`, at most 5000 folding ranges.
+#[test]
+fn default_folding_limit() {
+    let mut client = Client::start(json!({}));
+    let text = "<div>\n<p></p>\n</div>\n".repeat(6000);
+    client.notify(
+        "textDocument/didOpen",
+        json!({ "textDocument": { "uri": URI, "languageId": "html", "version": 1, "text": text } }),
+    );
+    let ranges = client.request(
+        "textDocument/foldingRange",
+        json!({ "textDocument": { "uri": URI } }),
+    );
+    assert_eq!(ranges.as_array().unwrap().len(), 5000);
+    assert_eq!(client.exit(), 0);
+}
+
+/// `docs/experimental.md`: with `itemDefaults` and resolve, the items have no
+/// range or documentation; resolve adds the documentation.
+#[test]
+fn compact_completion() {
+    let capabilities = json!({ "textDocument": { "completion": {
+        "completionItem": {
+            "snippetSupport": true,
+            "documentationFormat": ["markdown", "plaintext"],
+            "resolveSupport": { "properties": ["additionalTextEdits", "command", "detail", "documentation"] }
+        },
+        "completionList": { "itemDefaults": ["commitCharacters", "editRange", "insertTextMode", "insertTextFormat", "data"] }
+    } } });
+    let mut client = Client::start(capabilities);
+    client.notify(
+        "textDocument/didOpen",
+        json!({ "textDocument": { "uri": URI, "languageId": "html", "version": 1, "text": "<di" } }),
+    );
+    let list = client.request(
+        "textDocument/completion",
+        json!({ "textDocument": { "uri": URI }, "position": { "line": 0, "character": 3 } }),
+    );
+    let range =
+        json!({ "start": { "line": 0, "character": 1 }, "end": { "line": 0, "character": 3 } });
+    assert_eq!(list["itemDefaults"]["editRange"], range);
+    let div = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["label"] == "div")
+        .unwrap();
+    assert!(div.get("textEdit").is_none() && div.get("documentation").is_none());
+    let resolved = client.request("completionItem/resolve", div.clone());
+    assert!(
+        resolved["documentation"]["value"]
+            .as_str()
+            .unwrap()
+            .contains("div")
+    );
     assert_eq!(client.exit(), 0);
 }

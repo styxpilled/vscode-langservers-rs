@@ -446,10 +446,93 @@ fn deep_nesting() {
     let interpolation = format!("a{{b:{}", "#{".repeat(40));
     diagnostics(&mut client, "file:///i.scss", "scss", &interpolation);
 
+    let rules = "a{".repeat(200);
+    client.open("file:///rules.css", "css", &rules);
+    let symbols = client.request(
+        "textDocument/documentSymbol",
+        text_document("file:///rules.css"),
+    );
+    assert_eq!(symbol_tree(&symbols), (50, 200));
+
     let selector = "a ".repeat(3000) + "{}";
     client.open("file:///selector.css", "css", &selector);
     let hover = client.request("textDocument/hover", at("file:///selector.css", 0, 1));
     let html = hover["contents"][0].as_str().unwrap();
     assert_eq!(html.lines().count(), 1001);
+    assert_eq!(client.exit(), 0);
+}
+
+/// Depth and count of nested symbols.
+fn symbol_tree(symbols: &Value) -> (usize, usize) {
+    symbols.as_array().map_or((0, 0), |symbols| {
+        symbols.iter().fold((0, 0), |(depth, count), s| {
+            let (d, c) = symbol_tree(&s["children"]);
+            (depth.max(d + 1), count + c + 1)
+        })
+    })
+}
+
+/// `docs/experimental.md`: without `rangeLimit`, at most 5000 folding ranges.
+#[test]
+fn default_folding_limit() {
+    let (mut client, _) = Client::start(json!({}), json!({}));
+    client.open("file:///a.css", "css", &"a {\nb: c;\n}\n".repeat(6000));
+    let ranges = client.request("textDocument/foldingRange", text_document("file:///a.css"));
+    assert_eq!(ranges.as_array().unwrap().len(), 5000);
+    assert_eq!(client.exit(), 0);
+}
+
+/// Completion capabilities of Zed.
+fn zed_completion() -> Value {
+    json!({ "textDocument": { "completion": {
+        "completionItem": {
+            "snippetSupport": true,
+            "documentationFormat": ["markdown", "plaintext"],
+            "resolveSupport": { "properties": ["additionalTextEdits", "command", "detail", "documentation"] }
+        },
+        "completionList": { "itemDefaults": ["commitCharacters", "editRange", "insertTextMode", "insertTextFormat", "data"] }
+    } } })
+}
+
+/// `docs/experimental.md`: with `itemDefaults` and resolve, the items have no
+/// range, documentation or command; resolve adds them.
+#[test]
+fn compact_completion() {
+    let (mut client, init) = Client::start(zed_completion(), json!({}));
+    assert_eq!(
+        init["capabilities"]["completionProvider"]["resolveProvider"],
+        true
+    );
+    client.open("file:///a.css", "css", "a { colo }");
+    let list = client.request("textDocument/completion", at("file:///a.css", 0, 8));
+    let range =
+        json!({ "start": { "line": 0, "character": 4 }, "end": { "line": 0, "character": 8 } });
+    assert_eq!(
+        list["itemDefaults"],
+        json!({ "editRange": range, "insertTextFormat": 2 })
+    );
+    let items = list["items"].as_array().unwrap();
+    let color = items.iter().find(|i| i["label"] == "color").unwrap();
+    assert_eq!(color["textEditText"], "color: $0;");
+    for key in [
+        "textEdit",
+        "documentation",
+        "command",
+        "insertTextFormat",
+        "tags",
+    ] {
+        assert!(color.get(key).is_none(), "{key}");
+    }
+    let resolved = client.request("completionItem/resolve", color.clone());
+    assert!(
+        resolved["documentation"]["value"]
+            .as_str()
+            .unwrap()
+            .contains("color")
+    );
+    assert_eq!(
+        resolved["command"]["command"],
+        "editor.action.triggerSuggest"
+    );
     assert_eq!(client.exit(), 0);
 }

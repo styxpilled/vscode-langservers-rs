@@ -31,7 +31,7 @@ use vscode_uri::resolve_relative_path;
 use crate::schema_request::{
     FetchResult, HttpSettings, SchemaStore, Source, fetch_http, http_agent,
 };
-use lsp_transport::Writer;
+use lsp_transport::{DEFAULT_COLOR_LIMIT, DEFAULT_RESULT_LIMIT, Writer};
 
 /// `ColorPresentationParams` with the `f64` `Color`: Zed sends `f32` values as
 /// text, and Node reads them as doubles.
@@ -276,7 +276,7 @@ impl Server {
             )),
             folding_range_limit: limit(
                 capability(caps, "textDocument.foldingRange.rangeLimit"),
-                None,
+                Some(DEFAULT_RESULT_LIMIT),
             ),
             // VS Code sends 10000. Other clients get the same limit, because a response with
             // millions of edits is too large for them.
@@ -319,6 +319,7 @@ impl Server {
 
         let (fetched_tx, fetched_rx) = crossbeam_channel::unbounded();
         let http = HttpSettings::default();
+        let folding = capabilities.folding_range_limit;
         let server = Server {
             writer,
             receiver,
@@ -333,6 +334,11 @@ impl Server {
             capabilities,
             settings: Settings {
                 validate: true,
+                result_limit: Some(DEFAULT_RESULT_LIMIT),
+                json_folding_limit: folding,
+                jsonc_folding_limit: folding,
+                json_color_limit: Some(DEFAULT_COLOR_LIMIT),
+                jsonc_color_limit: Some(DEFAULT_COLOR_LIMIT),
                 ..Default::default()
             },
             formatter_registered: false,
@@ -767,11 +773,13 @@ impl Server {
         self.update_configuration(Vec::new());
 
         let folding = self.capabilities.folding_range_limit;
-        self.settings.result_limit = limit(get("/resultLimit"), None);
+        self.settings.result_limit = limit(get("/resultLimit"), Some(DEFAULT_RESULT_LIMIT));
         self.settings.json_folding_limit = limit(get("/jsonFoldingLimit"), folding);
         self.settings.jsonc_folding_limit = limit(get("/jsoncFoldingLimit"), folding);
-        self.settings.json_color_limit = limit(get("/jsonColorDecoratorLimit"), None);
-        self.settings.jsonc_color_limit = limit(get("/jsoncColorDecoratorLimit"), None);
+        self.settings.json_color_limit =
+            limit(get("/jsonColorDecoratorLimit"), Some(DEFAULT_COLOR_LIMIT));
+        self.settings.jsonc_color_limit =
+            limit(get("/jsoncColorDecoratorLimit"), Some(DEFAULT_COLOR_LIMIT));
 
         if self.capabilities.dynamic_formatter_registration {
             let methods = [
@@ -963,11 +971,9 @@ impl Server {
         };
         let limit = self.settings.result_limit;
         if self.capabilities.hierarchical_document_symbols {
-            DocumentSymbolResponse::Nested(find_document_symbols2(
-                &document.text,
-                document.json(),
-                limit,
-            ))
+            let mut symbols = find_document_symbols2(&document.text, document.json(), limit);
+            lsp_transport::cap_symbol_depth(&mut symbols);
+            DocumentSymbolResponse::Nested(symbols)
         } else {
             DocumentSymbolResponse::Flat(find_document_symbols(
                 &document.text,

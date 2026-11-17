@@ -335,10 +335,13 @@ fn http_schemas() {
 
 /// `docs/experimental.md`: an object deeper than `jsonc::MAX_DEPTH` is empty, with
 /// an error. Without the limit, the parse overflows the stack. The client reads
-/// at most 128 levels of JSON, so the test asks for no nested result.
+/// at most 128 levels of JSON: nested symbols stop at `MAX_SYMBOL_DEPTH`.
 #[test]
 fn deep_nesting() {
-    let capabilities = json!({ "textDocument": { "diagnostic": {} } });
+    let capabilities = json!({ "textDocument": {
+        "diagnostic": {},
+        "documentSymbol": { "hierarchicalDocumentSymbolSupport": true }
+    } });
     let mut client = Client::start(capabilities, json!({}));
     client.notify(
         "workspace/didChangeConfiguration",
@@ -360,7 +363,46 @@ fn deep_nesting() {
     assert_eq!(messages(items), ["Nesting too deep"]);
     assert_eq!(items[0]["range"]["start"]["line"], 1000);
     let symbols = client.request("textDocument/documentSymbol", document.clone());
-    assert_eq!(symbols.as_array().unwrap().len(), 1000);
+    assert_eq!(symbol_tree(&symbols), (50, 1000));
     client.request("textDocument/documentColor", document);
+    assert_eq!(client.exit(), 0);
+}
+
+/// Depth and count of nested symbols.
+fn symbol_tree(symbols: &Value) -> (usize, usize) {
+    symbols.as_array().map_or((0, 0), |symbols| {
+        symbols.iter().fold((0, 0), |(depth, count), s| {
+            let (d, c) = symbol_tree(&s["children"]);
+            (depth.max(d + 1), count + c + 1)
+        })
+    })
+}
+
+/// `docs/experimental.md`: without client limits, at most 5000 symbols and
+/// folding ranges and 500 colors.
+#[test]
+fn default_limits() {
+    let mut client = Client::start(json!({}), json!({}));
+    let mut text = String::from("{\n");
+    for i in 0..6000 {
+        text += &format!("\"k{i}\": {{\n\"c\": \"#ff0000\"\n}},\n");
+    }
+    text += "\"end\": 0\n}";
+    client.notify(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": { "json": { "schemas": [{
+            "fileMatch": ["a.json"],
+            "schema": { "additionalProperties": { "properties": { "c": { "format": "color" } } } }
+        }] } } }),
+    );
+    client.open("file:///a.json", "json", &text);
+    let document = json!({ "textDocument": { "uri": "file:///a.json" } });
+    let count = |client: &mut Client, method: &str| {
+        let result = client.request(method, document.clone());
+        result.as_array().unwrap().len()
+    };
+    assert_eq!(count(&mut client, "textDocument/documentSymbol"), 5000);
+    assert_eq!(count(&mut client, "textDocument/foldingRange"), 5000);
+    assert_eq!(count(&mut client, "textDocument/documentColor"), 500);
     assert_eq!(client.exit(), 0);
 }
