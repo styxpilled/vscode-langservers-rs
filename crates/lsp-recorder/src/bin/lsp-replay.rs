@@ -8,7 +8,8 @@
 //! The replay sends the client messages of the session in order and waits for the response
 //! to each request. It answers server requests with the recorded client responses (matched by
 //! method and params, in order). `$/cancelRequest` is not sent, because each request is
-//! answered before the next message.
+//! answered before the next message. As Zed does, a `textDocument/diagnostic` request sends
+//! the `resultId` of the last report of its document as `previousResultId`.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufReader, BufWriter};
@@ -216,6 +217,7 @@ fn replay(session_path: &str, out: &str, command: &[String], times_only: bool) -
     let start = Instant::now();
     let mut startup_millis = None;
     let mut end_memory = None;
+    let mut result_ids: HashMap<String, Value> = HashMap::new();
     for (index, line) in session.iter().enumerate() {
         let msg = &line["msg"];
         let Some(method) = msg.get("method").and_then(Value::as_str) else {
@@ -228,17 +230,35 @@ fn replay(session_path: &str, out: &str, command: &[String], times_only: bool) -
             server.settle()?;
             end_memory = end_memory.or_else(|| memory(&server.child));
         }
-        if method == "initialize" {
+        let uri = msg
+            .pointer("/params/textDocument/uri")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let mut msg = msg.clone();
+        match method {
             // `vscode-languageserver` exits when the client process is gone.
-            let mut msg = msg.clone();
-            msg["params"]["processId"] = json!(std::process::id());
-            server.send(&msg)?;
-        } else {
-            server.send(msg)?;
+            "initialize" => msg["params"]["processId"] = json!(std::process::id()),
+            "textDocument/diagnostic" => {
+                if let Some(result_id) = result_ids.get(&uri) {
+                    msg["params"]["previousResultId"] = result_id.clone();
+                }
+            }
+            "textDocument/didClose" => {
+                result_ids.remove(&uri);
+            }
+            _ => {}
         }
+        server.send(&msg)?;
         let Some(id) = msg.get("id") else { continue };
         let sent = Instant::now();
         let response = server.response(id)?;
+        if method == "textDocument/diagnostic" {
+            match response.pointer("/result/resultId") {
+                Some(result_id) => result_ids.insert(uri, result_id.clone()),
+                None => result_ids.remove(&uri),
+            };
+        }
         let millis = sent.elapsed().as_millis() as u64;
         if method == "initialize" {
             startup_millis = Some(start.elapsed().as_millis() as u64);
@@ -346,10 +366,46 @@ fn first_difference(a: &Value, b: &Value, path: String) -> Option<(String, Strin
     }
 }
 
+/// Replaces each `unchanged` diagnostic report with the last items of its document, and
+/// removes the `resultId`. Returns the number of `unchanged` reports.
+fn resolve_unchanged(requests: &mut [Value]) -> usize {
+    let mut items: HashMap<String, Value> = HashMap::new();
+    let mut unchanged = 0;
+    for request in requests {
+        if request["method"] != "textDocument/diagnostic" {
+            continue;
+        }
+        let uri = request["params"]
+            .pointer("/textDocument/uri")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let Some(Value::Object(result)) = request.pointer_mut("/response/result") else {
+            continue;
+        };
+        result.remove("resultId");
+        if result.get("kind").and_then(Value::as_str) == Some("unchanged") {
+            unchanged += 1;
+            result.insert("kind".into(), json!("full"));
+            let last = items.get(&uri).cloned().unwrap_or(Value::Null);
+            result.insert("items".into(), last);
+        } else if let Some(i) = result.get("items") {
+            items.insert(uri, i.clone());
+        }
+    }
+    unchanged
+}
+
 fn diff(a_path: &str, b_path: &str) -> Result<()> {
     let read =
         |p: &str| -> Result<Value> { Ok(serde_json::from_str(&std::fs::read_to_string(p)?)?) };
-    let (a, b) = (read(a_path)?, read(b_path)?);
+    let (mut a, mut b) = (read(a_path)?, read(b_path)?);
+    let mut unchanged = [0, 0];
+    for (side, count) in [&mut a, &mut b].into_iter().zip(&mut unchanged) {
+        if let Some(requests) = side["requests"].as_array_mut() {
+            *count = resolve_unchanged(requests);
+        }
+    }
     let mut differences = 0;
     let report = |what: String, d: Option<(String, String, String)>| {
         let Some((path, x, y)) = d else { return 0 };
@@ -419,6 +475,10 @@ fn diff(a_path: &str, b_path: &str) -> Result<()> {
     for key in ["startup_millis", "end_memory_mb", "peak_memory_mb"] {
         println!("{key}: a {}, b {}", a[key], b[key]);
     }
+    println!(
+        "unchanged diagnostic reports: a {}, b {}",
+        unchanged[0], unchanged[1]
+    );
     Ok(())
 }
 

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, at, never, select, unbounded};
 use lsp_server::{ErrorCode, Message, Notification, Request, RequestId, Response};
-use lsp_types::{Diagnostic, Uri};
+use lsp_types::{Diagnostic, DocumentDiagnosticParams, Uri};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -33,6 +33,37 @@ impl FullDiagnosticReport {
     }
 }
 
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum DiagnosticReport<'a> {
+    Full {
+        #[serde(rename = "resultId")]
+        result_id: String,
+        items: &'a [Diagnostic],
+    },
+    Unchanged {
+        #[serde(rename = "resultId")]
+        result_id: String,
+    },
+}
+
+/// A `textDocument/diagnostic` request.
+#[derive(Clone)]
+pub struct Pull {
+    pub id: RequestId,
+    pub uri: Uri,
+    previous_result_id: Option<String>,
+    /// At the request: settings that arrive later can be older.
+    generation: u64,
+}
+
+/// Pull diagnostics of the current text of a document, computed at `generation`.
+struct Report {
+    id: u64,
+    generation: u64,
+    items: Vec<Diagnostic>,
+}
+
 /// `O`: the kind of a request to the client whose response the server reads. `E`: an event
 /// from a worker thread.
 pub struct Core<O, E = ()> {
@@ -44,6 +75,12 @@ pub struct Core<O, E = ()> {
     next_id: i32,
     pull_diagnostics: bool,
     pending_validations: HashMap<Uri, Instant>,
+    /// Changes when the diagnostics of all documents can change: settings, schemas, data.
+    generation: u64,
+    reports: HashMap<Uri, Report>,
+    next_report_id: u64,
+    /// Pull diagnostics: changed documents to validate when no message waits.
+    idle_validations: VecDeque<Uri>,
     shutdown: bool,
 }
 
@@ -58,6 +95,10 @@ impl<O, E> Core<O, E> {
             next_id: 0,
             pull_diagnostics,
             pending_validations: HashMap::new(),
+            generation: 0,
+            reports: HashMap::new(),
+            next_report_id: 0,
+            idle_validations: VecDeque::new(),
             shutdown: false,
         }
     }
@@ -149,9 +190,15 @@ impl<O, E> Core<O, E> {
         );
     }
 
-    /// Push diagnostics: validates `uri` after a delay.
+    /// The text of `uri` changed. Push diagnostics: validates it after a delay. Pull
+    /// diagnostics: drops its report and validates it when no message waits.
     pub fn trigger_validation(&mut self, uri: Uri) {
-        if !self.pull_diagnostics {
+        if self.pull_diagnostics {
+            self.reports.remove(&uri);
+            if !self.idle_validations.contains(&uri) {
+                self.idle_validations.push_back(uri);
+            }
+        } else {
             self.pending_validations
                 .insert(uri, Instant::now() + VALIDATION_DELAY);
         }
@@ -159,6 +206,7 @@ impl<O, E> Core<O, E> {
 
     /// `workspace/diagnostic/refresh`, or for push diagnostics, a validation of `uris`.
     pub fn request_refresh<'a>(&mut self, uris: impl Iterator<Item = &'a Uri>) {
+        self.invalidate_diagnostics();
         if self.pull_diagnostics {
             self.send_request("workspace/diagnostic/refresh", Value::Null);
         } else {
@@ -168,9 +216,96 @@ impl<O, E> Core<O, E> {
         }
     }
 
-    /// Push diagnostics: stops the timer of a closed document and clears its diagnostics.
+    /// The diagnostics of all documents can change. No refresh is sent.
+    pub fn invalidate_diagnostics(&mut self) {
+        self.generation += 1;
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether the report of `uri` has the diagnostics of its current text and settings.
+    pub fn report_is_current(&self, uri: &Uri) -> bool {
+        self.reports
+            .get(uri)
+            .is_some_and(|r| r.generation == self.generation)
+    }
+
+    /// Keeps `items`, the diagnostics of the current text of `uri` at `generation`. The
+    /// `resultId` stays when the items are equal to the last ones.
+    pub fn store_report(&mut self, uri: Uri, generation: u64, items: Vec<Diagnostic>) {
+        if let Some(report) = self.reports.get_mut(&uri)
+            && report.items == items
+        {
+            report.generation = report.generation.max(generation);
+            return;
+        }
+        self.next_report_id += 1;
+        let report = Report {
+            id: self.next_report_id,
+            generation,
+            items,
+        };
+        self.reports.insert(uri, report);
+    }
+
+    /// The pull of `request`. `None`: the params are not valid, and the error is the response.
+    pub fn pull(&self, request: &Request) -> Option<Pull> {
+        let p: DocumentDiagnosticParams = self.params(request)?;
+        Some(Pull {
+            id: request.id.clone(),
+            uri: p.text_document.uri,
+            previous_result_id: p.previous_result_id,
+            generation: self.generation,
+        })
+    }
+
+    /// Responds to `pull` for an open document. `items`: the diagnostics of its current
+    /// text, or `None` for the current report. `unchanged` when the client has the report.
+    pub fn respond_pull(&mut self, pull: Pull, items: Option<Result<Vec<Diagnostic>, String>>) {
+        match items {
+            Some(Ok(items)) => self.store_report(pull.uri.clone(), pull.generation, items),
+            Some(Err(message)) => {
+                self.log_error(&format!(
+                    "Error while computing diagnostics for {}: {message}",
+                    pull.uri.as_str()
+                ));
+                return self.respond(pull.id, &FullDiagnosticReport::new(Vec::new()));
+            }
+            None => {}
+        }
+        let Some(report) = self.reports.get(&pull.uri) else {
+            return self.respond(pull.id, &FullDiagnosticReport::new(Vec::new()));
+        };
+        let result_id = report.id.to_string();
+        let response = if pull.previous_result_id.as_ref() == Some(&result_id) {
+            DiagnosticReport::Unchanged { result_id }
+        } else {
+            DiagnosticReport::Full {
+                result_id,
+                items: &report.items,
+            }
+        };
+        self.respond(pull.id, &response);
+    }
+
+    /// The next changed document without a current report.
+    pub fn next_idle_validation(&mut self) -> Option<Uri> {
+        while let Some(uri) = self.idle_validations.pop_front() {
+            if !self.report_is_current(&uri) {
+                return Some(uri);
+            }
+        }
+        None
+    }
+
+    /// Stops the work for a closed document. Push diagnostics: clears its diagnostics.
     pub fn close(&mut self, uri: Uri) {
-        if !self.pull_diagnostics {
+        if self.pull_diagnostics {
+            self.reports.remove(&uri);
+            self.idle_validations.retain(|u| *u != uri);
+        } else {
             self.pending_validations.remove(&uri);
             self.publish(uri, Vec::new());
         }
@@ -313,9 +448,7 @@ pub fn handle<S: Service, P: DeserializeOwned, R: Serialize>(
     };
     match catch(|| f(service, params)).and_then(|r| r) {
         Ok(result) => service.core().respond(request.id, &result),
-        Err(message) => service
-            .core()
-            .fail(request, error_value, action, &message),
+        Err(message) => service.core().fail(request, error_value, action, &message),
     }
 }
 
@@ -415,6 +548,14 @@ impl<J> ScopedSettings<J> {
         };
         self.waiting.push((id, job()));
         None
+    }
+
+    /// The settings of `uri` if the client sent them. No request is sent.
+    pub fn ready(&self, uri: &Uri) -> Option<Scoped> {
+        match self.documents.get(uri) {
+            Some(DocumentSettings::Ready(scoped)) => Some(scoped.clone()),
+            _ => None,
+        }
     }
 
     /// The response `id` for `uri`: `None` when the request failed, which is not cached, so

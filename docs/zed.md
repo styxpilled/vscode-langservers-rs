@@ -4,6 +4,20 @@ Facts from `upstream/zed` (sparse clone). The settings that make Zed use the
 ports are in the `README.md` of the repository. To record a session, put
 `lsp-recorder` in front of the server command (`testing.md`).
 
+## All servers
+
+Pull diagnostics, from `crates/editor/src/diagnostics.rs` and
+`crates/project/src/lsp_store.rs`:
+
+- Zed sends `textDocument/diagnostic` 50 ms after the last edit
+  (`diagnostics.lsp_pull_diagnostics.debounce_ms`; an edit starts the wait
+  again). Also after `workspace/diagnostic/refresh`, when a buffer registers
+  with a server, and when the editor shows new lines (a scroll), with no change.
+- Zed keeps the `resultId` of each report for each server and file path, and
+  sends it as `previousResultId` in the next pull. It forgets it when the buffer
+  closes or the server stops. On an `unchanged` report, Zed keeps the pulled
+  diagnostics that it has.
+
 ## JSON
 
 From `crates/languages/src/json.rs` and

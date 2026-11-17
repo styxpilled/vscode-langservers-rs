@@ -33,11 +33,11 @@ root.
 - Robustness: each feature on each prefix of malformed non-ASCII text, no
   panics. Extend the robustness tests for each new feature.
 - Deep nesting: `node scripts/deep-nesting.mjs <bin dir> [depth] [case ...]`
-  opens 65 nested documents (each nesting construct of the three servers) in
-  the release servers and sends each request except formatting. It prints the
-  time of each case or the first request without an answer. To test the
-  parser limits and not the stack size, build with a small
-  `SERVER_STACK_SIZE` (`lsp-core`; all cases pass with 4 MiB).
+  opens 65 nested documents (each nesting construct of the three servers) in the
+  release servers and sends each request except formatting. It prints the time
+  of each case or the first request without an answer. To test the parser limits
+  and not the stack size, build with a small `SERVER_STACK_SIZE` (`lsp-core`;
+  all cases pass with 4 MiB).
 - Session replay: sessions recorded in Zed (or generated) go to the Node and the
   Rust server, and the results are compared.
 
@@ -199,10 +199,13 @@ Sessions are in `.scratch/sessions/` (CSS in `css/`, HTML in `html/`).
   from the recording. The result has `millis` for each request,
   `startup_millis`, `end_memory_mb` and `peak_memory_mb`. `--times` keeps only
   response sizes. It waits 60 s for each response (`LSP_REPLAY_TIMEOUT`
-  overrides it, in seconds).
+  overrides it, in seconds). As Zed does, a `textDocument/diagnostic` request
+  sends the `resultId` of the last report of its document as `previousResultId`.
 - `lsp-replay --diff <a.json> <b.json>`: first difference of each response, of
   the last diagnostics for each URI, and of the server requests (with the number
-  of requests that only one side sent).
+  of requests that only one side sent). An `unchanged` diagnostic report counts
+  as the last items of its document, and `resultId` is ignored; the number of
+  `unchanged` reports of each side is printed.
 - `scripts/timeline.mjs <session>`: messages with response times.
 - Generated sessions, from the `initialize` and configuration answers of a Zed
   session:

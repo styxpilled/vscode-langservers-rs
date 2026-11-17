@@ -30,18 +30,19 @@
   `decode_uri_component`.
 - `crates/lsp-core`: the parts of the servers that do not depend on the
   language.
-  - Stdio threads, and `run_server`, which runs the server loop on a thread
-    with a 256 MiB stack (`experimental.md`, "Deep nesting"). Responses and
+  - Stdio threads, and `run_server`, which runs the server loop on a thread with
+    a 256 MiB stack (`experimental.md`, "Deep nesting"). Responses and
     notifications are serialized directly from the `lsp-types` values (a
     `serde_json::Value` takes about 8 times the memory of its JSON text).
-  - `server.rs`: `Core` (requests to the client, push diagnostic timers with
-    500 ms delay, `publishDiagnostics`, refresh) and `run`, the main loop of a
-    `Service`: `shutdown` and `exit`, a lookahead for the `$/cancelRequest` of
-    each request, timers, events from worker threads, and work while no
-    message waits. `handle` is `runSafe` (an error or a panic gives the error
-    value and a log message). `ScopedSettings` is `getDocumentSettings`: the
-    `workspace/configuration` result of each document, and the jobs that wait
-    for it.
+  - `server.rs`: `Core` (requests to the client, push diagnostic timers with 500
+    ms delay, `publishDiagnostics`, refresh, the pull report cache with
+    `resultId` and the queue of idle validations, `experimental.md` "Pull
+    diagnostics") and `run`, the main loop of a `Service`: `shutdown` and
+    `exit`, a lookahead for the `$/cancelRequest` of each request, timers,
+    events from worker threads, and work while no message waits. `handle` is
+    `runSafe` (an error or a panic gives the error value and a log message).
+    `ScopedSettings` is `getDocumentSettings`: the `workspace/configuration`
+    result of each document, and the jobs that wait for it.
   - `completion.rs`: small completion lists (`experimental.md`).
   - Result limits and the symbol depth cap.
 - `crates/lsp-recorder`: `lsp-recorder` and `lsp-replay` (see `testing.md`).
@@ -74,8 +75,8 @@ upstream. On `experimental` it reads at most `MAX_DEPTH` levels
   - `schema/tree.rs`: a schema document as a compact read-only JSON tree, built
     from the `jsonc` visitor. Keys keep the document order.
   - `schema/doc.rs`: a loaded document and its index, made in one walk at load:
-    the base URI and resource root of each node, the embedded resources
-    (`$id`), the anchors and the dynamic anchors.
+    the base URI and resource root of each node, the embedded resources (`$id`),
+    the anchors and the dynamic anchors.
   - `schema/mod.rs`, `schema/compile.rs`: `Schemas` is a snapshot of the loaded
     documents. A node is compiled into a typed `JsonSchema` on first use
     (`OnceLock`), and its `$ref` is resolved then (`experimental.md`, "Schema
@@ -97,20 +98,20 @@ upstream. On `experimental` it reads at most `MAX_DEPTH` levels
 - `server.rs`: `jsonServer.ts` and `utils/validation.ts`: all requests and
   notifications, client capability checks, settings, push or pull diagnostics,
   result limits, dynamic formatter registration. A `Service` of `lsp-core`;
-  schema fetches are its worker events, and the schema prefetch is its idle
-  work.
+  schema fetches are its worker events, and the schema prefetch and then the
+  validation of changed documents are its idle work.
 - `schema_request.rs`: schema content through `file:` (read inline), HTTP
   (`ureq` on a worker thread, with the `request-light` messages and a disk
-  cache, `experimental.md`) and
-  `vscode/content` (request to the client), as `handledSchemaProtocols` selects.
+  cache, `experimental.md`) and `vscode/content` (request to the client), as
+  `handledSchemaProtocols` selects.
 - Deferred requests: a request for schema content that is not loaded starts the
   fetch and fails. The server discards the result, resets the schema, and runs
   the request or validation again when the content arrives. `$/cancelRequest`
   removes a waiting request. A pull diagnostic does not wait (`experimental.md`,
   "Schema prefetch").
 - Schema reload: a `json/schemaContent` or file change removes the loaded
-  document of that URI only; the documents that reference it resolve the
-  `$ref` again. Compiled `fileMatch` globs are cached across resets.
+  document of that URI only; the documents that reference it resolve the `$ref`
+  again. Compiled `fileMatch` globs are cached across resets.
 - Parsed documents are cached for each open document.
 
 ## CSS
@@ -168,14 +169,13 @@ upstream. On `experimental` it reads at most `MAX_DEPTH` levels
 
 ### `crates/css-language-server`
 
-- `server.rs`: `cssServer.ts`, `customData.ts`, `runner.ts`, `validation.ts`.
-  A `Service` of `lsp-core`. One `CssDataManager` for the three
-  dialects. The `didChangeConfiguration` settings are kept as JSON. Parsed style
-  sheets are cached for each open document.
+- `server.rs`: `cssServer.ts`, `customData.ts`, `runner.ts`, `validation.ts`. A
+  `Service` of `lsp-core`. One `CssDataManager` for the three dialects. The
+  `didChangeConfiguration` settings are kept as JSON. Parsed style sheets are
+  cached for each open document.
 - Scoped settings (`ScopedSettings` of `lsp-core`): completion, hover and
-  validation wait for the `workspace/configuration` response of their
-  document. `$/cancelRequest`
-  answers a waiting request with `RequestCancelled`.
+  validation wait for the `workspace/configuration` response of their document.
+  `$/cancelRequest` answers a waiting request with `RequestCancelled`.
 - `settings.rs`: JSON settings to the service types, with the JS semantics of
   upstream (`parseInt`, truthiness, `braceStyle` lists).
 - `fs.rs`: `RequestService` (`nodeFs.ts` with `std::fs`, `file` scheme only) and
@@ -219,8 +219,8 @@ upstream. On `experimental` it reads at most `MAX_DEPTH` levels
 ### `crates/html-language-server`
 
 - `server.rs`: `htmlServer.ts` and the tag auto insertion of Zed's fork. Same
-  `lsp-core` parts as the CSS server; the configuration request has
-  four sections. `html/customDataContent` requests go to the client in batches.
+  `lsp-core` parts as the CSS server; the configuration request has four
+  sections. `html/customDataContent` requests go to the client in batches.
 - `modes.rs`: the modes (`Mode`: HTML, CSS, `Script`), `formatting.ts`,
   `htmlFolding.ts`, `selectionRanges.ts`, `semanticTokens.ts`. `Document` caches
   the parse, the regions and the embedded CSS, JavaScript and TypeScript

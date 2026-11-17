@@ -280,6 +280,44 @@ fn scoped_settings() {
         [("unknownProperties".into(), 2)]
     );
 
+    // `docs/experimental.md`: an unchanged report needs no settings.
+    let id = report["resultId"].clone();
+    let report = client.request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": URI }, "previousResultId": id }),
+    );
+    assert_eq!(report, json!({ "kind": "unchanged", "resultId": id }));
+
+    // Settings that were requested before a configuration change are older: the
+    // next pull validates again.
+    client.notify(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": {} }),
+    );
+    client.server_request("workspace/diagnostic/refresh");
+    let pull = client.send_request("textDocument/diagnostic", text_document(URI));
+    let request = client.server_request("workspace/configuration");
+    client.notify(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": { "css": { "lint": { "unknownProperties": "error" } } } }),
+    );
+    client.server_request("workspace/diagnostic/refresh");
+    client.send(Response::new_ok(request.id, json!([null])));
+    let report = client.response(pull).unwrap();
+    assert_eq!(
+        severities(report["items"].as_array().unwrap()),
+        [("unknownProperties".into(), 2)]
+    );
+    let id = client.send_request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": URI }, "previousResultId": report["resultId"] }),
+    );
+    client.configuration(json!([]));
+    assert_eq!(
+        severities(client.response(id).unwrap()["items"].as_array().unwrap()),
+        [("unknownProperties".into(), 1)]
+    );
+
     // A request that waits for the settings can be cancelled.
     client.notify(
         "workspace/didChangeConfiguration",

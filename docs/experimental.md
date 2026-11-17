@@ -16,8 +16,8 @@ Upstream parsers and tree walks are recursive. Node throws `RangeError` at about
 `a{`, `(` or `<div>` (6 to 15 KB of text) stopped each server.
 
 - Server thread. Each server runs its loop on a thread with a 256 MiB stack
-  (`lsp_core::run_server`). This is address space; the system commits pages
-  only on use.
+  (`lsp_core::run_server`). This is address space; the system commits pages only
+  on use.
 - Nesting limits, 1000 levels. Deeper parts are cut, so the walks after the
   parse also have a bounded depth:
   - JSON (`jsonc::MAX_DEPTH`, in `jsonc` and in the `JsonDocument` parser): a
@@ -55,9 +55,9 @@ Upstream parsers and tree walks are recursive. Node throws `RangeError` at about
 - Nested symbols (`documentSymbol` as `DocumentSymbol`, all three servers): a
   client that reads JSON with the default `serde_json` recursion limit (128
   levels) cannot read a response with symbols 62 levels deep, and loses the full
-  response. The symbols below `lsp_core::MAX_SYMBOL_DEPTH` (50) become
-  children of their ancestor at that depth, in document order. No symbol is
-  lost. `lsp-core` `symbol_depth`; `tests/stdio.rs` of each server.
+  response. The symbols below `lsp_core::MAX_SYMBOL_DEPTH` (50) become children
+  of their ancestor at that depth, in document order. No symbol is lost.
+  `lsp-core` `symbol_depth`; `tests/stdio.rs` of each server.
 - Not limited: the JavaScript mode (tsrs, one more document). No overflow up to
   6000 levels, but its time grows as the cube of the depth (3000 levels: 1.9 s,
   6000: 14.5 s, 12000: more than 60 s).
@@ -71,12 +71,12 @@ Upstream servers limit results only when the client gives a limit. The VS Code
 client gives 5000 symbols (`json.maxItemsComputed`), 5000 folding ranges
 (`editor.foldingMaximumRegions`) and 500 colors (`editor.colorDecoratorsLimit`).
 Zed gives none. The branch uses these values when the client gives none
-(`lsp_core::DEFAULT_RESULT_LIMIT`, `DEFAULT_COLOR_LIMIT`): folding ranges
-in all three servers; symbols and colors in the JSON server, as only its
-upstream has these settings. Zed shows no notice when a result is cut.
-`tests/stdio.rs` of each server (`default_limits`, `default_folding_limit`).
-Effect on `perf.jsonl` (33 MB): JSON `documentSymbol` 2540 ms against 35 ms,
-`foldingRange` 91 ms against 55 ms, peak memory 636 MB against 315 MB.
+(`lsp_core::DEFAULT_RESULT_LIMIT`, `DEFAULT_COLOR_LIMIT`): folding ranges in all
+three servers; symbols and colors in the JSON server, as only its upstream has
+these settings. Zed shows no notice when a result is cut. `tests/stdio.rs` of
+each server (`default_limits`, `default_folding_limit`). Effect on `perf.jsonl`
+(33 MB): JSON `documentSymbol` 2540 ms against 35 ms, `foldingRange` 91 ms
+against 55 ms, peak memory 636 MB against 315 MB.
 
 ## Completion lists
 
@@ -98,14 +98,64 @@ CSS and HTML servers send smaller lists (`lsp_core::completion`):
   the commands of `executeCommandProvider`).
 - Empty `tags` are left out.
 
-Script items (JavaScript mode) do not change. `lsp-core` tests,
-`tests/stdio.rs` (`compact_completion`) of both servers. Effect on the Zed
-sessions: CSS 96 completions 38.2 MB against 4.2 MB (average 398 KB against 44
-KB, largest 1157 KB against 119 KB), 317 ms against 101 ms in `lsp-replay`; HTML
-121 completions 2.40 MB against 0.13 MB.
+Script items (JavaScript mode) do not change. `lsp-core` tests, `tests/stdio.rs`
+(`compact_completion`) of both servers. Effect on the Zed sessions: CSS 96
+completions 38.2 MB against 4.2 MB (average 398 KB against 44 KB, largest 1157
+KB against 119 KB), 317 ms against 101 ms in `lsp-replay`; HTML 121 completions
+2.40 MB against 0.13 MB.
 
 Not done: serialization of constant item lists once. A CSS completion now takes
 about 1 ms with the transfer.
+
+## Pull diagnostics
+
+Upstream validates the document at each `textDocument/diagnostic` and sends a
+`full` report without `resultId`. Zed pulls 50 ms after the last edit
+(`lsp_pull_diagnostics.debounce_ms`), and also on other events: 196 of 925 JSON,
+98 of 392 CSS and 190 of 646 HTML pulls in the Zed sessions come when the
+document and the settings did not change.
+
+The branch (`lsp_core::server`, all three servers):
+
+- Report cache. The server keeps the last report of each open document with a
+  `resultId`. A change of the text drops it. A configuration change, a schema
+  change and a custom data change increment a generation, and a report of an
+  older generation is validated again. A pull with the `resultId` of a current
+  report gets `{ "kind": "unchanged" }`; Zed then keeps its diagnostics. When a
+  new validation gives the same items, the `resultId` stays. A pull that waits
+  for `workspace/configuration` keeps the generation of the request, so settings
+  that the client sent before a configuration change do not give a current
+  report. CSS and HTML: an unchanged report needs no settings. Custom data
+  (`css/customDataChanged`, `html/customDataChanged`) increments the generation
+  but sends no refresh, as upstream.
+- Idle validation. After `didOpen` and `didChange`, the server validates the
+  document when no message waits, so the pull is a lookup. One document for each
+  idle turn. CSS and HTML validate only when the settings of the document are
+  known; JSON only when its schemas are loaded (else the schema prefetch loads
+  them). The work is on the main thread: a request that arrives during an idle
+  validation waits for it.
+- JSON: the syntax-only report of a pull without its schema has no `resultId`.
+
+Push diagnostics do not change. `tests/stdio.rs`: `diagnostic_result_ids`
+(JSON), `scoped_settings` (CSS). Zed facts: `zed.md`.
+
+Effect. On the Zed sessions in `lsp-replay`: diagnostic response bytes JSON 1054
+against 789 KB, CSS 338 against 231 KB, HTML 55 against 47 KB; the same results,
+request times equal (the replay sends the pull at once after the change). A
+change on a large JSON document, then a pull or a hover after a pause
+(`scripts/pull-latency.py`, median of 6):
+
+| Document                    | Pause  | Pull, no idle work | Pull, idle validation |
+| --------------------------- | ------ | ------------------ | --------------------- |
+| `large-file.json` (26 MB)   | 0 ms   | 107 ms             | 109 ms                |
+| `large-file.json`           | 50 ms  | 84 ms              | 58 ms                 |
+| `large-file.json`           | 200 ms | 85 ms              | 0 ms                  |
+| `large-pretty.json` (33 MB) | 50 ms  | 97 ms              | 83 ms                 |
+
+A hover has the same times: the idle work parses the document. From the recorded
+time between each change and the next pull, the idle validation is complete
+before 684 of the 686 JSON pulls that follow a change. CSS and HTML validation
+takes less than 1 ms.
 
 ## CSS parse time
 
@@ -402,14 +452,14 @@ against 1046 MB. The responses are the same as before, except four
   VS Code client has a cache, Zed has none. The branch writes each 2xx response
   with its `ETag` to a cache folder (`%LOCALAPPDATA%`, `~/Library/Caches` or
   `$XDG_CACHE_HOME` / `~/.cache`, then `vscode-langservers-rs/json-schemas`;
-  `JSON_SCHEMA_CACHE` sets the folder, an empty value turns the cache off).
-  A load with a cached copy reads the file inline and uses it. A worker thread
+  `JSON_SCHEMA_CACHE` sets the folder, an empty value turns the cache off). A
+  load with a cached copy reads the file inline and uses it. A worker thread
   then checks the copy with `If-None-Match`: on `304` or a network error the
   copy stays; changed content replaces the cache and reloads the schema as
   `json/schemaContent` does, with a refresh. After a change on the server, the
   requests of the first second use the old copy. `tests/stdio.rs`
   (`http_schema_cache`). Effect on the 54 JSON sessions (one HTTP schema, in 3
   sessions): all requests 4.5 s with no cache, 2.7 s at the first load into an
-  empty cache, 1.9 s with the cached copy; `documentColor` 2.7 s against 0.25
-  s; max request 829 against 170 ms. With the cached copy, the replays differ
-  only in one fewer refresh in each of the 3 sessions.
+  empty cache, 1.9 s with the cached copy; `documentColor` 2.7 s against 0.25 s;
+  max request 829 against 170 ms. With the cached copy, the replays differ only
+  in one fewer refresh in each of the 3 sessions.

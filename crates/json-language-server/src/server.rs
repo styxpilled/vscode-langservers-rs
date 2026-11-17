@@ -17,11 +17,10 @@ use lsp_server::{ErrorCode, Message, Notification, Request, RequestId, Response}
 use lsp_types::{
     CodeActionParams, ColorPresentation, CompletionList, CompletionParams, Diagnostic,
     DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentColorParams, DocumentDiagnosticParams,
-    DocumentFormattingParams, DocumentLink, DocumentLinkParams, DocumentRangeFormattingParams,
-    DocumentSymbolParams, DocumentSymbolResponse, FoldingRange, FoldingRangeParams, Hover,
-    HoverParams, Range, SelectionRange, SelectionRangeParams, TextDocumentIdentifier, TextEdit,
-    Uri,
+    DidOpenTextDocumentParams, DocumentColorParams, DocumentFormattingParams, DocumentLink,
+    DocumentLinkParams, DocumentRangeFormattingParams, DocumentSymbolParams,
+    DocumentSymbolResponse, FoldingRange, FoldingRangeParams, Hover, HoverParams, Range,
+    SelectionRange, SelectionRangeParams, TextDocumentIdentifier, TextEdit, Uri,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -536,12 +535,9 @@ impl Server {
             "textDocument/documentLink" => {
                 self.handle(request, empty(), "computing links", Self::document_links)
             }
-            "textDocument/diagnostic" if self.core.pull_diagnostics() => self.handle(
-                request,
-                json!({ "kind": "full", "items": [] }),
-                "computing diagnostics",
-                Self::pull_diagnostics,
-            ),
+            "textDocument/diagnostic" if self.core.pull_diagnostics() => {
+                self.pull_diagnostics(request)
+            }
             "json/validate" => self.handle(request, empty(), "validating", Self::force_validate),
             "json/validateAll" => self.handle(request, Value::Null, "validating", |s, _: Value| {
                 s.request_refresh()
@@ -577,9 +573,6 @@ impl Server {
         };
         match self.with_schemas(|s| f(s, params)) {
             Ok(Ok(result)) => self.core.respond(request.id, &result),
-            Ok(Err(waiting)) if request.method == "textDocument/diagnostic" => {
-                self.diagnostics_without_schema(request, waiting)
-            }
             Ok(Err(waiting)) => self.deferred.push(Deferred {
                 waiting,
                 job: Job::Request(request),
@@ -591,23 +584,43 @@ impl Server {
         }
     }
 
-    /// A pull does not wait for schema content: it gets the syntax diagnostics, and a refresh
-    /// follows when the schema is loaded and compiled.
-    fn diagnostics_without_schema(&mut self, request: Request, waiting: HashSet<String>) {
-        let uri = request
-            .params
-            .pointer("/textDocument/uri")
-            .and_then(Value::as_str)
-            .and_then(|u| u.parse::<Uri>().ok());
-        let items = match uri.as_ref().and_then(|u| self.documents.get(u)) {
-            Some(d) => validate_syntax(&self.ls, &self.settings, &d.text, d.json()),
-            None => Vec::new(),
+    fn pull_diagnostics(&mut self, request: Request) {
+        let Some(pull) = self.core.pull(&request) else {
+            return;
         };
-        self.core
-            .respond(request.id, &FullDiagnosticReport::new(items));
-        if let Some(uri) = uri {
-            self.defer_prefetch(uri, true, waiting);
+        if !self.documents.contains_key(&pull.uri) {
+            return self
+                .core
+                .respond(pull.id, &FullDiagnosticReport::new(Vec::new()));
         }
+        if self.core.report_is_current(&pull.uri) {
+            return self.core.respond_pull(pull, None);
+        }
+        match self.validate_open(&pull.uri) {
+            Ok(Ok(items)) => self.core.respond_pull(pull, Some(Ok(items))),
+            Ok(Err(waiting)) => self.diagnostics_without_schema(pull.id, pull.uri, waiting),
+            Err(message) => self.core.respond_pull(pull, Some(Err(message))),
+        }
+    }
+
+    /// `Err`: the panic message. `Ok(Err)`: the schemas that are not loaded yet.
+    fn validate_open(
+        &mut self,
+        uri: &Uri,
+    ) -> Result<Result<Vec<Diagnostic>, HashSet<String>>, String> {
+        self.with_schemas(|s| {
+            let document = &s.documents[uri];
+            validate(&mut s.ls, &s.settings, &document.text, document.json())
+        })
+    }
+
+    /// A pull does not wait for schema content: it gets the syntax diagnostics without a
+    /// `resultId`, and a refresh follows when the schema is loaded and compiled.
+    fn diagnostics_without_schema(&mut self, id: RequestId, uri: Uri, waiting: HashSet<String>) {
+        let document = &self.documents[&uri];
+        let items = validate_syntax(&self.ls, &self.settings, &document.text, document.json());
+        self.core.respond(id, &FullDiagnosticReport::new(items));
+        self.defer_prefetch(uri, true, waiting);
     }
 
     fn defer_prefetch(&mut self, uri: Uri, refresh: bool, waiting: HashSet<String>) {
@@ -1019,19 +1032,6 @@ impl Server {
         find_links(&document.text, document.json())
     }
 
-    fn pull_diagnostics(&mut self, p: DocumentDiagnosticParams) -> FullDiagnosticReport {
-        let items = match self.documents.get(&p.text_document.uri) {
-            Some(document) => validate(
-                &mut self.ls,
-                &self.settings,
-                &document.text,
-                document.json(),
-            ),
-            None => Vec::new(),
-        };
-        FullDiagnosticReport::new(items)
-    }
-
     fn force_validate(&mut self, uri: Uri) -> Vec<Diagnostic> {
         if !self.documents.contains_key(&uri) {
             return Vec::new();
@@ -1133,11 +1133,22 @@ impl Service for Server {
         }
     }
 
+    /// Schema loads first: a validation needs the schema.
     fn idle(&mut self) -> bool {
-        if self.prefetch.is_empty() {
-            return false;
+        if !self.prefetch.is_empty() {
+            self.prefetch_next();
+            return true;
         }
-        self.prefetch_next();
+        let Some(uri) = self.core.next_idle_validation() else {
+            return false;
+        };
+        // The pull logs an error. A missing schema loads, and the pull then validates.
+        if self.documents.contains_key(&uri) {
+            let generation = self.core.generation();
+            if let Ok(Ok(items)) = self.validate_open(&uri) {
+                self.core.store_report(uri, generation, items);
+            }
+        }
         true
     }
 }

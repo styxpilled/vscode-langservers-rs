@@ -269,6 +269,72 @@ fn pull_diagnostics() {
     assert_eq!(client.exit(), 0);
 }
 
+/// `docs/experimental.md`: a pull with the `resultId` of the current report gets
+/// `unchanged`. A change of the text or of the diagnostics gives a new `resultId`.
+#[test]
+fn diagnostic_result_ids() {
+    let capabilities = json!({ "textDocument": { "diagnostic": {} } });
+    let mut client = Client::start(capabilities, json!({}));
+    let settings = |enable: bool, format: bool| json!({ "settings": { "json": { "validate": { "enable": enable }, "format": { "enable": format } } } });
+    client.notify("workspace/didChangeConfiguration", settings(true, false));
+    client.server_request("workspace/diagnostic/refresh");
+    client.open("file:///a.json", "json", "{");
+    let pull = |client: &mut Client, previous: &Value| {
+        client.request(
+            "textDocument/diagnostic",
+            json!({ "textDocument": { "uri": "file:///a.json" }, "previousResultId": previous }),
+        )
+    };
+    let first = pull(&mut client, &Value::Null);
+    assert_eq!(first["kind"], "full");
+    assert_eq!(first["items"].as_array().unwrap().len(), 1);
+    let id = &first["resultId"];
+    assert_eq!(
+        pull(&mut client, id),
+        json!({ "kind": "unchanged", "resultId": id })
+    );
+    // The report without `previousResultId`.
+    assert_eq!(pull(&mut client, &Value::Null), first);
+
+    let change = |client: &mut Client, version: i32, text: &str| {
+        client.notify(
+            "textDocument/didChange",
+            json!({ "textDocument": { "uri": "file:///a.json", "version": version }, "contentChanges": [{ "text": text }] }),
+        );
+    };
+    change(&mut client, 2, "{}");
+    let empty = pull(&mut client, id);
+    assert_eq!(empty["items"], json!([]));
+    assert_ne!(&empty["resultId"], id);
+    let id = &empty["resultId"];
+
+    // Other settings, the same diagnostics.
+    client.notify("workspace/didChangeConfiguration", settings(true, true));
+    client.server_request("workspace/diagnostic/refresh");
+    assert_eq!(pull(&mut client, id)["kind"], "unchanged");
+
+    change(&mut client, 3, "{");
+    let error = pull(&mut client, id);
+    assert_eq!(error["items"].as_array().unwrap().len(), 1);
+    let id = &error["resultId"];
+    client.notify("workspace/didChangeConfiguration", settings(false, true));
+    client.server_request("workspace/diagnostic/refresh");
+    let disabled = pull(&mut client, id);
+    assert_eq!(disabled["items"], json!([]));
+    assert_ne!(&disabled["resultId"], id);
+
+    // A closed document has no report.
+    client.notify(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": "file:///a.json" } }),
+    );
+    assert_eq!(
+        pull(&mut client, &disabled["resultId"]),
+        json!({ "kind": "full", "items": [] })
+    );
+    assert_eq!(client.exit(), 0);
+}
+
 /// `docs/experimental.md`: the schema load starts at `didOpen`, and a pull does not wait
 /// for it. A refresh follows when the schema is ready.
 #[test]
@@ -292,6 +358,8 @@ fn pull_diagnostics_without_schema() {
         messages(report["items"].as_array().unwrap()),
         ["End of file expected."]
     );
+    // Not a complete report.
+    assert!(report.get("resultId").is_none());
 
     let schema = json!({ "properties": { "b": { "type": "string" } } });
     client.send(Response::new_ok(content.id, schema.to_string()));

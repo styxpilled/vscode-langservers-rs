@@ -16,8 +16,8 @@ use css_languageservice::services::navigation::ColorInformation;
 use html_languageservice::{HtmlDataProvider, LanguageService};
 use lsp_core::completion::{CompletionSupport, ResolveStore};
 use lsp_core::server::{
-    Core, Scoped, ScopedSettings, Service, capability, catch, contains_markdown, limit,
-    unwrap_positional,
+    Core, FullDiagnosticReport, Pull, Scoped, ScopedSettings, Service, capability, catch,
+    contains_markdown, limit, unwrap_positional,
 };
 use lsp_core::{DEFAULT_RESULT_LIMIT, Writer};
 use lsp_server::{ErrorCode, Message, Notification, Request, RequestId, Response};
@@ -100,6 +100,7 @@ enum Job {
     /// The document at the time of the request. It is used if the document closes.
     Request(Request, Rc<Document>),
     Validate(Uri),
+    Pull(Pull),
 }
 
 pub enum Outgoing {
@@ -377,6 +378,7 @@ impl Server {
                     self.with_settings(request, &document, scoped);
                 }
                 Job::Validate(uri) => self.finish_validation(uri, scoped),
+                Job::Pull(pull) => self.finish_pull(pull, scoped),
             }
         }
     }
@@ -439,6 +441,7 @@ impl Server {
         for document in self.documents.values_mut() {
             *document = Rc::new(Document::new(document.text.clone()));
         }
+        self.core.invalidate_diagnostics();
     }
 
     fn request(&mut self, request: Request) {
@@ -449,7 +452,7 @@ impl Server {
             | "textDocument/formatting"
             | "textDocument/rangeFormatting" => self.needs_settings(request),
             "textDocument/diagnostic" if self.core.pull_diagnostics() => {
-                self.needs_settings(request)
+                self.pull_diagnostics(request)
             }
             "completionItem/resolve" => self.resolve(request),
             "workspace/textDocumentContent" => {
@@ -562,7 +565,6 @@ impl Server {
         match request.method.as_str() {
             "textDocument/completion" => mode_at("/position").is_some(),
             "textDocument/hover" => mode_at("/position") == Some(Mode::Html),
-            "textDocument/diagnostic" => self.validation_needs_settings(document),
             _ => true,
         }
     }
@@ -596,28 +598,14 @@ impl Server {
         request: Request,
         context: Option<(&Rc<Document>, Scoped)>,
     ) {
-        let uri = request
-            .params
-            .pointer("/textDocument/uri")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
         let (error_value, action) = match request.method.as_str() {
             "textDocument/completion" => (Value::Null, "computing completions for"),
             "textDocument/hover" => (Value::Null, "computing hover for"),
             "textDocument/formatting" => (json!([]), "formatting"),
-            "textDocument/rangeFormatting" => (json!([]), "formatting range for"),
-            _ => (
-                json!({ "kind": "full", "items": [] }),
-                "computing diagnostics for",
-            ),
+            _ => (json!([]), "formatting range for"),
         };
         let Some((document, scoped)) = context else {
-            let missing = match request.method.as_str() {
-                "textDocument/completion" | "textDocument/hover" => Value::Null,
-                _ => error_value,
-            };
-            return self.core.send(Response::new_ok(request.id, missing));
+            return self.core.send(Response::new_ok(request.id, error_value));
         };
         let result = catch(|| -> Result<Box<RawValue>, String> {
             let params = request.params.clone();
@@ -631,19 +619,9 @@ impl Server {
                     let p: PositionParams = serde_json::from_value(params).map_err(parse)?;
                     raw(&self.hover(document, p.position, scoped.as_ref())?)
                 }
-                "textDocument/formatting" | "textDocument/rangeFormatting" => {
+                _ => {
                     let p: FormattingParams = serde_json::from_value(params).map_err(parse)?;
                     raw(&self.format(document, p.range, &p.options, scoped.as_ref())?)
-                }
-                _ => {
-                    let items = self
-                        .validate_document(document, scoped.as_ref())
-                        .unwrap_or_else(|message| {
-                            self.core
-                                .log_error(&format!("Error while validating {uri}: {message}"));
-                            Vec::new()
-                        });
-                    raw(&json!({ "kind": "full", "items": items }))
                 }
             }
         })
@@ -652,6 +630,48 @@ impl Server {
             Ok(result) => self.core.respond(request.id, &result),
             Err(message) => self.core.fail(request, error_value, action, &message),
         }
+    }
+
+    fn pull_diagnostics(&mut self, request: Request) {
+        let Some(pull) = self.core.pull(&request) else {
+            return;
+        };
+        let Some(document) = self.document(&pull.uri) else {
+            return self
+                .core
+                .respond(pull.id, &FullDiagnosticReport::new(Vec::new()));
+        };
+        if self.core.report_is_current(&pull.uri) {
+            return self.core.respond_pull(pull, None);
+        }
+        if !self.validation_needs_settings(&document) {
+            return self.finish_pull(pull, None);
+        }
+        let job = || Job::Pull(pull.clone());
+        if let Some(scoped) = self.scoped_settings(&document.text, job) {
+            self.finish_pull(pull, scoped);
+        }
+    }
+
+    /// Validates the current text, as `finish_validation`.
+    fn finish_pull(&mut self, pull: Pull, scoped: Scoped) {
+        let Some(document) = self.document(&pull.uri) else {
+            return self
+                .core
+                .respond(pull.id, &FullDiagnosticReport::new(Vec::new()));
+        };
+        let items = (!self.core.report_is_current(&pull.uri)).then(|| {
+            catch(|| self.validate_document(&document, scoped.as_ref())).map(|items| {
+                items.unwrap_or_else(|message| {
+                    self.core.log_error(&format!(
+                        "Error while validating {}: {message}",
+                        pull.uri.as_str()
+                    ));
+                    Vec::new()
+                })
+            })
+        });
+        self.core.respond_pull(pull, items);
     }
 
     /// `runSafe`: an error or a panic gives `error_value`.
@@ -746,10 +766,11 @@ impl Server {
             }
             "$/cancelRequest" => {
                 let id: RequestId = serde_json::from_value(params["id"].clone())?;
-                if self
-                    .settings
-                    .cancel(|job| matches!(job, Job::Request(r, _) if r.id == id))
-                {
+                if self.settings.cancel(|job| match job {
+                    Job::Request(r, _) => r.id == id,
+                    Job::Pull(pull) => pull.id == id,
+                    Job::Validate(_) => false,
+                }) {
                     self.core.respond_cancelled(id);
                 }
             }
@@ -1239,5 +1260,28 @@ impl Service for Server {
         if let Some(scoped) = self.scoped_settings(&document.text, job) {
             self.finish_validation(uri, scoped);
         }
+    }
+
+    /// Validates a changed document when its settings are known.
+    fn idle(&mut self) -> bool {
+        let Some(uri) = self.core.next_idle_validation() else {
+            return false;
+        };
+        let Some(document) = self.document(&uri) else {
+            return true;
+        };
+        let scoped =
+            if !self.capabilities.scoped_settings || !self.validation_needs_settings(&document) {
+                Some(None)
+            } else {
+                self.settings.ready(&uri)
+            };
+        if let Some(scoped) = scoped {
+            let generation = self.core.generation();
+            if let Ok(Ok(items)) = catch(|| self.validate_document(&document, scoped.as_ref())) {
+                self.core.store_report(uri, generation, items);
+            }
+        }
+        true
     }
 }

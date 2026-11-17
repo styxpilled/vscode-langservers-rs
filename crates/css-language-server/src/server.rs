@@ -23,7 +23,7 @@ use css_languageservice::services::selection_range::get_selection_ranges;
 use css_languageservice::services::validation::do_validation;
 use lsp_core::completion::{CompactList, CompletionSupport, ResolveStore};
 use lsp_core::server::{
-    Core, FullDiagnosticReport, Scoped, ScopedSettings, Service, capability, catch,
+    Core, FullDiagnosticReport, Pull, Scoped, ScopedSettings, Service, capability, catch,
     contains_markdown, limit, unwrap_positional,
 };
 use lsp_core::{DEFAULT_RESULT_LIMIT, Writer};
@@ -31,10 +31,10 @@ use lsp_server::{ErrorCode, Message, Notification, Request, RequestId, Response}
 use lsp_types::{
     CodeAction, CodeActionParams, ColorPresentation, CompletionParams, Diagnostic,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentColorParams, DocumentDiagnosticParams, DocumentHighlight, DocumentHighlightParams,
-    DocumentLinkParams, DocumentSymbol, DocumentSymbolParams, FoldingRange, FoldingRangeParams,
-    GotoDefinitionParams, Hover, HoverParams, Location, Range, ReferenceParams, RenameParams,
-    SelectionRange, SelectionRangeParams, TextDocumentIdentifier, TextEdit, Uri, WorkspaceEdit,
+    DocumentColorParams, DocumentHighlight, DocumentHighlightParams, DocumentLinkParams,
+    DocumentSymbol, DocumentSymbolParams, FoldingRange, FoldingRangeParams, GotoDefinitionParams,
+    Hover, HoverParams, Location, Range, ReferenceParams, RenameParams, SelectionRange,
+    SelectionRangeParams, TextDocumentIdentifier, TextEdit, Uri, WorkspaceEdit,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -75,6 +75,7 @@ enum Job {
     /// The document at the time of the request. It is used if the document closes.
     Request(Request, Rc<Document>),
     Validate(Uri),
+    Pull(Pull),
 }
 
 /// A `workspace/configuration` request for a document.
@@ -278,7 +279,7 @@ impl Server {
                 self.core.send(Response::new_ok(request.id, item));
             }
             "textDocument/diagnostic" if self.core.pull_diagnostics() => {
-                self.needs_settings(request)
+                self.pull_diagnostics(request)
             }
             "textDocument/documentSymbol" => self.handle(
                 request,
@@ -381,11 +382,7 @@ impl Server {
     ) {
         let (error_value, action) = match request.method.as_str() {
             "textDocument/completion" => (Value::Null, "computing completions for"),
-            "textDocument/hover" => (Value::Null, "computing hover for"),
-            _ => (
-                json!({ "kind": "full", "items": [] }),
-                "computing diagnostics for",
-            ),
+            _ => (Value::Null, "computing hover for"),
         };
         let Some((document, scoped)) = context else {
             return self.core.send(Response::new_ok(request.id, error_value));
@@ -398,14 +395,8 @@ impl Server {
                     document,
                     scoped.as_ref()
                 )),
-                "textDocument/hover" => {
-                    json!(self.hover(serde_json::from_value(params)?, document, scoped.as_ref()))
-                }
                 _ => {
-                    let _: DocumentDiagnosticParams = serde_json::from_value(params)?;
-                    json!(FullDiagnosticReport::new(
-                        self.validate_document(document, scoped.as_ref())
-                    ))
+                    json!(self.hover(serde_json::from_value(params)?, document, scoped.as_ref()))
                 }
             })
         });
@@ -418,6 +409,36 @@ impl Server {
             )),
             Err(message) => self.core.fail(request, error_value, action, &message),
         }
+    }
+
+    fn pull_diagnostics(&mut self, request: Request) {
+        let Some(pull) = self.core.pull(&request) else {
+            return;
+        };
+        let Some(document) = self.document(&pull.uri) else {
+            return self
+                .core
+                .respond(pull.id, &FullDiagnosticReport::new(Vec::new()));
+        };
+        if self.core.report_is_current(&pull.uri) {
+            return self.core.respond_pull(pull, None);
+        }
+        let job = || Job::Pull(pull.clone());
+        if let Some(scoped) = self.scoped_settings(&document.text, job) {
+            self.finish_pull(pull, scoped);
+        }
+    }
+
+    /// Validates the current text, as `finish_validation`.
+    fn finish_pull(&mut self, pull: Pull, scoped: Scoped) {
+        let Some(document) = self.document(&pull.uri) else {
+            return self
+                .core
+                .respond(pull.id, &FullDiagnosticReport::new(Vec::new()));
+        };
+        let items = (!self.core.report_is_current(&pull.uri))
+            .then(|| catch(|| self.validate_document(&document, scoped.as_ref())));
+        self.core.respond_pull(pull, items);
     }
 
     /// `runSafeAsync`: an error or a panic gives `error_value`.
@@ -491,13 +512,15 @@ impl Server {
                     .map(|p| data_provider(&self.request_service, p))
                     .collect();
                 self.data.set_data_providers(true, &providers);
+                self.core.invalidate_diagnostics();
             }
             "$/cancelRequest" => {
                 let id: RequestId = serde_json::from_value(params["id"].clone())?;
-                if self
-                    .settings
-                    .cancel(|job| matches!(job, Job::Request(r, _) if r.id == id))
-                {
+                if self.settings.cancel(|job| match job {
+                    Job::Request(r, _) => r.id == id,
+                    Job::Pull(pull) => pull.id == id,
+                    Job::Validate(_) => false,
+                }) {
                     self.core.respond_cancelled(id);
                 }
             }
@@ -788,6 +811,7 @@ impl Service for Server {
                     self.with_settings(request, &document, scoped);
                 }
                 Job::Validate(uri) => self.finish_validation(uri, scoped),
+                Job::Pull(pull) => self.finish_pull(pull, scoped),
             }
         }
     }
@@ -800,5 +824,27 @@ impl Service for Server {
         if let Some(scoped) = self.scoped_settings(&document.text, job) {
             self.finish_validation(uri, scoped);
         }
+    }
+
+    /// Validates a changed document when its settings are known.
+    fn idle(&mut self) -> bool {
+        let Some(uri) = self.core.next_idle_validation() else {
+            return false;
+        };
+        let Some(document) = self.document(&uri) else {
+            return true;
+        };
+        let scoped = if self.capabilities.scoped_settings {
+            self.settings.ready(&uri)
+        } else {
+            Some(None)
+        };
+        if let Some(scoped) = scoped {
+            let generation = self.core.generation();
+            if let Ok(items) = catch(|| self.validate_document(&document, scoped.as_ref())) {
+                self.core.store_report(uri, generation, items);
+            }
+        }
+        true
     }
 }
