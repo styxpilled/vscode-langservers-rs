@@ -1,9 +1,9 @@
 //! The SCSS grammar of `scssParser.ts`.
 
-use super::Parser;
 use super::errors::*;
 use super::nodes::{Field, Kind, NodeId, NodeType, ReferenceType, Rule};
 use super::scanner::TokenType as T;
+use super::{MAX_DEPTH, Parser, Retry};
 
 pub static FROM_EXPECTED: Rule = Rule {
     id: "scss-fromexpected",
@@ -165,6 +165,10 @@ impl<'a> Parser<'a> {
     }
 
     pub(crate) fn parse_module_member(&mut self) -> Option<NodeId> {
+        self.remember_failure(Retry::ModuleMember, Self::parse_module_member_once)
+    }
+
+    fn parse_module_member_once(&mut self) -> Option<NodeId> {
         let pos = self.mark();
         let node = self.create(Kind::Module);
 
@@ -531,9 +535,11 @@ impl<'a> Parser<'a> {
             return self.finish_error(node, &EXPRESSION_EXPECTED);
         }
         self.parse_body(node, parse_statement);
-        if self.accept_keyword("@else") {
+        if self.depth < MAX_DEPTH && self.accept_keyword("@else") {
             if self.peek_ident("if") {
+                self.depth += 1;
                 let else_clause = self.internal_parse_if_statement(parse_statement);
+                self.depth -= 1;
                 self.ast
                     .set_node(node, Field::ElseClause, Some(else_clause), None);
             } else if self.peek(T::CurlyL) {
@@ -995,6 +1001,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_list_element(&mut self) -> Option<NodeId> {
+        self.nested(Self::parse_list_element_once)
+    }
+
+    fn parse_list_element_once(&mut self) -> Option<NodeId> {
         let node = self.create(Kind::ListEntry);
         let child = self.parse_binary_expr(None, None)?;
         if self.accept(T::Colon) {

@@ -141,3 +141,20 @@ fn scoped_settings() {
     assert_eq!(client.response(id).as_array().unwrap().len(), 1);
     assert_eq!(client.exit(), 0);
 }
+
+/// `docs/experimental.md`: at `MAX_DEPTH`, a start tag closes the deepest open
+/// element, so deep nesting does not overflow the stack.
+#[test]
+fn deep_nesting() {
+    let mut client = Client::start(json!({}));
+    let depth = 100_000;
+    let text = "<div>\n".repeat(depth);
+    client.notify(
+        "textDocument/didOpen",
+        json!({ "textDocument": { "uri": URI, "languageId": "html", "version": 1, "text": text } }),
+    );
+    let document = json!({ "textDocument": { "uri": URI } });
+    let symbols = client.request("textDocument/documentSymbol", document);
+    assert_eq!(symbols.as_array().unwrap().len(), depth);
+    assert_eq!(client.exit(), 0);
+}

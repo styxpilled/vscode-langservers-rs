@@ -95,3 +95,25 @@ fn path_completion_ranges() {
         r(0, 12, 0, 14)
     );
 }
+
+#[test]
+fn nesting_limit() {
+    use html_languageservice::parser::MAX_DEPTH;
+    let text = "<div>".repeat(MAX_DEPTH + 2);
+    let html = html_languageservice::HtmlDocument::parse(&text, |_| false, false);
+    let depth = |mut id| {
+        let mut depth = 1;
+        while let Some(parent) = html.parent(id) {
+            id = parent;
+            depth += 1;
+        }
+        depth
+    };
+    let deepest = html.find_node_at(text.len());
+    assert_eq!(depth(deepest), MAX_DEPTH);
+    assert_eq!(html[deepest].start, 5 * (MAX_DEPTH + 1));
+    let closed = html.find_node_at(5 * MAX_DEPTH - 1);
+    assert_eq!(depth(closed), MAX_DEPTH);
+    assert_eq!(html[closed].end, 5 * MAX_DEPTH);
+    assert!(!html[closed].closed);
+}

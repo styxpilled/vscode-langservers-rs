@@ -28,7 +28,9 @@
   `to_string_unencoded`), `Utils` (`join_path`, `dirname`, `basename`,
   `resolve_path`), `posix` (bundled `path.posix`), `resolve_relative_path`,
   `decode_uri_component`.
-- `crates/lsp-transport`: stdio threads for the servers. Responses and
+- `crates/lsp-transport`: stdio threads for the servers, and `run_server`,
+  which runs the server loop on a thread with a 256 MiB stack
+  (`experimental.md`, "Deep nesting"). Responses and
   notifications are serialized directly from the `lsp-types` values (a
   `serde_json::Value` takes about 8 times the memory of its JSON text).
 - `crates/lsp-recorder`: `lsp-recorder` and `lsp-replay` (see `testing.md`).
@@ -40,8 +42,8 @@
 Port of `node-jsonc-parser`: scanner, error-tolerant parser, `parse_tree` (arena
 `Tree`), `visit` (`Visitor` trait), `get_location`, `format`, `modify`,
 `apply_edits`, `strip_comments`. No LSP dependency. The parser is recursive, as
-upstream: very deep nesting can overflow the stack (upstream throws
-`RangeError`).
+upstream. On `experimental` it reads at most `MAX_DEPTH` levels
+(`experimental.md`, "Deep nesting").
 
 ### `crates/json-languageservice`
 

@@ -11,9 +11,17 @@ mod scss;
 pub mod symbol_scope;
 
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 
 use nodes::{Ast, Kind, Level, Marker, NodeId, NodeType, Rule};
 use scanner::{Scanner, Token, TokenType};
+
+/// Deepest nesting that the parser reads: the recursive parse functions
+/// (blocks, expressions, selectors, conditions), plus the links of a binary
+/// expression or `@else if` chain. Deeper content is a parse error, and the
+/// error recovery skips it without recursion. Recursive walks of the tree
+/// then have a bounded depth. Not in upstream.
+pub const MAX_DEPTH: usize = 1000;
 
 /// The CSS dialect. Upstream uses subclasses of the scanner and the parser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +57,16 @@ pub(crate) struct Mark {
     nodes: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Retry {
+    Selector,
+    Function,
+    ModuleMember,
+}
+
+/// The closing bracket of a group and the scanner position after it.
+type GroupEnd = (Token, usize);
+
 pub struct Parser<'a> {
     pub(crate) dialect: Dialect,
     pub(crate) scanner: Scanner<'a>,
@@ -60,6 +78,18 @@ pub struct Parser<'a> {
     last_error_token: Option<u32>,
     /// Nesting inside `attr()`, where `type(<syntax>)` is a valid argument.
     pub(crate) attr_depth: u32,
+    /// Calls of `nested` and chain links in progress.
+    pub(crate) depth: usize,
+    /// The tokens where `nested` stopped at `MAX_DEPTH`.
+    too_deep: HashMap<usize, Token>,
+    /// The end of each closed group, by the offset of its opening bracket.
+    /// Built at the first skip.
+    group_ends: Option<HashMap<usize, GroupEnd>>,
+    /// The parse functions that failed at an offset with an `attr_depth`. The
+    /// parser tries some parse functions again at the same offset; in nested
+    /// input this takes time exponential in the depth (also upstream). Not in
+    /// upstream.
+    failed: HashSet<(Retry, usize, u32)>,
     pub ast: Ast,
 }
 
@@ -79,6 +109,10 @@ impl<'a> Parser<'a> {
             prev_token: None,
             last_error_token: None,
             attr_depth: 0,
+            depth: 0,
+            too_deep: HashMap::new(),
+            group_ends: None,
+            failed: HashSet::new(),
             ast,
         }
     }
@@ -130,6 +164,80 @@ impl<'a> Parser<'a> {
         self.set_token(next);
     }
 
+    /// Runs a parse function that can recurse, one level deeper. At
+    /// `MAX_DEPTH`, adds an error, skips to the closing bracket of the
+    /// enclosing group and returns `None`; the caller then recovers as from any
+    /// missing part. Without the skip, each enclosing level would parse the
+    /// deep rest again.
+    pub(crate) fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        if self.depth == MAX_DEPTH {
+            self.skip_too_deep();
+            return None;
+        }
+        self.depth += 1;
+        let result = f(self);
+        self.depth -= 1;
+        result
+    }
+
+    /// Skips to the closing bracket of the enclosing group. Without one, the
+    /// rest of the text is in the unclosed group: the text then ends at the
+    /// current token. Restores make the parser come back to skipped text, so
+    /// a skip jumps over each inner group through `group_ends`.
+    #[cold]
+    #[inline(never)]
+    fn skip_too_deep(&mut self) {
+        let first = self.token;
+        self.too_deep.entry(first.offset).or_insert(first);
+        let ends = self.group_ends.take().unwrap_or_else(|| {
+            let mut scanner = Scanner::new(self.dialect);
+            scanner.set_source(self.scanner.source());
+            group_ends(scanner)
+        });
+        let closed = loop {
+            match self.token.kind {
+                TokenType::CurlyL
+                | TokenType::ParenthesisL
+                | TokenType::BracketL
+                | TokenType::InterpolationFunction => {
+                    let Some(&(end, pos)) = ends.get(&self.token.offset) else {
+                        break false;
+                    };
+                    self.scanner.go_back_to(pos);
+                    self.prev_token = Some(end);
+                    let next = self.scanner.scan();
+                    self.set_token(next);
+                }
+                TokenType::CurlyR | TokenType::ParenthesisR | TokenType::BracketR => break true,
+                TokenType::Eof => break false,
+                _ => self.consume_token(),
+            }
+        };
+        self.group_ends = Some(ends);
+        if !closed {
+            self.scanner.end_at(first.offset);
+            let eof = self.scanner.scan();
+            self.set_token(eof);
+        }
+    }
+
+    /// Adds an error for each token where `nested` stopped at `MAX_DEPTH`.
+    pub(crate) fn mark_too_deep(&mut self, root: NodeId) {
+        let mut skips: Vec<_> = self.too_deep.drain().map(|(_, t)| t).collect();
+        skips.sort_by_key(|t| t.offset);
+        for token in skips {
+            let marker = Marker {
+                node: root,
+                rule: &errors::NESTING_TOO_DEEP,
+                level: Level::Error,
+                message: errors::NESTING_TOO_DEEP.message.to_owned(),
+                offset: token.offset as isize,
+                length: token.len as isize,
+            };
+            self.ast.add_issue(root, marker);
+        }
+    }
+
     pub(crate) fn accept_unicode_range(&mut self) -> bool {
         if let Some(token) = self.scanner.try_scan_unicode() {
             self.prev_token = Some(token);
@@ -170,6 +278,27 @@ impl<'a> Parser<'a> {
     pub(crate) fn discard(&mut self, node: NodeId) -> Option<NodeId> {
         self.ast.discard_from(node.index());
         None
+    }
+
+    /// `f`, or `None` without a call when `f` failed at this position before.
+    /// For parse functions whose result depends only on the position. Only
+    /// failures that scanned more than two tokens are kept: most calls fail on
+    /// the first token or two, and the set then stays empty.
+    pub(crate) fn remember_failure(
+        &mut self,
+        retry: Retry,
+        f: impl FnOnce(&mut Self) -> Option<NodeId>,
+    ) -> Option<NodeId> {
+        let key = (retry, self.token.offset, self.attr_depth);
+        if !self.failed.is_empty() && self.failed.contains(&key) {
+            return None;
+        }
+        let scans = self.next_id;
+        let node = f(self);
+        if node.is_none() && self.next_id - scans > 2 {
+            self.failed.insert(key);
+        }
+        node
     }
 
     /// `try`: restores the position when `f` returns nothing.
@@ -360,4 +489,25 @@ fn lower_eq(token: &str, text: &str) -> bool {
         return token.len() == text.len() && token.eq_ignore_ascii_case(text);
     }
     token.encode_utf16().count() == text.len() && token.to_lowercase() == text
+}
+
+fn group_ends(mut scanner: Scanner) -> HashMap<usize, GroupEnd> {
+    let mut ends = HashMap::new();
+    let mut open = Vec::new();
+    loop {
+        let token = scanner.scan();
+        match token.kind {
+            TokenType::CurlyL
+            | TokenType::ParenthesisL
+            | TokenType::BracketL
+            | TokenType::InterpolationFunction => open.push(token.offset),
+            TokenType::CurlyR | TokenType::ParenthesisR | TokenType::BracketR => {
+                if let Some(start) = open.pop() {
+                    ends.insert(start, (token, scanner.pos()));
+                }
+            }
+            TokenType::Eof => return ends,
+            _ => {}
+        }
+    }
 }

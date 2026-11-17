@@ -5,7 +5,7 @@ use lsp_types::{LanguageString, MarkedString};
 use crate::language_facts::CssDataManager;
 use crate::parser::nodes::{Ast, Field, Kind, NodeId, NodeType};
 use crate::parser::scanner::Scanner;
-use crate::parser::{Dialect, Parser};
+use crate::parser::{Dialect, MAX_DEPTH, Parser};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ElementId(usize);
@@ -102,6 +102,18 @@ impl Elements {
         {
             last.value = concat(last.value.as_deref(), "", Some(text));
         }
+    }
+
+    /// Whether `id` has at least `depth` ancestors.
+    fn is_deeper_than(&self, id: ElementId, depth: usize) -> bool {
+        let mut curr = id;
+        for _ in 0..depth {
+            match self.get(curr).parent {
+                Some(parent) => curr = parent,
+                None => return false,
+            }
+        }
+        true
     }
 
     pub fn find_root(&self, id: ElementId) -> ElementId {
@@ -340,6 +352,10 @@ impl Builder<'_> {
 
         for child in ast.children(selector) {
             let is_simple = ast.kind(child) == Kind::SimpleSelector;
+            // The tree nests at each combinator. Not in upstream.
+            if is_simple && self.elements.is_deeper_than(self.element, MAX_DEPTH) {
+                break;
+            }
             if is_simple {
                 let prev_is = |s: &str| self.prev.is_some_and(|p| ast.matches(p, s));
                 if self

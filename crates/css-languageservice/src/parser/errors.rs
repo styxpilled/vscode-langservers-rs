@@ -43,4 +43,5 @@ rules! {
     WILDCARD_EXPECTED = "css-wildcardexpected", "wildcard expected";
     IDENTIFIER_OR_VARIABLE_EXPECTED = "css-idorvarexpected", "identifier or variable expected";
     IF_CONDITION_EXPECTED = "css-ifconditionexpected", "if condition expected";
+    NESTING_TOO_DEEP = "css-nestingtoodeep", "nesting too deep";
 }

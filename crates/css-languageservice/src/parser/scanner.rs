@@ -169,6 +169,12 @@ impl<'a> Scanner<'a> {
         self.pos = 0;
     }
 
+    /// Ends the source at `end`: later scans give `Eof` there.
+    pub fn end_at(&mut self, end: usize) {
+        self.src = &self.src[..end];
+        self.pos = self.pos.min(end);
+    }
+
     pub fn source(&self) -> &'a str {
         self.src
     }

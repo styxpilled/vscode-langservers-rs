@@ -1116,3 +1116,29 @@ fn location_matches() {
         true,
     );
 }
+
+/// Not in upstream (`docs/experimental.md`): a value deeper than `MAX_DEPTH` is
+/// an empty array or object with an error.
+#[test]
+fn nesting_limit() {
+    let depth = jsonc::MAX_DEPTH + 2;
+    let text = "[{\"a\":".repeat(depth) + "1" + &"}]".repeat(depth);
+    let (tree, errors) = parse_tree(&text, ParseOptions::default());
+    let tree = tree.unwrap();
+    let [error] = errors.as_slice() else {
+        panic!("{errors:?}");
+    };
+    assert_eq!(error.error, ParseErrorCode::NestingTooDeep);
+    assert_eq!(error.offset, 6 * jsonc::MAX_DEPTH / 2);
+    let mut node = tree.root();
+    let mut nesting = 1;
+    while let Some(&child) = tree[node].children.last() {
+        if tree[child].node_type != NodeType::Property {
+            nesting += 1;
+        }
+        node = child;
+    }
+    assert_eq!(nesting, jsonc::MAX_DEPTH + 1);
+    assert_eq!(tree[node].node_type, NodeType::Array);
+    assert_eq!(tree[node].end(), text.len() - jsonc::MAX_DEPTH);
+}

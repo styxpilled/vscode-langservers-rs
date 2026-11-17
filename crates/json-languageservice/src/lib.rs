@@ -90,6 +90,8 @@ impl ErrorCode {
     pub const DUPLICATE_KEY: Self = Self(0x208);
     pub const COMMENT_NOT_PERMITTED: Self = Self(0x209);
     pub const PROPERTY_KEYS_MUST_BE_DOUBLEQUOTED: Self = Self(0x210);
+    /// Not in upstream: `jsonc::MAX_DEPTH`.
+    pub const NESTING_TOO_DEEP: Self = Self(0x211);
     pub const SCHEMA_UNSUPPORTED_FEATURE: Self = Self(0x301);
     pub const SCHEMA_RESOLVE_ERROR: Self = Self(0x10000);
 

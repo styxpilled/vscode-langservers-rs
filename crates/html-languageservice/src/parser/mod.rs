@@ -10,6 +10,11 @@ pub type NodeId = usize;
 /// The pseudo node that holds the roots.
 const DOCUMENT: NodeId = 0;
 
+/// Deepest nesting of elements. At this depth a start tag first closes the
+/// deepest open element, so recursive walks of the tree have a bounded depth.
+/// Not in upstream.
+pub const MAX_DEPTH: usize = 1000;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Node {
     pub tag: Option<String>,
@@ -160,6 +165,7 @@ impl HtmlDocument {
         let mut nodes = Vec::with_capacity(1 + text.bytes().filter(|&b| b == b'<').count());
         nodes.push(Node::new(0, text.len(), None));
         let mut curr = DOCUMENT;
+        let mut depth = 0;
         let mut end_tag_start = 0;
         let mut end_tag_name: Option<&str> = None;
         let mut pending_attribute: Option<usize> = None;
@@ -167,6 +173,12 @@ impl HtmlDocument {
         while token != TokenType::Eos {
             match token {
                 TokenType::StartTagOpen => {
+                    if depth == MAX_DEPTH {
+                        nodes[curr].end = scanner.token_offset();
+                        curr = nodes[curr].parent.unwrap();
+                        depth -= 1;
+                    }
+                    depth += 1;
                     let child = nodes.len();
                     nodes.push(Node::new(scanner.token_offset(), text.len(), Some(curr)));
                     nodes[curr].children.push(child);
@@ -183,10 +195,12 @@ impl HtmlDocument {
                             if nodes[curr].tag.as_deref().is_some_and(&is_void_element) {
                                 nodes[curr].closed = true;
                                 curr = parent;
+                                depth -= 1;
                             }
                         } else {
                             // A pseudo close token of an incomplete start tag.
                             curr = parent;
+                            depth -= 1;
                         }
                     }
                 }
@@ -197,6 +211,7 @@ impl HtmlDocument {
                         node.end = scanner.token_end();
                         node.start_tag_end = Some(scanner.token_end());
                         curr = parent;
+                        depth -= 1;
                     }
                 }
                 TokenType::EndTagOpen => {
@@ -218,12 +233,14 @@ impl HtmlDocument {
                             nodes[curr].end = end_tag_start;
                             nodes[curr].closed = false;
                             curr = nodes[curr].parent.unwrap();
+                            depth -= 1;
                         }
                         let n = &mut nodes[curr];
                         n.closed = true;
                         n.end_tag_start = Some(end_tag_start);
                         n.end = scanner.token_end();
                         curr = n.parent.unwrap();
+                        depth -= 1;
                     } else if create_nodes_for_orphan_end_tags {
                         let orphan = nodes.len();
                         let mut n = Node::new(end_tag_start, scanner.token_end(), Some(curr));

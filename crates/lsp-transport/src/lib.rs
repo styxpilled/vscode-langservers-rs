@@ -82,6 +82,23 @@ impl IoThreads {
     }
 }
 
+/// Stack of the server thread. The parsers and tree walks recurse for each
+/// nesting level, up to the parser limits. This is address space: the system
+/// commits pages only on use.
+const SERVER_STACK_SIZE: usize = 256 << 20;
+
+/// Runs `f` on a thread with a large stack. A stack overflow stops the process
+/// and `catch_unwind` cannot catch it.
+pub fn run_server<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .name("server".into())
+        .stack_size(SERVER_STACK_SIZE)
+        .spawn(f)
+        .expect("server thread")
+        .join()
+        .unwrap_or_else(|e| std::panic::resume_unwind(e))
+}
+
 pub fn stdio() -> (Receiver<Message>, Writer, IoThreads) {
     let (reader_tx, reader_rx) = unbounded();
     let reader = std::thread::spawn(move || {

@@ -332,3 +332,35 @@ fn http_schemas() {
     );
     assert_eq!(client.exit(), 0);
 }
+
+/// `docs/experimental.md`: an object deeper than `jsonc::MAX_DEPTH` is empty, with
+/// an error. Without the limit, the parse overflows the stack. The client reads
+/// at most 128 levels of JSON, so the test asks for no nested result.
+#[test]
+fn deep_nesting() {
+    let capabilities = json!({ "textDocument": { "diagnostic": {} } });
+    let mut client = Client::start(capabilities, json!({}));
+    client.notify(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": { "json": { "validate": { "enable": true } } } }),
+    );
+    client.server_request("workspace/diagnostic/refresh");
+    let depth = 100_000;
+    let text = "{\"a\":
+"
+    .repeat(depth)
+        + "1"
+        + &"}
+"
+        .repeat(depth);
+    client.open("file:///a.json", "json", &text);
+    let document = json!({ "textDocument": { "uri": "file:///a.json" } });
+    let report = client.request("textDocument/diagnostic", document.clone());
+    let items = report["items"].as_array().unwrap();
+    assert_eq!(messages(items), ["Nesting too deep"]);
+    assert_eq!(items[0]["range"]["start"]["line"], 1000);
+    let symbols = client.request("textDocument/documentSymbol", document.clone());
+    assert_eq!(symbols.as_array().unwrap().len(), 1000);
+    client.request("textDocument/documentColor", document);
+    assert_eq!(client.exit(), 0);
+}

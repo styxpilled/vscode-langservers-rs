@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::ops::Index;
 
-use jsonc::{NodeType, ScanError, Scanner, Segment, SyntaxKind};
+use jsonc::{MAX_DEPTH, NodeType, ScanError, Scanner, Segment, SyntaxKind};
 use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range};
 use serde_json::{Map, Value};
 
@@ -268,6 +268,7 @@ pub fn parse(document: &TextDocument, collect_comments: bool) -> JsonDocument {
         last_problem_offset: None,
         doc: JsonDocument::default(),
         key_maps: Vec::new(),
+        depth: 0,
     };
     parser.run();
     parser.doc.index_children();
@@ -285,6 +286,7 @@ struct Parser<'a> {
     doc: JsonDocument,
     /// Unused duplicate-key maps, to reuse their allocations.
     key_maps: Vec<KeysSeen<'a>>,
+    depth: usize,
 }
 
 const OBJECT_RECOVERY: &[SyntaxKind] = &[SyntaxKind::CloseBraceToken, SyntaxKind::CommaToken];
@@ -709,10 +711,60 @@ impl<'a> Parser<'a> {
         Some(self.finalize(node, true))
     }
 
+    /// Reads a value deeper than `MAX_DEPTH` as an empty array or object.
+    #[cold]
+    #[inline(never)]
+    fn skip_too_deep(&mut self, parent: Option<NodeId>) -> NodeId {
+        let kind = if self.token() == SyntaxKind::OpenBracketToken {
+            AstKind::Array
+        } else {
+            AstKind::Object
+        };
+        let (start, end) = (self.scanner.token_offset(), self.token_end());
+        self.error_at_range(
+            "Nesting too deep",
+            ErrorCode::NESTING_TOO_DEEP,
+            start,
+            end,
+            DiagnosticSeverity::ERROR,
+        );
+        let node = self.push(kind, parent);
+        let mut depth = 0;
+        loop {
+            match self.token() {
+                SyntaxKind::OpenBracketToken | SyntaxKind::OpenBraceToken => depth += 1,
+                SyntaxKind::CloseBracketToken | SyntaxKind::CloseBraceToken => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return self.finalize(node, true);
+                    }
+                }
+                SyntaxKind::EOF => return self.finalize(node, false),
+                _ => {}
+            }
+            self.scan_next();
+        }
+    }
+
     fn parse_value(&mut self, parent: Option<NodeId>) -> Option<NodeId> {
         match self.token() {
-            SyntaxKind::OpenBracketToken => self.parse_array(parent),
-            SyntaxKind::OpenBraceToken => self.parse_object(parent),
+            SyntaxKind::OpenBracketToken | SyntaxKind::OpenBraceToken
+                if self.depth == MAX_DEPTH =>
+            {
+                Some(self.skip_too_deep(parent))
+            }
+            SyntaxKind::OpenBracketToken => {
+                self.depth += 1;
+                let node = self.parse_array(parent);
+                self.depth -= 1;
+                node
+            }
+            SyntaxKind::OpenBraceToken => {
+                self.depth += 1;
+                let node = self.parse_object(parent);
+                self.depth -= 1;
+                node
+            }
             SyntaxKind::StringLiteral => self.parse_string(parent),
             SyntaxKind::NumericLiteral => self.parse_number(parent),
             _ => self.parse_literal(parent),

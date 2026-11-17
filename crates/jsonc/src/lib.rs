@@ -70,7 +70,14 @@ pub enum ParseErrorCode {
     InvalidUnicode = 14,
     InvalidEscapeCharacter = 15,
     InvalidCharacter = 16,
+    /// Not in upstream. An array or object deeper than `MAX_DEPTH`.
+    NestingTooDeep = 17,
 }
+
+/// Deepest nesting of arrays and objects that the parsers read. A deeper
+/// value is read as an empty array or object, so recursive walks of the result
+/// have a bounded depth.
+pub const MAX_DEPTH: usize = 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParseError {

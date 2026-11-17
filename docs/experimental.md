@@ -8,6 +8,74 @@ of `testing.md`.
 
 `docs/differences/` keeps the differences of `main` that the branch also has.
 
+## Deep nesting
+
+Upstream parsers and tree walks are recursive. Node throws `RangeError` at about
+3000 levels, and the request fails. In Rust a stack overflow stops the process
+(`catch_unwind` does not catch it): before this change, 3000 levels of `[`,
+`a{`, `(` or `<div>` (6 to 15 KB of text) stopped each server.
+
+- Server thread. Each server runs its loop on a thread with a 256 MiB stack
+  (`lsp_transport::run_server`). This is address space; the system commits pages
+  only on use.
+- Nesting limits, 1000 levels. Deeper parts are cut, so the walks after the
+  parse also have a bounded depth:
+  - JSON (`jsonc::MAX_DEPTH`, in `jsonc` and in the `JsonDocument` parser): a
+    deeper array or object is empty and covers the text to its closing bracket.
+    Error "Nesting too deep" (code `0x211`; `jsonc`:
+    `ParseErrorCode::NestingTooDeep`).
+  - CSS (`parser::MAX_DEPTH`): a recursion guard (`Parser::nested`) on the
+    parse functions where each recursion passes: declarations (blocks),
+    expressions (parentheses, function arguments, interpolations), selectors
+    (pseudo-class arguments), boolean expressions, media and supports
+    conditions, SCSS list elements. The links of a binary expression chain and
+    of an SCSS `@else if` chain count too. At the limit the function gives the
+    error `css-nestingtoodeep`, skips to the closing bracket of the enclosing
+    group, and returns nothing; the error recovery of the caller follows. A
+    binary chain stops; the rest reads as more terms (`+1` is a term with a
+    sign). The selector hover tree nests at each combinator; it stops at the
+    limit.
+  - CSS skips in the deep part. Restores make the parser come back to the
+    skipped text from each outer level. So at the first skip, one scan builds
+    the end of each bracket group, and a skip jumps over each inner group;
+    when the enclosing group is not closed, the text ends for the parser at the
+    skip. Without this, 8000 levels of closed `:not(` took 1.1 s (now 6 ms).
+  - CSS cost on usual documents: the guard is a counter at each call of these
+    functions, not at each token. A first version counted the brackets at each
+    token: parse 4% slower on bootstrap, so it was replaced.
+  - HTML (`parser::MAX_DEPTH`): at the limit, a start tag first closes the
+    deepest open element (as browsers do; Chromium stops at 512). No diagnostic:
+    the HTML mode has no parse diagnostics.
+- Effect: all features except formatting answer on 100000 levels of 64 generated
+  documents (each nesting construct of the three servers, open and closed;
+  `scripts/deep-nesting.mjs`), also with a 4 MiB stack: 256 MiB is a margin of 64 times. The slowest take 2
+  to 4 s (600 KB of text with up to 100000 diagnostics) and grow linearly. Formatting is not limited: its output
+  grows as the square of the depth (indentation), as upstream. `tests/stdio.rs`
+  of each server (`deep_nesting`), `jsonc` `nesting_limit`, HTML
+  `nesting_limit`.
+- Not limited: the JavaScript mode (tsrs, one more document). No overflow up to
+  6000 levels, but its time grows as the cube of the depth (3000 levels: 1.9 s,
+  6000: 14.5 s, 12000: more than 60 s).
+- Clients: `serde_json` reads 128 levels by default, so the test clients cannot
+  read a nested result (hierarchical symbols, selection ranges) deeper than
+  that. Upstream gives the same results. Not checked in Zed.
+
+## CSS parse time
+
+Upstream tries some parse functions again at the same offset. In nested input
+each level is then parsed two or three times, and the time is exponential in the
+depth: `:not(` 22 times takes 3.4 s in Node, 30 times stops the server for
+minutes; the same for SCSS `#{` in a value (a term tries a module member, a
+function and an identifier, each with the full interpolation). The parser now
+keeps the offsets (with `attr_depth`) where `try_as_selector`, `parse_function`
+and `parse_module_member` failed after more than two tokens, and fails at once
+there again. The result of these functions depends only on the position. Most
+calls fail on the first or second token: they do not go into the set, and the
+set is empty in usual documents (a first version kept each failure: parse 22%
+slower on bootstrap). Effect: 30 levels in 10 ms, 1000
+levels in about 0.1 s. Parse results do not change: the parser fixtures, the
+sweeps and the replays pass. `tests/stdio.rs` (`deep_nesting`).
+
 ## CSS completion and language facts
 
 - Baseline status. Upstream writes `Baseline since undefined` when an entry has
@@ -145,18 +213,18 @@ The HTML server uses the same helpers for its formatter settings.
 - Path completion. Upstream takes the replace range from the value range with
   `shiftRange(range, 1, -1)` and shifts the end character by the length of the
   name after the last `/`. The shift stays on one line, and it assumes two
-  quotes: a name on two lines gives a negative character and upstream throws
-  (no completion); an empty value gives a reversed range; an unclosed quote
-  loses the last character. The branch takes the value without its quotes as
-  byte offsets and makes the range from offsets. `do_complete2` always answers.
-  The feature sweep skips path completion in a value that is not quoted on one
-  line (137 results, 13 of them where upstream throws). `path_completion_ranges`.
+  quotes: a name on two lines gives a negative character and upstream throws (no
+  completion); an empty value gives a reversed range; an unclosed quote loses
+  the last character. The branch takes the value without its quotes as byte
+  offsets and makes the range from offsets. `do_complete2` always answers. The
+  feature sweep skips path completion in a value that is not quoted on one line
+  (137 results, 13 of them where upstream throws). `path_completion_ranges`.
 - Region markers. Upstream `/^\s*#(region\b)|(endregion\b)/` has no `^` for
   `endregion`, so a comment with `endregion` anywhere ends a region. The branch
-  uses `/^\s*#(end)?region\b/`. The JSON folding has the same pattern after
-  `//` and the same change. `endregion_only_at_start`.
-- Entity hover. Upstream writes the first UTF-16 unit of the character
-  (`U+D835` for `&Afr;`). The branch writes the code point (`U+1D504`).
+  uses `/^\s*#(end)?region\b/`. The JSON folding has the same pattern after `//`
+  and the same change. `endregion_only_at_start`.
+- Entity hover. Upstream writes the first UTF-16 unit of the character (`U+D835`
+  for `&Afr;`). The branch writes the code point (`U+1D504`).
   `entity_hover_code_point`.
 - Simplifications without an effect on results:
   - The `type` value of a quoted attribute without closing quote kept all but
@@ -176,13 +244,13 @@ The HTML server uses the same helpers for its formatter settings.
   `didChangeConfiguration`, and completion, hover, formatting and diagnostics
   fail. The branch uses the global settings for that request and does not cache
   the result. `tests/stdio.rs` (`scoped_settings`).
-- `html.format.unformatted` that is truthy and not a string. Upstream js-beautify
-  throws (`unformattedTags.match`), and formatting answers `[]`. The branch
-  ignores the value. `scoped_settings`.
+- `html.format.unformatted` that is truthy and not a string. Upstream
+  js-beautify throws (`unformattedTags.match`), and formatting answers `[]`. The
+  branch ignores the value. `scoped_settings`.
 - Languages in a document. Upstream `getLanguagesInDocument` stops at three
   embedded languages and then does not add `html`: a document with CSS,
-  JavaScript and TypeScript regions has no HTML mode for links, symbols,
-  colors, semantic tokens and diagnostics. The branch has no limit.
+  JavaScript and TypeScript regions has no HTML mode for links, symbols, colors,
+  semantic tokens and diagnostics. The branch has no limit.
   `embedded::tests::languages_in_document`.
 - Selection ranges. In the HTML mode, upstream adds the HTML ranges as parent of
   the same HTML ranges, so the innermost range repeats. The branch returns the

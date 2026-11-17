@@ -32,6 +32,12 @@ root.
   without it the sweep test skips.
 - Robustness: each feature on each prefix of malformed non-ASCII text, no
   panics. Extend the robustness tests for each new feature.
+- Deep nesting: `node scripts/deep-nesting.mjs <bin dir> [depth] [case ...]`
+  opens 65 nested documents (each nesting construct of the three servers) in
+  the release servers and sends each request except formatting. It prints the
+  time of each case or the first request without an answer. To test the
+  parser limits and not the stack size, build with a small
+  `SERVER_STACK_SIZE` (`lsp-transport`; all cases pass with 4 MiB).
 - Session replay: sessions recorded in Zed (or generated) go to the Node and the
   Rust server, and the results are compared.
 

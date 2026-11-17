@@ -3,8 +3,8 @@ use std::ops::Index;
 use serde_json::{Map, Value};
 
 use crate::{
-    Literal, NodeType, ParseError, ParseErrorCode, ParseOptions, ScanError, Scanner, Segment, Span,
-    SyntaxKind,
+    Literal, MAX_DEPTH, NodeType, ParseError, ParseErrorCode, ParseOptions, ScanError, Scanner,
+    Segment, Span, SyntaxKind,
 };
 
 /// Callbacks for [`visit`]. The `path` arguments give the location of the current value.
@@ -539,6 +539,7 @@ pub fn visit<V: Visitor + ?Sized>(text: &str, visitor: &mut V, options: ParseOpt
         visitor,
         path: Vec::new(),
         suppressed: 0,
+        depth: 0,
         options,
     };
     walker.run();
@@ -550,6 +551,7 @@ struct Walker<'a, 'v, V: Visitor + ?Sized> {
     path: Vec<Segment>,
     /// Depth of the begin callbacks that returned `false`. Callbacks occur only at depth 0.
     suppressed: usize,
+    depth: usize,
     options: ParseOptions,
 }
 
@@ -724,7 +726,7 @@ impl<V: Visitor + ?Sized> Walker<'_, '_, V> {
         true
     }
 
-    fn parse_object(&mut self) -> bool {
+    fn parse_object(&mut self) {
         self.on_begin(false);
         self.scan_next();
 
@@ -762,10 +764,9 @@ impl<V: Visitor + ?Sized> Walker<'_, '_, V> {
         } else {
             self.scan_next();
         }
-        true
     }
 
-    fn parse_array(&mut self) -> bool {
+    fn parse_array(&mut self) {
         self.on_begin(true);
         self.scan_next();
 
@@ -817,13 +818,56 @@ impl<V: Visitor + ?Sized> Walker<'_, '_, V> {
         } else {
             self.scan_next();
         }
+    }
+
+    /// Reads a value deeper than `MAX_DEPTH` as an empty array or object.
+    #[cold]
+    #[inline(never)]
+    fn skip_too_deep(&mut self) -> bool {
+        let array = self.token() == SyntaxKind::OpenBracketToken;
+        self.on_error(ParseErrorCode::NestingTooDeep);
+        self.on_begin(array);
+        let mut depth = 0;
+        loop {
+            match self.token() {
+                SyntaxKind::OpenBracketToken | SyntaxKind::OpenBraceToken => depth += 1,
+                SyntaxKind::CloseBracketToken | SyntaxKind::CloseBraceToken => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                SyntaxKind::EOF => break,
+                _ => {}
+            }
+            self.scan_next();
+        }
+        self.on_end(array);
+        if self.token() != SyntaxKind::EOF {
+            self.scan_next();
+        }
         true
     }
 
     fn parse_value(&mut self) -> bool {
         match self.token() {
-            SyntaxKind::OpenBracketToken => self.parse_array(),
-            SyntaxKind::OpenBraceToken => self.parse_object(),
+            SyntaxKind::OpenBracketToken | SyntaxKind::OpenBraceToken
+                if self.depth == MAX_DEPTH =>
+            {
+                self.skip_too_deep()
+            }
+            SyntaxKind::OpenBracketToken => {
+                self.depth += 1;
+                self.parse_array();
+                self.depth -= 1;
+                true
+            }
+            SyntaxKind::OpenBraceToken => {
+                self.depth += 1;
+                self.parse_object();
+                self.depth -= 1;
+                true
+            }
             SyntaxKind::StringLiteral => {
                 self.parse_string(true);
                 true

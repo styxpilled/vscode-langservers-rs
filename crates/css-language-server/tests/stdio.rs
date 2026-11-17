@@ -419,3 +419,37 @@ fn custom_data() {
     std::fs::remove_dir_all(&dir).unwrap();
     assert_eq!(client.exit(), 0);
 }
+
+/// `docs/experimental.md`: nesting deeper than `MAX_DEPTH` gives an error, not a
+/// stack overflow, and nested `:not(` and `#{` take polynomial time.
+#[test]
+fn deep_nesting() {
+    let caps = json!({ "textDocument": { "diagnostic": {} } });
+    let (mut client, _) = Client::start(caps, json!({}));
+    let diagnostics = |client: &mut Client, uri: &str, language_id: &str, text: &str| {
+        client.open(uri, language_id, text);
+        let report = client.request("textDocument/diagnostic", text_document(uri));
+        severities(report["items"].as_array().unwrap())
+    };
+
+    // `a{` is the same in release, but slow in debug (`debug_assert!` in `discard_from`).
+    let media = "@media ".to_owned() + &"(".repeat(1200);
+    let codes = diagnostics(&mut client, "file:///media.css", "css", &media);
+    assert!(
+        codes.contains(&("css-nestingtoodeep".to_owned(), 1)),
+        "{codes:?}"
+    );
+    let chain = format!("a{{b:{}1}}", "1+".repeat(1200));
+    diagnostics(&mut client, "file:///chain.css", "css", &chain);
+    let not = ":not(".repeat(40);
+    diagnostics(&mut client, "file:///not.css", "css", &not);
+    let interpolation = format!("a{{b:{}", "#{".repeat(40));
+    diagnostics(&mut client, "file:///i.scss", "scss", &interpolation);
+
+    let selector = "a ".repeat(3000) + "{}";
+    client.open("file:///selector.css", "css", &selector);
+    let hover = client.request("textDocument/hover", at("file:///selector.css", 0, 1));
+    let html = hover["contents"][0].as_str().unwrap();
+    assert_eq!(html.lines().count(), 1001);
+    assert_eq!(client.exit(), 0);
+}

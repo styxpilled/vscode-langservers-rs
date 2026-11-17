@@ -3,7 +3,7 @@
 use super::errors::*;
 use super::nodes::{Field, Kind, NodeId, NodeType, ReferenceType};
 use super::scanner::TokenType as T;
-use super::{Dialect, Parser};
+use super::{Dialect, MAX_DEPTH, Parser, Retry};
 
 const PAGE_BOX_DIRECTIVES: &[&str] = &[
     "@bottom-center",
@@ -102,6 +102,7 @@ impl<'a> Parser<'a> {
             }
         }
 
+        self.mark_too_deep(node);
         self.finish(node)
     }
 
@@ -253,6 +254,13 @@ impl<'a> Parser<'a> {
 
     pub(crate) fn parse_declarations(
         &mut self,
+        parse_declaration: impl FnMut(&mut Self) -> Option<NodeId>,
+    ) -> Option<NodeId> {
+        self.nested(|p| p.parse_declarations_once(parse_declaration))
+    }
+
+    fn parse_declarations_once(
+        &mut self,
         mut parse_declaration: impl FnMut(&mut Self) -> Option<NodeId>,
     ) -> Option<NodeId> {
         let node = self.create(Kind::Declarations);
@@ -311,10 +319,10 @@ impl<'a> Parser<'a> {
     }
 
     pub(crate) fn parse_selector(&mut self, is_nested: bool) -> Option<NodeId> {
-        match self.dialect {
-            Dialect::Less => self.less_parse_selector(is_nested),
-            _ => self.css_parse_selector(is_nested),
-        }
+        self.nested(|p| match p.dialect {
+            Dialect::Less => p.less_parse_selector(is_nested),
+            _ => p.css_parse_selector(is_nested),
+        })
     }
 
     pub(crate) fn css_parse_selector(&mut self, is_nested: bool) -> Option<NodeId> {
@@ -941,7 +949,7 @@ impl<'a> Parser<'a> {
             let declaration = self.try_to_parse_declaration(Some(&[T::ParenthesisR]));
             if !self.ast.add_child(node, declaration) {
                 // Upstream drops this condition node; it is never `null`.
-                self.parse_supports_condition();
+                self.nested(|p| Some(p.parse_supports_condition()));
             }
             if !self.accept(T::ParenthesisR) {
                 return self.finish_resync(
@@ -1060,6 +1068,13 @@ impl<'a> Parser<'a> {
         &mut self,
         parse_test: fn(&mut Self) -> Option<NodeId>,
     ) -> Option<NodeId> {
+        self.nested(|p| p.parse_boolean_expression_once(parse_test))
+    }
+
+    fn parse_boolean_expression_once(
+        &mut self,
+        parse_test: fn(&mut Self) -> Option<NodeId>,
+    ) -> Option<NodeId> {
         let node = self.create(Kind::Node);
 
         if self.accept_ident("not") {
@@ -1118,10 +1133,10 @@ impl<'a> Parser<'a> {
     }
 
     pub(crate) fn parse_media_condition(&mut self) -> Option<NodeId> {
-        match self.dialect {
-            Dialect::Scss => self.scss_parse_media_condition(),
-            _ => Some(self.css_parse_media_condition()),
-        }
+        self.nested(|p| match p.dialect {
+            Dialect::Scss => p.scss_parse_media_condition(),
+            _ => Some(p.css_parse_media_condition()),
+        })
     }
 
     pub(crate) fn css_parse_media_condition(&mut self) -> NodeId {
@@ -1872,6 +1887,11 @@ impl<'a> Parser<'a> {
         Some(self.finish(node))
     }
 
+    /// `try(tryAsSelector)`.
+    fn try_selector_list(&mut self) -> Option<NodeId> {
+        self.remember_failure(Retry::Selector, |p| p.try_parse(|p| p.try_as_selector()))
+    }
+
     fn try_as_selector(&mut self) -> Option<NodeId> {
         let selectors = self.create_node(NodeType::SelectorList);
         let selector = self.parse_selector(true);
@@ -1900,7 +1920,7 @@ impl<'a> Parser<'a> {
     pub(crate) fn css_parse_pseudo(&mut self) -> Option<NodeId> {
         let node = self.try_parse_pseudo_identifier()?;
         if !self.has_whitespace() && self.accept(T::ParenthesisL) {
-            let selector = self.try_parse(|p| p.try_as_selector());
+            let selector = self.try_selector_list();
             let has_selector = self.ast.add_child(node, selector);
             if !has_selector {
                 // The <an+b> syntax, which is not a proper expression.
@@ -1915,7 +1935,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 if self.accept_ident("of") {
-                    let selector = self.try_parse(|p| p.try_as_selector());
+                    let selector = self.try_selector_list();
                     if !self.ast.add_child(node, selector) {
                         return Some(self.finish_error(node, &SELECTOR_EXPECTED));
                     }
@@ -1979,6 +1999,10 @@ impl<'a> Parser<'a> {
     }
 
     pub(crate) fn parse_expr(&mut self, stop_on_comma: bool) -> Option<NodeId> {
+        self.nested(|p| p.parse_expr_once(stop_on_comma))
+    }
+
+    fn parse_expr_once(&mut self, stop_on_comma: bool) -> Option<NodeId> {
         let node = self.create(Kind::Expression);
         let expr = self.parse_binary_expr(None, None);
         if !self.ast.add_child(node, expr) {
@@ -2068,8 +2092,12 @@ impl<'a> Parser<'a> {
 
         // A chain of binary expressions.
         node = self.finish(node);
-        if let Some(operator) = self.parse_operator() {
+        if self.depth < MAX_DEPTH
+            && let Some(operator) = self.parse_operator()
+        {
+            self.depth += 1;
             node = self.parse_binary_expr(Some(node), Some(operator)).unwrap();
+            self.depth -= 1;
         }
         Some(self.finish(node))
     }
@@ -2227,11 +2255,11 @@ impl<'a> Parser<'a> {
     }
 
     pub(crate) fn parse_function(&mut self) -> Option<NodeId> {
-        match self.dialect {
-            Dialect::Scss => self.scss_parse_function(),
-            Dialect::Less => self.less_parse_function(),
-            _ => self.css_parse_function(),
-        }
+        self.remember_failure(Retry::Function, |p| match p.dialect {
+            Dialect::Scss => p.scss_parse_function(),
+            Dialect::Less => p.less_parse_function(),
+            _ => p.css_parse_function(),
+        })
     }
 
     pub(crate) fn css_parse_function(&mut self) -> Option<NodeId> {
