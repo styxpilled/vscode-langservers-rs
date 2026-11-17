@@ -35,7 +35,9 @@ pub struct ColorInformation {
     pub color: Color,
 }
 
-/// `findDocumentColors`. Stops after `limit` string nodes with a color format.
+/// `findDocumentColors`, at most `limit` colors. Upstream counts the strings with
+/// a color format, also the ones that are not a color, and gives one color for
+/// limit 0.
 pub fn find_document_colors(
     service: &mut JsonSchemaService,
     document: &TextDocument,
@@ -43,11 +45,13 @@ pub fn find_document_colors(
     limit: Option<usize>,
 ) -> Vec<ColorInformation> {
     let mut result = Vec::new();
+    let limit = limit.unwrap_or(usize::MAX);
+    if limit == 0 {
+        return result;
+    }
     let Some(schema) = service.get_schema_for_resource(document.uri().as_str(), Some(doc)) else {
         return result;
     };
-    // Upstream also stops after the first node if the limit is 0.
-    let mut remaining = limit.unwrap_or(usize::MAX).max(1);
     let mut visited = HashSet::new();
     let matching = doc.get_matching_schemas(
         &schema.schemas,
@@ -75,10 +79,9 @@ pub fn find_document_colors(
                 range: document.range(node.offset(), node.end()),
                 color,
             });
-        }
-        remaining -= 1;
-        if remaining == 0 {
-            break;
+            if result.len() == limit {
+                break;
+            }
         }
     }
     result

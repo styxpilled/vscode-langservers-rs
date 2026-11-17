@@ -44,4 +44,3 @@ JSON-Schema-Test-Suite (`testing.md`).
 ## Ported
 
 - Sort swaps reversed line ranges on malformed input, as `substring` does.
-- `find_document_colors` with limit 0 returns one result.
