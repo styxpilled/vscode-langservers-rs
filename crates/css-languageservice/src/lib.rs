@@ -1,9 +1,9 @@
 //! Port of `microsoft/vscode-css-languageservice`.
 
-pub mod beautify;
 pub mod data;
 pub mod language_facts;
 pub mod parser;
+pub mod printer;
 pub mod services;
 pub mod utils;
 

@@ -125,21 +125,23 @@ Costs that profiles found and that the port avoids:
 
 ## CSS library
 
-`css_bench` on bootstrap, formatted and repeated 4 times (501 KB, 30513 lines,
+`css_bench` on bootstrap, formatted and repeated 4 times (506 KB, 30477 lines,
 `<file> 4 40`):
 
 | Step                     | Time    |
 | ------------------------ | ------- |
 | parse                    | 8.1 ms  |
-| validation               | 5.3 ms  |
-| symbols                  | 3.2 ms  |
-| colors                   | 1.2 ms  |
+| validation               | 5.9 ms  |
+| symbols                  | 3.3 ms  |
+| colors                   | 1.4 ms  |
 | folding                  | 2.5 ms  |
-| format                   | 6.4 ms  |
-| completion, 207 requests | 27.5 ms |
+| format                   | 5.5 ms  |
+| completion, 207 requests | 31.8 ms |
 
 Parse profile: selectors 40%, expressions 27%, scanner 26%. An 8 MB style sheet
-formats in 221 ms (Node 756 ms).
+formats in 104 ms after a parse of 135 ms. Format profile: the scanner is a
+quarter; the printer reuses its buffers (item lists, statement marks, the walk
+stack), which were 40% as new allocations.
 
 A property-name completion has 888 items in 968 KB of JSON; 702 KB of it is the
 markdown documentation. The service builds it in about 0.13 ms; the request

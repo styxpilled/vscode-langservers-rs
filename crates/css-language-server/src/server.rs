@@ -760,9 +760,9 @@ impl Server {
         };
         let text = &document.text;
         let full_range = text.full_range();
-        self.dialect(text);
+        let dialect = self.dialect(text);
         let options = format_configuration(&p.options);
-        let edits = format(text, Some(p.range.unwrap_or(full_range)), &options);
+        let edits = format(text, self.stylesheet(&document), dialect, p.range, &options);
         if self
             .capabilities
             .formatter_edit_limit

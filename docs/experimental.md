@@ -50,8 +50,9 @@ Upstream parsers and tree walks are recursive. Node throws `RangeError` at about
   `scripts/deep-nesting.mjs`), also with a 4 MiB stack: 256 MiB is a margin of
   64 times. The slowest take 2 to 4 s (600 KB of text with up to 100000
   diagnostics) and grow linearly. Formatting is not limited: its output grows as
-  the square of the depth (indentation), as upstream. `tests/stdio.rs` of each
-  server (`deep_nesting`), `jsonc` `nesting_limit`, HTML `nesting_limit`.
+  the square of the depth (indentation), as upstream. CSS formatting stops at
+  the limit (`CSS formatter`). `tests/stdio.rs` of each server (`deep_nesting`),
+  `jsonc` `nesting_limit`, HTML `nesting_limit`.
 - Nested symbols (`documentSymbol` as `DocumentSymbol`, all three servers): a
   client that reads JSON with the default `serde_json` recursion limit (128
   levels) cannot read a response with symbols 62 levels deep, and loses the full
@@ -333,15 +334,68 @@ The HTML server uses the same helpers for its formatter settings.
 
 ## CSS formatter
 
-- Nested pseudo-class. Upstream `foundNestedPseudoClass` starts its search one
-  character after the character that follows the colon, so `h:(i) {` in a rule
-  is a property (`h: (i) {`). The branch starts at the character after the
-  colon. `tests/formatter.rs` (`nested_pseudo_class_after_colon`). The format
-  sweep skips the texts with a colon before `(`, `)`, `{`, `}` or `;` (178 of
-  24700 results; 17 of them differ).
-- Kept: one newline after `property:` also with `preserveNewLines: false`. This
-  is the intended "allow at least one new line" of js-beautify: the value stays
-  on the next line.
+Upstream formats with js-beautify (`beautify-css.js`), which finds the structure
+from character patterns. It cannot tell a selector comma from a media query
+comma, or a declaration colon from a map colon. Examples: `} @else {` becomes
+two blocks with an empty line between them; `@media a,print` gets a line break
+after the comma; each comment in a selector or a declaration goes on its own
+line; `content:"{;}"` and `width:~"x"` get no space after the colon; SCSS maps
+get no space after their colons; a Less detached ruleset gets its `;` on a line
+of its own.
+
+The branch prints the parse tree (`printer.rs`). The scanner gives the tokens,
+so each token of the source is printed; the tree gives the structure.
+
+- Statements: each on its own line, blocks indented. A statement with a parse
+  error outside its blocks, a block without its `}`, and tokens that no
+  statement covers keep their source text and the source whitespace around them.
+- `;` after the last declaration, as Prettier. Only after a statement type that
+  ends with `;` (declarations, `@import`, `@include`, mixin calls and others),
+  with its parentheses closed, in a block without parse errors of its own, and
+  before the end of the block or a statement without parse errors. Other cases
+  change the parse.
+- Spaces: one after `,` and none before; none after `(` and `[` and before `)`
+  and `]`; `: ` after the colon of a declaration, a media feature, an SCSS map
+  entry, a keyword argument, a parameter default and a module configuration
+  (`(min-width: 1px)`, `(a: b)`); a space before `!important` and `!default`.
+  Other tokens keep one space if the source has whitespace between them, else
+  none. Colons in selectors keep the source.
+- Line breaks in a value or in parentheses stay, indented one level more than
+  the statement, plus one level for each open parenthesis. Other line breaks in
+  a statement become spaces.
+- `} @else {`, `@r: { ... };`.
+- `url(...)`, unicode ranges and custom property values keep their source text:
+  the parser scans them in other modes.
+- Comments: a comment on its own line stays on its own line; a comment after a
+  statement on the same line stays there.
+- `/* beautify ignore:start */` to `ignore:end` keeps the source text, between
+  statements only.
+- Settings, with the upstream names and defaults: `newlineBetweenSelectors`,
+  `newlineBetweenRules` (an empty line before and after a statement with a
+  block), `spaceAroundSelectorSeparator` (spaces around `>`, `+` and `~`),
+  `braceStyle`, `preserveNewLines` and `maxPreserveNewLines` (empty lines
+  between statements), `indentEmptyLines`, `insertFinalNewline`.
+  `wrapLineLength` has no effect, as upstream.
+- Range formatting: the statements of the innermost block that the range
+  touches, from the first to the last. Upstream formats the text of the range,
+  with a `{` before it inside a rule.
+- A style sheet nested deeper than `MAX_DEPTH` is not formatted.
+- HTML: `<style>` content and `<script type="text/css">` content go to the
+  printer.
+
+Tests (`tests/formatter.rs`): the expected output for each construct. For each
+input: the same text without whitespace and `;`, the same tree node types and
+error count (custom property values excepted: before a `;` the parser makes an
+expression, else a token list; after an error, the parse of the input without
+its whitespace at the end also counts), idempotence, and the same checks for
+four ranges. Inputs: the parser sweep inputs, the nested sweep inputs and the
+texts of the format sweep of `main` in each dialect (`invariants_on_sweeps`).
+The HTML format sweep compares the results with CSS content (534 of 15406)
+without whitespace and `;`.
+
+Effect: `css_bench` on bootstrap, `format` 5.5 ms against 7.0 ms on `main`. The
+request uses the parse that the server keeps. Replaces `beautify.rs` (827 lines)
+with `printer.rs` (756 lines).
 
 ## CSS code actions
 
@@ -468,8 +522,8 @@ one character before it; the `Do not use empty rulesets` range of `style=""` is
 empty at the value, not over `="`. `tests.rs`, `mod embedded_css`.
 
 Effect (`gen-embedded-session.mjs`, 134 KB): pull times summed over 3 runs,
-after the 6 edits in the body 24 against 18 ms, after the 9 edits in a script 188
-against 153 ms (the CSS parse stays). Memory does not change.
+after the 6 edits in the body 24 against 18 ms, after the 9 edits in a script
+188 against 153 ms (the CSS parse stays). Memory does not change.
 
 ### Scripts
 
@@ -487,10 +541,10 @@ The branch (`embedded.rs` `script_files`, `javascript.rs`):
   module script, which ends with `export {};`. The files go to tsrs as
   `/html-server/javascript-<n>.js` (`typescript-<n>.ts`), all open at the same
   time, so they are one program: a module sees the globals of the classic
-  scripts. Each request finds the file of its position and maps positions in
-  and ranges out (`ScriptDocs`); highlights, references, rename and definition
-  map the ranges of each file. The classic scripts share one file because tsrs,
-  as TypeScript, reports a redeclaration between JavaScript files only with
+  scripts. Each request finds the file of its position and maps positions in and
+  ranges out (`ScriptDocs`); highlights, references, rename and definition map
+  the ranges of each file. The classic scripts share one file because tsrs, as
+  TypeScript, reports a redeclaration between JavaScript files only with
   `checkJs` (browsers fail on `let a` in two classic scripts).
 - Kept files. A file whose text did not change stays open as it is, so an edit
   outside the scripts does not parse or check them again. When the request is
@@ -505,17 +559,17 @@ The branch (`embedded.rs` `script_files`, `javascript.rs`):
 - Selection ranges (all embedded modes): a parent with the range of its child is
   removed, and embedded ranges that are not inside the HTML range of the
   position are dropped (upstream gives the whole document first for a position
-  between statements). Upstream repeats some ranges, for example three times
-  the value of a style attribute.
+  between statements). Upstream repeats some ranges, for example three times the
+  value of a style attribute.
 
-Differences in the replays (against the CSS change only): diagnostics at the
-end of a script document are at the end of the script region, not at the end of
-the HTML document; selection ranges as above; module scripts do not see each
-other; a completion item at the start of the compact file does not offer the
-identifier under the cursor (`updateModel` in `21634.html`); replayed resolves
-of items with the old `data.offset` resolve in the first file, with tsrs details
-for a position outside a scope (shorter type texts). `tests.rs`
-(`script_files`, `highlights_across_files`, `edit_outside_scripts_keeps_the_files`,
+Differences in the replays (against the CSS change only): diagnostics at the end
+of a script document are at the end of the script region, not at the end of the
+HTML document; selection ranges as above; module scripts do not see each other;
+a completion item at the start of the compact file does not offer the identifier
+under the cursor (`updateModel` in `21634.html`); replayed resolves of items
+with the old `data.offset` resolve in the first file, with tsrs details for a
+position outside a scope (shorter type texts). `tests.rs` (`script_files`,
+`highlights_across_files`, `edit_outside_scripts_keeps_the_files`,
 `resolve_in_second_script`, `selection_in_handler_has_no_repeats`).
 
 Effect (`gen-embedded-session.mjs`, 134 KB, 3 runs): pull times summed after the
@@ -531,6 +585,8 @@ same.
   The format sweep skips the texts with a character outside the BMP (68 of 15406
   results; 19 of them differ). Effect on `html-perf.jsonl` (ASCII): formatting
   60 to 66 ms against 60 to 61 ms, the same within noise.
+- CSS content goes to the style sheet printer (`CSS formatter`), not to the
+  `beautify-css.js` copy of the HTML service.
 
 ## Schema loading
 

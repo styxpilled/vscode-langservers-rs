@@ -4,12 +4,14 @@
 //! `eol` is always `\n` and `indent_level` is 0: `htmlFormatter.ts` sets no
 //! other value. `js_beautify` returns its input, as upstream.
 
+mod directives;
 mod output;
 mod tokenizer;
 
 use std::borrow::Cow;
 
-use css_languageservice::beautify::{BeautifyOptions as CssBeautifyOptions, css_beautify};
+use css_languageservice::parser::Dialect;
+use css_languageservice::printer::{PrintOptions, format_text};
 use css_languageservice::utils::{is_js_whitespace, utf16_len};
 use serde::Deserialize;
 
@@ -74,7 +76,7 @@ pub struct BeautifyOptions {
     pub indent_scripts: IndentScripts,
     pub void_elements: Vec<String>,
     /// The options of `css_beautify` for `<style>` content.
-    pub css: CssBeautifyOptions,
+    pub css: PrintOptions,
 }
 
 const INLINE: [&str; 57] = [
@@ -659,7 +661,7 @@ impl<'a> Beautifier<'a, '_> {
             let source = format!("{indentation}{text}");
             text = match name {
                 CustomBeautifier::Javascript => source,
-                CustomBeautifier::Css => css_beautify(&source, &self.options.css),
+                CustomBeautifier::Css => format_text(&source, Dialect::Css, &self.options.css),
                 CustomBeautifier::Html => html_beautify(&source, self.options),
                 CustomBeautifier::Null => {
                     if !whitespace_before.is_empty() {

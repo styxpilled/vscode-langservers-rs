@@ -1,6 +1,6 @@
 //! Port of `htmlFormatter.ts`.
 
-use css_languageservice::beautify::BeautifyOptions as CssBeautifyOptions;
+use css_languageservice::printer::PrintOptions;
 use css_languageservice::services::formatter::BraceStyle;
 use css_languageservice::utils::is_js_whitespace;
 use lsp_types::{Position, Range, TextEdit};
@@ -228,8 +228,8 @@ fn beautify_options(
         unformatted_content_delimiter,
         indent_scripts: options.indent_scripts.unwrap_or_default(),
         void_elements: VOID_ELEMENTS.map(String::from).to_vec(),
-        css: CssBeautifyOptions {
-            indent_size,
+        css: PrintOptions {
+            indent_size: indent_size.max(0) as usize,
             indent_with_tabs,
             end_with_newline,
             selector_separator_newline: css.newline_between_selectors.unwrap_or(true),
@@ -238,11 +238,10 @@ fn beautify_options(
             brace_style_expand: css.brace_style == Some(BraceStyle::Expand),
             indent_empty_lines,
             max_preserve_newlines: if css_preserve_newlines {
-                css_max_preserve_newlines
+                css_max_preserve_newlines.max(0) as usize
             } else {
                 0
             },
-            loose_directives: true,
         },
     }
 }

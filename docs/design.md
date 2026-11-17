@@ -165,8 +165,8 @@ upstream. On `experimental` it reads at most `MAX_DEPTH` levels
   `code_actions.rs`, `folding.rs`, `selection_range.rs`, `links.rs`
   (`LinkResolver`, `FileSystemProvider`, `DocumentContext`),
   `path_completion.rs`, `formatter.rs`.
-- `beautify.rs`: port of `beautify-css.js` (js-beautify 2.0.3). Tokens are
-  slices of the source text. No wrap code: upstream never sets a wrap point.
+- `printer.rs`: the formatter. It prints the scanner tokens of each statement
+  and uses the tree for the structure (`experimental.md`, "CSS formatter").
 - The service is synchronous. Where upstream rejects a promise, the Rust
   function returns `None` or an empty result.
 - `lsp_types::Color` has `f32` fields. The color requests use the own `Color`
@@ -218,9 +218,9 @@ upstream. On `experimental` it reads at most `MAX_DEPTH` levels
   (`TagOpenParserToken`) are an arena, the tag stack is a `Vec` of indices.
   `output.rs` is `Output` with line wrapping (UTF-16 counts). The items of all
   lines are one `Vec` of `Cow` slices of the source; a line is a start index.
-  Tag names are `Cow` (no copy when lowercase ASCII). `<style>` content goes to
-  `css_languageservice::beautify::css_beautify` with `loose_directives` (the
-  HTML copy of `beautify-css.js` has a different directive pattern).
+  Tag names are `Cow` (no copy when lowercase ASCII). `directives.rs` has the
+  `beautify ignore:start` and `ignore:end` matchers. CSS content goes to
+  `css_languageservice::printer::format_text`.
 
 ### `crates/html-language-server`
 

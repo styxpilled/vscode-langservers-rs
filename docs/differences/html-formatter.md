@@ -1,15 +1,12 @@
 # HTML formatter: differences from upstream
 
 Upstream: `vscode-html-languageservice`, `htmlFormatter.ts`,
-`beautify/beautify-html.js` and `beautify/beautify-css.js` (js-beautify 2.0.3).
-`<style>` content goes to `css_languageservice::beautify`. Sweep generator:
+`beautify/beautify-html.js` (js-beautify 2.0.3). CSS content goes to the
+style sheet printer (`experimental.md`, "CSS formatter"). Sweep generator:
 `scripts/html/trace-format.mjs`.
 
 ## Not ported
 
-- The quirks of the CSS beautifier in `css-formatter.md` ("Not ported") also
-  apply to `<style>` content: the HTML service has its own copy of
-  `beautify-css.js`. The sweep patches it as the CSS trace does.
 - The numbers go through `parseInt`. Rust takes integers.
 - A value outside the list of `wrapAttributes`, `indentScripts`, `templating` or
   `css.braceStyle` throws upstream. Rust does not deserialize the configuration.

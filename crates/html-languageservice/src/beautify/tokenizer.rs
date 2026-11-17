@@ -2,7 +2,7 @@
 //! `TemplatablePattern` and `WhitespacePattern`. The regular expressions are
 //! matched by hand.
 
-use css_languageservice::beautify::{find_ignore_end, is_ignore_start};
+use super::directives::{find_ignore_end, is_ignore_start};
 use css_languageservice::utils::is_js_whitespace;
 
 use super::{BeautifyOptions, Templating};
@@ -411,7 +411,7 @@ impl<'a, 'o> Tokenizer<'a, 'o> {
         }
         let start = self.pos;
         if !self.read_pair("<!--", "-->").is_empty() {
-            if is_ignore_start(self.slice(start), "<!--", "-->", true) {
+            if is_ignore_start(self.slice(start), "<!--", "-->") {
                 self.pos = find_ignore_end(self.rest(), "<!--", "-->")
                     .map_or(self.text.len(), |i| self.pos + i);
             }

@@ -421,16 +421,16 @@ fn formatting() {
         client.request("textDocument/formatting", params)
     };
     let edits = format(&mut client, json!({ "tabSize": 2, "insertSpaces": true }));
-    assert_eq!(edits[0]["newText"], "a {\n  color: red\n}");
+    assert_eq!(edits[0]["newText"], "a {\n  color: red;\n}");
     let options = json!({ "tabSize": 2.7, "insertSpaces": 1, "braceStyle": "collapse,expand" });
     let edits = format(&mut client, options);
-    assert_eq!(edits[0]["newText"], "a\n{\n  color: red\n}");
+    assert_eq!(edits[0]["newText"], "a\n{\n  color: red;\n}");
     // `docs/experimental.md`: an unknown brace style is ignored.
     let edits = format(&mut client, json!({ "braceStyle": "sideways" }));
     assert_eq!(
         edits[0]["newText"],
         "a {
-	color: red
+	color: red;
 }"
     );
     assert_eq!(client.exit(), 0);

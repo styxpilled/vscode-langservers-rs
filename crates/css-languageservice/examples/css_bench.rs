@@ -40,7 +40,9 @@ fn main() {
     let uri: lsp_types::Uri = "file:///a.css".parse().unwrap();
     let source = std::fs::read_to_string(&path).unwrap();
     let source_doc = TextDocument::new(uri.clone(), "css", 1, source.clone());
-    let formatted = match format(&source_doc, None, &CssFormatConfiguration::default()).first() {
+    let source_sheet = parse_stylesheet(dialect, &source);
+    let options = CssFormatConfiguration::default();
+    let formatted = match format(&source_doc, &source_sheet, dialect, None, &options).first() {
         Some(edit) => edit.new_text.clone(),
         None => source,
     };
@@ -69,7 +71,7 @@ fn main() {
         get_folding_ranges(&doc, None).len()
     });
     time("format", iterations, || {
-        format(&doc, None, &CssFormatConfiguration::default()).len()
+        format(&doc, &sheet, dialect, None, &options).len()
     });
 
     // Completion and hover at each 97th offset of the first 20 KB.

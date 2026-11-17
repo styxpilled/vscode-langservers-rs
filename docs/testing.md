@@ -122,8 +122,10 @@ arguments also writes the sweep; without them, only the fixture.
 - Navigation sweep: highlights, definition, rename and selection ranges at each
   offset; symbols, colors, folding, code actions; color presentations on a grid
   of colors. It patches upstream `difference` (`differences/css-navigation.md`).
-- Formatter: the script patches two upstream quirks; `UNPATCHED=1` turns the
-  patches off.
+- Formatter: not compared with Node (`experimental.md`, "CSS formatter").
+  `invariants_on_sweeps` reads `CSS_SWEEP_INPUTS` (the parser or the nested
+  sweep inputs) and the texts of `CSS_FORMAT_SWEEP` (`trace-format.mjs` of
+  `main`; about 7 s in release).
 - Links: the fixture records each file system and `resolveReference` call; the
   Rust test answers from it, and a call that upstream did not make fails. The
   sweep uses a virtual file system. Debug build is enough (2 s).
@@ -154,7 +156,8 @@ arguments also writes the sweep; without them, only the fixture.
   The texts of the fixture, of the VS Code server test fixtures and a list of
   extra texts, with 14 option sets: the full document, each line and
   pseudo-random ranges. The same test formats each prefix of each text with the
-  templating option sets (no panics).
+  templating option sets (no panics). Results with CSS content are compared
+  without whitespace and `;` (`experimental.md`, "CSS formatter").
 - Feature sweep (`tests/sweep.rs`, 158128 results):
   `node scripts/html/trace-sweep.mjs upstream/vscode-html-languageservice crates/html-languageservice/tests/fixtures/upstream.json upstream/vscode .scratch/data/html-sweep.json`,
   then
